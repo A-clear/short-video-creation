@@ -1,0 +1,65 @@
+---
+title: 認証・認可
+---
+sequenceDiagram
+    autonumber
+    box Web
+    participant NextJS
+    participant LiveKitWebRTCTransport
+    end
+
+    box Interface
+    participant APIGateway
+    end
+    
+    box Application
+    participant LiveKit
+    participant Rasa
+    participant Django
+    participant FastAPI
+    participant Cognito
+    participant Lambda
+    end
+
+    box Middleware
+    end
+    
+    box Repository
+    participant RDS
+    participant S3
+    end
+
+    box LiveKit
+    participant AgentSessions
+    participant ChatContext
+    participant TurnDetection
+    participant STTNode
+    participant LLMNode
+    participant TTSNode
+    participant Agents
+    participant Tasks
+    participant Tools
+    end
+
+    box Rasa
+    participant Flows
+    participant Patterns
+    participant Slots
+    participant Responses
+    participant Actions
+    participant KnowledgeSources
+    end
+
+    box Claude
+    participant LLMModel
+    end
+
+    box OpenAI
+    participant STTModel
+    participant TTSModel
+    end
+
+    Note over NextJS,Cognito: 認証
+    NextJS->>Cognito: 認証情報
+    Cognito->>Cognito: 認証・認可(OIDC)
+    Cognito-->>NextJS: Claim情報
