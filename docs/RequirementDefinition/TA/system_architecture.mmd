@@ -1,0 +1,48 @@
+---
+title: ショート動画作成ツール
+---
+flowchart LR
+    subgraph User
+        direction LR
+        user@{ img: "https://api.iconify.design/mdi:account-outline.svg", label: "User", w: 60, h: 60, constraint: "on" }
+    end
+
+    internet@{ img: "https://api.iconify.design/bx:bxl-google-cloud.svg", label: "Internet", w: 60, h: 60, constraint: "on" }
+
+    subgraph GCP
+        direction LR
+        oauth-client@{ img: "https://api.iconify.design/material-icon-theme:gcp.svg", label: "OAuth Client", w: 60, h: 60, constraint: "on" }
+    end
+
+    subgraph OpenAI
+        direction LR
+        gpt@{ img: "https://api.iconify.design/tabler:brand-openai.svg", label: "GPT", w: 60, h: 60, constraint: "on" }
+    end
+
+    subgraph Descript
+        direction LR
+        descript-app@{ img: "https://api.iconify.design/logos:descript-icon.svg", label: "Descript", w: 60, h: 60, constraint: "on" }
+        descript-mcp@{ img: "https://api.iconify.design/logos:descript-icon.svg", label: "Descript MCP", w: 60, h: 60, constraint: "on" }
+    end
+
+
+    subgraph Vercel
+        direction LR
+        subgraph Vercel Compute
+            open-webui@{ img: "https://work-kameya-public.s3.ap-northeast-1.amazonaws.com/open-web-ui.png", label: "Open WebUI", w: 60, h: 60, constraint: "on" }
+        end
+        
+    end
+    
+    user <--> |アクセス| internet
+    
+    internet <--> |WebApp チャットの表示| open-webui
+    
+    open-webui <--> |認証| oauth-client
+    open-webui <--> |プロンプト| gpt
+    open-webui <--> |MCPサーバのリクエスト/レスポンス| descript-mcp
+
+    descript-mcp <--> |descriptの操作| descript-app
+    
+    
+    

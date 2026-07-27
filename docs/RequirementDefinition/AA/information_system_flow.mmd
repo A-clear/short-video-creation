@@ -1,0 +1,60 @@
+---
+title: ショート動画作成ツール
+---
+sequenceDiagram
+    autonumber
+    box User
+    actor User as ユーザ
+    end
+
+    box Short-form video creation tool
+    participant WebApp
+    end
+
+    box Google
+    participant OAuthClient
+    end
+
+    box OpenAI
+    participant LLMModel
+    end
+
+    box Descript
+    participant DescriptApp
+    end
+
+    Note over User,OAuthClient: ログイン
+    User->>WebApp: 認証
+    WebApp->>OAuthClient: 認証・認可(OIDC)
+    WebApp-->>User: 結果
+
+    Note over User,WebApp: 動画のアップロード
+    User->>WebApp: チャットに動画の添付,アップロードチャット
+    WebApp->>WebApp: 動画アップロードAgentの実行
+    WebApp->>DescriptApp: プロジェクトの作成, 動画アップロード
+    DescriptApp-->>WebApp: 結果
+    WebApp-->>User: 結果
+
+    Note over User,WebApp: ショート動画作成
+    User->>WebApp: ショート動画作成チャット
+    WebApp->>WebApp: ショート動画作成Agentの実行
+    loop ワークフローが完了するまで
+        WebApp->>DescriptApp: DescriptMCP
+        DescriptApp->>DescriptApp: Agent edit
+        DescriptApp-->>WebApp: 結果
+    
+    end
+    WebApp-->>User: 結果
+    
+    Note over User,DescriptApp: タイムラインエクスポート
+    User->>WebApp: プロジェクト公開チャット
+    WebApp->>WebApp: プロジェクト公開Agentの実行
+    WebApp->>DescriptApp: プロジェクトを記述されたウェブリンクに公開
+    DescriptApp-->>WebApp: 結果
+    WebApp-->>User: 結果
+    
+    User->>WebApp: リンクの押下
+    User->>DescriptApp: 画面遷移
+    User->>DescriptApp: タイムラインエクスポート
+    DescriptApp->>DescriptApp: Final Cut Proにフォーマット
+    DescriptApp-->>User: 結果
