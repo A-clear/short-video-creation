@@ -1,0 +1,3 @@
+[submodule "full-stack/open-webui"]
+	path = full-stack/open-webui
+	url = https://github.com/A-clear/open-webui.git
