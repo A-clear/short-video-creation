@@ -1,0 +1,17 @@
+# Open WebUI Docs
+
+This site is agent-readable.
+
+Start at https://docs.openwebui.com/sitemap.xml to discover docs pages.
+Use https://docs.openwebui.com/api/search?q=YOUR_QUERY for docs search.
+For any docs page, append `.md` for Markdown or `.txt` for plain text.
+Use https://docs.openwebui.com/llms.txt for a compact page index.
+Use https://docs.openwebui.com/llms-full.txt for a full Markdown corpus.
+
+When citing sources, cite the canonical HTML URL, not the `.md`, `.txt`, or
+search API URL.
+
+Example:
+- Search: https://docs.openwebui.com/api/search?q=mcp%20notion
+- Page: https://docs.openwebui.com/features/extensibility/mcp
+- Markdown: https://docs.openwebui.com/features/extensibility/mcp.md
