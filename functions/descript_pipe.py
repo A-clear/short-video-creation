@@ -21,16 +21,20 @@ requirements:
 
 import asyncio
 import json
+import os
 import re
 import time
 from typing import Any, Optional
 
+import httpx
 from pydantic import BaseModel, Field
 
 from open_webui.models.chats import Chats
 from open_webui.models.config import Config
+from open_webui.models.files import Files
 from open_webui.models.prompts import Prompts
 from open_webui.models.users import UserModel
+from open_webui.storage.provider import Storage
 from open_webui.utils.chat import generate_chat_completion
 from open_webui.utils.middleware import connect_mcp_server
 
@@ -42,6 +46,12 @@ _STATE_KEY = "descript"
 _STATE_VERSION = 1
 _HISTORY_MAX = 50
 _LOGICAL_OPS = ("list_projects", "get_project", "import_media", "agent_edit", "publish", "job_status")
+
+# 契約書 §2.1 の 6 つに加え、実測で存在が確定した 2 ツールを Pipe だけが解決する。
+#   export_timeline      — 7 番目の論理操作（契約書 §2.0.1 ④）
+#   report_upload_status — 直接アップロード失敗時の通知（契約書 §2.0.1 ①）
+# _LOGICAL_OPS 自体は 3 ファイル共通の定義なので変更しない。
+_LOGICAL_OPS_EXT = _LOGICAL_OPS + ("export_timeline", "report_upload_status")
 
 
 class DescriptError(Exception):
@@ -408,19 +418,57 @@ def _form_result(value: Any) -> tuple[bool, Any, Optional[dict]]:
 # ===========================================================================
 
 
+def _accepts_arg(spec: dict, arg_name: str, arg_map: Optional[dict] = None) -> bool:
+    """ツールのスキーマがその引数を受け付けるかを _coerce_args と同じ規則で判定する。
+
+    スキーマ不明（properties が空）なら _coerce_args は素通しするので True を返す。
+    """
+    props = ((spec or {}).get("parameters") or {}).get("properties") or {}
+    if not props:
+        return True
+    name = (arg_map or {}).get(arg_name, arg_name)
+    if name in props:
+        return True
+    return _norm_key(name) in {_norm_key(k) for k in props}
+
+
 async def _poll_job(client, specs_by_name: dict, tool_map: dict, arg_maps: dict,
                     job_id: str, emit_status, valves) -> dict:
     """Descript の非同期ジョブを完了まで追跡する。
 
     job_state は queued -> running -> stopped (+ cancelled)。
     stopped は「終わった」だけで成功ではない。必ず result.status を見る。
+
+    ⚠️ 実測ツール `wait_for_job` はポーリングではなく**ブロッキング待機**で、
+    wait_seconds を省略すると既定 300 秒ブロックする（契約書 §2.0.1 ③）。
+    1 回の呼び出しで 300 秒待つと Action→Pipe の HTTP がリバースプロキシに
+    切られるため、poll_wait_seconds（既定 25）を必ず明示して渡す。
+    ブロッキング待機が効いている間は asyncio.sleep での二重待機を行わない。
     """
     started = time.monotonic()
     interval = float(valves.poll_interval_sec)
     ticks = 0
 
+    # wait_seconds を実際に受け付けるツールかどうかで待ち方を切り替える。
+    # 受け付けないツール（＝従来型のポーリング API）なら _coerce_args に
+    # 落とされるだけなので、その場合は今までどおり sleep で間隔を空ける。
+    wait_seconds = max(0, int(getattr(valves, "poll_wait_seconds", 0) or 0))
+    job_spec = specs_by_name.get((tool_map or {}).get("job_status") or "") or {}
+    blocking = wait_seconds > 0 and _accepts_arg(
+        job_spec, "wait_seconds", (arg_maps or {}).get("job_status")
+    )
+    # ブロッキング時は 1 tick がそのまま数十秒なので、毎回 status を更新する。
+    status_every_n = 1 if blocking else max(1, int(valves.poll_status_every_n))
+
     while True:
-        raw = await _mcp_call(client, specs_by_name, tool_map, "job_status", {"job_id": job_id}, arg_maps)
+        poll_args = {"job_id": job_id}
+        if blocking:
+            poll_args["wait_seconds"] = wait_seconds
+        call_started = time.monotonic()
+        raw = await _mcp_call(client, specs_by_name, tool_map, "job_status", poll_args, arg_maps)
+        # ブロッキング待機のはずが即座に返る実装だった場合、ここで sleep を
+        # 飛ばすと API を叩き続ける熱いループになる。実測の待ち時間で判定する。
+        waited = time.monotonic() - call_started
         state = str(_pick(raw, "job_state", "state", "status", default="") or "").lower()
         result = _pick(raw, "result", default={}) or {}
 
@@ -445,7 +493,7 @@ async def _poll_job(client, specs_by_name: dict, tool_map: dict, arg_maps: dict,
 
         ticks += 1
         elapsed = int(time.monotonic() - started)
-        if ticks % max(1, int(valves.poll_status_every_n)) == 0:
+        if ticks % status_every_n == 0:
             progress = _pick(raw, "progress", default={}) or {}
             label = _pick(progress, "label", default="処理中")
             percent = _pick(progress, "percent")
@@ -460,8 +508,10 @@ async def _poll_job(client, specs_by_name: dict, tool_map: dict, arg_maps: dict,
                 {"job_id": job_id},
             )
 
-        await asyncio.sleep(interval)
-        interval = min(interval * 1.5, float(valves.poll_backoff_max_sec))
+        if not blocking or waited < 1.0:
+            # ブロッキング待機が効いていない実装向けの従来ポーリング。
+            await asyncio.sleep(interval)
+            interval = min(interval * 1.5, float(valves.poll_backoff_max_sec))
 
 
 # ===========================================================================
@@ -500,13 +550,17 @@ def _redact_signed_urls(text: str, replacement: str = "") -> str:
 # 契約書 §2.3 ツール名の正規表現候補
 # ===========================================================================
 
+# 先頭ほど高得点。2026-08-02 の probe で確定した実測ツール名を各行の先頭に置き、
+# 自動解決が確実に当たるようにしている（契約書 §2.0）。
 _TOOL_PATTERNS = {
     "list_projects": [r"^list_?projects?$", r"list.*project", r"projects?_?list", r"^get_?projects?$", r"search.*project"],
     "get_project":   [r"^get_?project$", r"project.*(detail|info|metadata)", r"^describe_?project$", r"open.*project"],
-    "import_media":  [r"import.*(media|file|video|url)", r"^upload", r"(create|add).*(composition|media)", r"add.*file"],
-    "agent_edit":    [r"agent.*edit", r"^agent$", r"underlord", r"^edit$", r"apply.*edit", r"edit.*project"],
-    "publish":       [r"^publish", r"export.*(video|media|link)", r"^share", r"render"],
-    "job_status":    [r"job.*(status|state)", r"^get_?job$", r"^poll", r"task.*status"],
+    "import_media":  [r"^import_?media$", r"import.*(media|file|video|url)", r"^upload", r"(create|add).*(composition|media)", r"add.*file"],
+    "agent_edit":    [r"^prompt_?project_?agent$", r"agent.*edit", r"prompt.*agent", r"^agent$", r"underlord", r"^edit$", r"apply.*edit", r"edit.*project"],
+    "publish":       [r"^publish_?project$", r"^publish", r"export.*(video|media|link)", r"^share", r"render"],
+    "job_status":    [r"^wait_?for_?job$", r"job.*(status|state)", r"^get_?job$", r"^poll", r"task.*status"],
+    "export_timeline": [r"^export_?timeline$", r"export.*(timeline|fcpxml|edl|aaf|sesx)", r"timeline.*export"],
+    "report_upload_status": [r"^report_?upload_?status$", r"report.*upload", r"upload.*status"],
 }
 
 # description に含まれていれば加点するキーワード（§2.3 の「日本語/英語キーワード」）
@@ -516,7 +570,9 @@ _TOOL_KEYWORDS = {
     "import_media":  ("import", "upload", "media", "video", "audio", "取り込", "アップロード"),
     "agent_edit":    ("underlord", "agent", "edit", "instruction", "prompt", "編集"),
     "publish":       ("publish", "export", "share", "render", "download", "書き出", "公開"),
-    "job_status":    ("job", "status", "progress", "poll", "ジョブ", "進捗"),
+    "job_status":    ("job", "status", "progress", "poll", "wait", "ジョブ", "進捗"),
+    "export_timeline": ("timeline", "fcpxml", "final cut", "premiere", "edl", "タイムライン"),
+    "report_upload_status": ("upload", "status", "report", "failed", "アップロード"),
 }
 
 # 本 Function 自身の id。編集プロンプト合成で自分自身を呼んで無限再帰するのを防ぐ。
@@ -783,6 +839,118 @@ def _as_project_list(raw: Any) -> list:
     return projects
 
 
+def _normalize_media_type(value: Any) -> str:
+    """publish_project の media_type を実測値 'Video' / 'Audio' に正規化する。
+
+    実測（契約書 §2.0.1 ②）では先頭大文字の 'Video' / 'Audio' のみが通り、
+    'mp4' / 'mp3' / 'wav' のような拡張子表記は 422 で弾かれる。
+    Valve に旧既定値（mp4 等）が残っている環境でも動くようここで吸収する。
+    """
+    key = str(value or "").strip().lower()
+    if key in ("audio", "mp3", "wav", "m4a", "aac", "flac", "ogg", "opus", "wma"):
+        return "Audio"
+    return "Video"
+
+
+def _looks_like_no_video(exc: "DescriptError") -> bool:
+    """publish の失敗が「映像トラックが無いのに Video を指定した」ものか推定する。
+
+    実測（契約書 §2.0.1 ②）: media_type='Video' を明示しかつ映像が無いと 422。
+    """
+    parts = [str(exc.message_ja or "")]
+    try:
+        parts.append(json.dumps(exc.data, ensure_ascii=False, default=str))
+    except Exception:
+        parts.append(str(exc.data))
+    text = " ".join(parts).lower()
+    if "422" in text or "unprocessable" in text:
+        return True
+    return any(t in text for t in ("no video", "video track", "without video", "audio only"))
+
+
+# export_timeline の format（契約書 §2.0.1 ④）
+_TIMELINE_FORMATS = ("fcp", "premiere", "davinci_resolve", "aaf", "edl", "sesx")
+
+
+def _media_key(name: Any, url: Any, used: set) -> str:
+    """add_media のキー（Descript 上の表示名）を作る。
+
+    元のファイル名 → URL の末尾 の順に採る。重複時は連番を付ける。
+    """
+    base = str(name or "").strip()
+    if not base and url:
+        path = str(url).split("?", 1)[0].split("#", 1)[0].rstrip("/")
+        base = path.rsplit("/", 1)[-1]
+    base = re.sub(r'[\\/:*?"<>|\x00-\x1f]', "_", base).strip() or "media"
+
+    key = base
+    index = 2
+    while key in used:
+        stem, dot, ext = base.rpartition(".")
+        key = f"{stem}_{index}{dot}{ext}" if dot else f"{base}_{index}"
+        index += 1
+    used.add(key)
+    return key
+
+
+def _build_add_media(entries: list) -> tuple[dict, dict]:
+    """import_media の add_media（表示名 → メディア定義）を組み立てる（契約書 §2.0.1 ①）。
+
+    tool_arg_map はキー名の付け替えしかできないため、この構造変換はコード側で行う。
+
+    entries の要素: {"name", "url", "path", "content_type", "file_size"}
+    戻り値: (add_media, uploads)
+      uploads は upload_urls への PUT が必要なもの {表示名: entry}
+    """
+    add_media: dict = {}
+    uploads: dict = {}
+    used: set = set()
+
+    for entry in entries or []:
+        key = _media_key(entry.get("name"), entry.get("url"), used)
+        url = entry.get("url")
+        if url:
+            # URL 取込: {"表示名": {"url": "https://..."}}
+            add_media[key] = {"url": str(url)}
+            continue
+        # 直接アップロード: {"表示名": {"content_type": ..., "file_size": ...}}
+        # file_size は宣言値と実サイズが一致しないと失敗するため実測値を入れる。
+        definition = {"file_size": int(entry.get("file_size") or 0)}
+        if entry.get("content_type"):
+            definition["content_type"] = str(entry["content_type"])
+        add_media[key] = definition
+        uploads[key] = entry
+
+    return add_media, uploads
+
+
+def _extract_job_id(raw: Any) -> Optional[str]:
+    """ツールの戻り値から非同期ジョブ ID を取り出す。無ければ None。"""
+    if not isinstance(raw, dict):
+        return None
+    job_id = _pick(raw, "job_id", "jobId")
+    if job_id is None:
+        state_hint = str(_pick(raw, "job_state", "state", "status", default="") or "").lower()
+        if state_hint in ("queued", "running", "pending", "in_progress", "processing"):
+            job_id = _pick(raw, "id")
+    return str(job_id) if job_id is not None else None
+
+
+def _file_chunks(path: str, chunk_size: int = 1024 * 1024):
+    """ファイルをチャンクで読む同期ジェネレータ。
+
+    httpx は Content-Length を明示していれば Transfer-Encoding: chunked を
+    付けない（_prepare が既存の Content-Length を尊重する）ため、
+    署名付き PUT でも壊れない。
+    """
+    with open(path, "rb") as handle:
+        while True:
+            chunk = handle.read(chunk_size)
+            if not chunk:
+                break
+            yield chunk
+
+
 def _extract_publish(result: Any) -> dict:
     """publish 系ジョブの結果から URL 群を取り出す。"""
     payload = result if isinstance(result, dict) else {}
@@ -821,12 +989,37 @@ class Pipe:
         )
         mcp_connect_retries: int = Field(default=2, description="MCP 接続の再試行回数")
         # --- ツール名オーバーライド（空なら自動推定） ---
-        tool_list_projects: str = Field(default="", description="空なら自動推定")
-        tool_get_project: str = Field(default="", description="空なら自動推定")
-        tool_import_media: str = Field(default="", description="空なら自動推定")
-        tool_agent_edit: str = Field(default="", description="空なら自動推定")
-        tool_publish: str = Field(default="", description="空なら自動推定")
-        tool_job_status: str = Field(default="", description="空なら自動推定")
+        # description の「実測値」は 2026-08-02 に probe で確認した実際のツール名
+        #（契約書 §2.0）。本番は tool_resolution_mode=valve_only にしてここへ明示する。
+        tool_list_projects: str = Field(
+            default="", description="空なら自動推定。実測値は list_projects"
+        )
+        tool_get_project: str = Field(
+            default="", description="空なら自動推定。実測値は get_project"
+        )
+        tool_import_media: str = Field(
+            default="", description="空なら自動推定。実測値は import_media"
+        )
+        tool_agent_edit: str = Field(
+            default="", description="空なら自動推定。実測値は prompt_project_agent"
+        )
+        tool_publish: str = Field(
+            default="", description="空なら自動推定。実測値は publish_project"
+        )
+        tool_job_status: str = Field(
+            default="", description="空なら自動推定。実測値は wait_for_job"
+        )
+        tool_export_timeline: str = Field(
+            default="export_timeline",
+            description="タイムライン書き出し（FCPXML 等）。実測値は export_timeline",
+        )
+        tool_report_upload_status: str = Field(
+            default="report_upload_status",
+            description=(
+                "直接アップロード失敗を import ジョブに通知するツール。"
+                "実測値は report_upload_status"
+            ),
+        )
         tool_arg_map: str = Field(
             default="{}",
             description='引数名の差異を吸収する JSON。例 {"agent_edit": {"project_id": "projectId"}}',
@@ -839,10 +1032,26 @@ class Pipe:
             description="ツール名の解決方法。本番では valve_only 推奨",
         )
         # --- ジョブポーリング ---
-        poll_interval_sec: int = Field(default=5)
+        poll_wait_seconds: int = Field(
+            default=25,
+            description=(
+                "wait_for_job に渡す 1 回あたりのブロッキング待機秒数。"
+                "省略すると MCP 側の既定 300 秒ブロックし、Action→Pipe の HTTP が"
+                "リバースプロキシに切られる。0 で即時リターン（従来のポーリング相当）"
+            ),
+        )
+        poll_interval_sec: int = Field(
+            default=5, description="ブロッキング待機が使えないときの再問い合わせ間隔（秒）"
+        )
         poll_backoff_max_sec: int = Field(default=30)
         poll_timeout_sec: int = Field(default=900, description="1 ジョブの上限待ち時間（秒）")
-        poll_status_every_n: int = Field(default=3, description="N 回に 1 回 status イベントを出す")
+        poll_status_every_n: int = Field(
+            default=3,
+            description="N 回に 1 回 status イベントを出す（ブロッキング待機時は毎回）",
+        )
+        upload_timeout_sec: int = Field(
+            default=600, description="upload_urls への PUT 1 本あたりのタイムアウト（秒）"
+        )
         # --- 編集ループ ---
         max_edit_iterations: int = Field(default=5)
         confirm_timeout_sec: int = Field(
@@ -851,14 +1060,31 @@ class Pipe:
         )
         # --- 出力既定 ---
         default_media_type: str = Field(
-            default="mp4",
-            json_schema_extra={"input": {"type": "select", "options": ["mp4", "mp3", "wav"]}},
+            default="Video",
+            json_schema_extra={"input": {"type": "select", "options": ["Video", "Audio"]}},
+            description=(
+                "publish_project の media_type。実測値は Video / Audio のみ。"
+                "Video を明示しかつ映像が無いと 422 で失敗するため、その場合は"
+                "自動的に Audio で 1 回だけ再試行する"
+            ),
         )
         default_resolution: str = Field(
             default="1080x1920",
             json_schema_extra={
                 "input": {"type": "select", "options": ["1080x1920", "1080x1080", "1920x1080", "720x1280"]}
             },
+            description=(
+                "編集プロンプトのアスペクト比算出にのみ使う。"
+                "MCP 側スキーマに存在しない可能性あり・未確認のため publish には渡さない"
+            ),
+        )
+        default_timeline_format: str = Field(
+            default="fcp",
+            json_schema_extra={"input": {"type": "select", "options": list(_TIMELINE_FORMATS)}},
+            description=(
+                "export_timeline の format。fcp = Final Cut Pro X（.fcpxml）。"
+                "書き出されるのはタイムライン/XML のみでメディアは同梱されない"
+            ),
         )
         # --- LLM ---
         editing_model_id: str = Field(
@@ -1162,7 +1388,7 @@ class Pipe:
 
         # ① Valve の明示指定（実在するツール名のみ採用）
         valve_map = {}
-        for op in _LOGICAL_OPS:
+        for op in _LOGICAL_OPS_EXT:
             name = str(getattr(self.valves, f"tool_{op}", "") or "").strip()
             if name and name in specs_by_name:
                 valve_map[op] = name
@@ -1173,14 +1399,14 @@ class Pipe:
         cached = (ctx.get("state") or {}).get("tool_map")
         if isinstance(cached, dict):
             for op, name in cached.items():
-                if op in _LOGICAL_OPS and op not in resolved and name in specs_by_name:
+                if op in _LOGICAL_OPS_EXT and op not in resolved and name in specs_by_name:
                     resolved[op] = name
 
         if mode == "valve_only":
             return resolved
 
         # ③ 正規表現スコアリング
-        missing = [op for op in _LOGICAL_OPS if op not in resolved]
+        missing = [op for op in _LOGICAL_OPS_EXT if op not in resolved]
         if missing:
             used = set(resolved.values())
             for op in missing:
@@ -1190,7 +1416,7 @@ class Pipe:
                     used.add(name)
 
         # ④ LLM 選択
-        missing = [op for op in _LOGICAL_OPS if op not in resolved]
+        missing = [op for op in _LOGICAL_OPS_EXT if op not in resolved]
         if missing and mode == "regex_then_llm":
             try:
                 guessed = await self._resolve_by_llm(ctx, specs_by_name, missing)
@@ -1263,7 +1489,9 @@ class Pipe:
             "- import_media: メディアファイル/URL の取り込み\n"
             "- agent_edit: Underlord エージェントによる編集の実行\n"
             "- publish: 書き出し・共有リンクの生成\n"
-            "- job_status: 非同期ジョブの進捗・結果取得\n\n"
+            "- job_status: 非同期ジョブの完了待ち・結果取得\n"
+            "- export_timeline: 編集タイムラインの XML 書き出し（Final Cut Pro / Premiere 等）\n"
+            "- report_upload_status: 直接アップロードの成否を取込ジョブに通知\n\n"
             f"# ツール一覧\n{json.dumps(catalog, ensure_ascii=False)}"
         )
 
@@ -1356,6 +1584,8 @@ class Pipe:
             return await self._op_publish(args, ctx, client, specs, tool_map, arg_maps)
         if op == "job_status":
             return await self._op_job_status(args, ctx, client, specs, tool_map, arg_maps)
+        if op == "export_timeline":
+            return await self._op_export_timeline(args, ctx, client, specs, tool_map, arg_maps)
         if op == "start_edit_loop":
             return await self._op_start_edit_loop(args, ctx, client, specs, tool_map, arg_maps)
         if op == "resume_edit_loop":
@@ -1372,7 +1602,7 @@ class Pipe:
         """依存ゼロの疎通確認。MCP 接続とツール名確定の唯一の手段。"""
         data = {
             "tools": list(specs.values()),
-            "resolved": {op: tool_map.get(op) for op in _LOGICAL_OPS},
+            "resolved": {op: tool_map.get(op) for op in _LOGICAL_OPS_EXT},
             "server": {"id": server_id, "tool_count": len(specs)},
         }
         await ctx["emit_status"](f"Descript MCP に接続できました（ツール {len(specs)} 件）", done=True)
@@ -1432,15 +1662,23 @@ class Pipe:
         if not project_id:
             project_id = str((ctx.get("state") or {}).get("project_id") or "").strip()
 
-        source_url = args.get("source_url")
-        file_id = args.get("file_id")
-        if not source_url and not file_id:
+        entries = []
+        if args.get("source_url"):
+            entries.append(
+                {"name": args.get("name") or args.get("media_name"), "url": args["source_url"]}
+            )
+        if args.get("file_id"):
+            entries.append(
+                {
+                    "name": args.get("name") or args.get("media_name"),
+                    "file_id": args["file_id"],
+                    "content_type": args.get("content_type"),
+                }
+            )
+        if not entries:
             # 通常チャット経路のフォールバック: Filter が退避した添付を使う（契約書 §1.4）
-            media = ctx.get("media") or []
-            if media:
-                source_url = media[0].get("url")
-                file_id = media[0].get("file_id")
-        if not source_url and not file_id:
+            entries = list(ctx.get("media") or [])
+        if not entries:
             raise DescriptError(
                 "TOOL_ARGS_MISSING",
                 "取り込むメディア（source_url または file_id）が指定されていません。",
@@ -1449,15 +1687,11 @@ class Pipe:
             )
 
         await ctx["emit_status"]("Descript にメディアを取り込んでいます")
-        outcome = await self._call_job(
+        outcome = await self._run_import_media(
             ctx, client, specs, tool_map, arg_maps,
-            "import_media",
-            {
-                "project_id": project_id or None,
-                "project_name": project_name or None,
-                "source_url": source_url,
-                "file_id": file_id,
-            },
+            project_id=project_id,
+            project_name=project_name,
+            entries=entries,
         )
         result = outcome["result"] if isinstance(outcome["result"], dict) else {}
         new_project_id = str(
@@ -1565,6 +1799,82 @@ class Pipe:
         result = _pick(raw, "result", default={}) or {}
         await ctx["emit_status"](f"ジョブ {job_id[:8]} の状態: {job_state or '不明'}", done=True)
         return _ok("job_status", {"job_state": job_state, "result": result}, ctx.get("state"))
+
+    async def _op_export_timeline(self, args, ctx, client, specs, tool_map, arg_maps) -> str:
+        """編集タイムラインを FCPXML 等で書き出す（契約書 §2.0.1 ④ / UC3）。
+
+        非同期。完了結果の download_url は期限付きなので state には保存しない。
+        メディアファイルは同梱されず、タイムライン/XML ファイルのみが出力される。
+        """
+        state = ctx.get("state") or {}
+        project_id = str(args.get("project_id") or "").strip() or str(
+            state.get("project_id") or ""
+        ).strip()
+        if not project_id:
+            project_id = await self._infer_project_id(ctx, client, specs, tool_map, arg_maps)
+
+        fmt = str(args.get("format") or self.valves.default_timeline_format or "fcp").strip().lower()
+        if fmt not in _TIMELINE_FORMATS:
+            raise DescriptError(
+                "TOOL_ARGS_MISSING",
+                f"タイムラインの書き出し形式 '{fmt}' は指定できません。",
+                f"指定できるのは {' / '.join(_TIMELINE_FORMATS)} です。",
+                {"format": fmt, "allowed": list(_TIMELINE_FORMATS)},
+            )
+
+        await ctx["emit_status"]("タイムラインを書き出しています")
+        outcome = await self._call_job(
+            ctx, client, specs, tool_map, arg_maps,
+            "export_timeline",
+            {
+                "project_id": project_id,
+                "composition_id": args.get("composition_id") or state.get("composition_id") or None,
+                "format": fmt,
+            },
+        )
+        result = outcome["result"] if isinstance(outcome["result"], dict) else {}
+        download_url = _pick(result, "download_url", "downloadUrl", "url", "file_url")
+        expires_at = _pick(
+            result, "download_url_expires_at", "downloadUrlExpiresAt", "expires_at", "expiresAt"
+        )
+        if not download_url:
+            raise DescriptError(
+                "JOB_FAILED",
+                "タイムラインのダウンロード URL を取得できませんでした。",
+                "Descript 側で書き出しが完了したかご確認ください。",
+                {"job_id": outcome.get("job_id"), "result": result},
+            )
+
+        note_ja = (
+            "タイムライン（XML）ファイルのみが書き出されます。メディアファイルは同梱されません。"
+            "ダウンロード URL は期限付きです。"
+        )
+        # download_url は期限付きなので state には保存しない（契約書 §11）
+        new_state = await _save_state(
+            ctx.get("chat_id"),
+            {"project_id": project_id, "last_job_id": outcome.get("job_id")},
+        )
+        await _append_history(
+            ctx.get("chat_id"),
+            {
+                "op": "export_timeline",
+                "job": outcome.get("job_id"),
+                "result": "partial" if outcome.get("partial") else "success",
+                "note": fmt,
+            },
+        )
+        await ctx["emit_status"](f"タイムラインを書き出しました（{fmt}）。{note_ja}", done=True)
+
+        data = {
+            "download_url": str(download_url),
+            "expires_at": str(expires_at) if expires_at else None,
+            "format": fmt,
+            "note_ja": note_ja,
+        }
+        if outcome.get("partial"):
+            data["warning_code"] = "JOB_PARTIAL"
+            data["warning_ja"] = "一部の処理に失敗しました。"
+        return _ok("export_timeline", data, new_state)
 
     # -- 編集ループ ---------------------------------------------------------
 
@@ -1919,27 +2229,197 @@ class Pipe:
         _poll_job が result.status を見て判定する。
         """
         raw = await _mcp_call(client, specs, tool_map, op, args, arg_maps)
+        return await self._track_job(ctx, client, specs, tool_map, arg_maps, raw)
+
+    async def _track_job(self, ctx, client, specs, tool_map, arg_maps, raw) -> dict:
+        """ツールの戻り値にジョブ ID があれば完了まで追跡し、無ければそのまま返す。"""
         if not isinstance(raw, dict):
             return {"job_id": None, "result": {}, "partial": False, "raw": raw}
 
-        state_hint = str(_pick(raw, "job_state", "state", "status", default="") or "").lower()
-        job_id = _pick(raw, "job_id", "jobId")
-        if job_id is None and state_hint in ("queued", "running", "pending", "in_progress", "processing"):
-            job_id = _pick(raw, "id")
-
+        job_id = _extract_job_id(raw)
         if job_id is None:
             # ジョブを作らず同期に結果を返す実装
             return {"job_id": None, "result": _pick(raw, "result", default=raw) or raw, "partial": False, "raw": raw}
 
         polled = await _poll_job(
-            client, specs, tool_map, arg_maps, str(job_id), ctx["emit_status"], self.valves
+            client, specs, tool_map, arg_maps, job_id, ctx["emit_status"], self.valves
         )
         return {
-            "job_id": str(job_id),
+            "job_id": job_id,
             "result": polled.get("result") or {},
             "partial": bool(polled.get("partial")),
             "raw": raw,
         }
+
+    # -- メディア取込（契約書 §2.0.1 ①）------------------------------------
+
+    async def _run_import_media(
+        self, ctx, client, specs, tool_map, arg_maps, *, project_id, project_name, entries
+    ) -> dict:
+        """add_media マップを組み立てて import_media を呼ぶ。
+
+        直接アップロード経路（file_id 指定）では、レスポンスの upload_urls に
+        実体を PUT してからジョブの完了を待つ。PUT を済ませないと import ジョブが
+        そのファイルを待ち続ける。
+        """
+        prepared = []
+        for entry in entries or []:
+            if not isinstance(entry, dict):
+                continue
+            if entry.get("url"):
+                prepared.append(
+                    {
+                        "name": entry.get("name"),
+                        "url": str(entry["url"]),
+                        "content_type": entry.get("content_type"),
+                    }
+                )
+                continue
+            if entry.get("file_id"):
+                prepared.append(await self._resolve_stored_file(entry))
+        if not prepared:
+            raise DescriptError(
+                "TOOL_ARGS_MISSING",
+                "取り込めるメディアがありませんでした。",
+                "動画の URL、または Open WebUI にアップロード済みのファイルを指定してください。",
+                {"missing": ["source_url|file_id"]},
+            )
+
+        add_media, uploads = _build_add_media(prepared)
+        args = {
+            "add_media": add_media,
+            "project_id": project_id or None,
+            "project_name": project_name or None,
+        }
+        # 新規プロジェクトには add_compositions を渡す。渡さないと取り込んだメディアが
+        # タイムラインに載らない。既存プロジェクトには渡さない（既存の編集が壊れる）。
+        if not project_id:
+            args["add_compositions"] = [{"clips": [{"media": key} for key in add_media]}]
+
+        raw = await _mcp_call(client, specs, tool_map, "import_media", args, arg_maps)
+        job_id = _extract_job_id(raw)
+        if uploads:
+            await self._upload_media(
+                ctx, client, specs, tool_map, arg_maps, raw=raw, job_id=job_id, uploads=uploads
+            )
+        return await self._track_job(ctx, client, specs, tool_map, arg_maps, raw)
+
+    @staticmethod
+    async def _resolve_stored_file(entry: dict) -> dict:
+        """Open WebUI に保存済みのファイル（file_id）の実体パス・サイズを解決する。
+
+        Files.get_file_by_id で DB レコードを引き（backend/open_webui/models/files.py:153）、
+        Storage.get_file で実体をローカルパスに解決する
+        （backend/open_webui/storage/provider.py:70 / 162）。
+        STORAGE_PROVIDER=s3（MinIO）でも S3StorageProvider.get_file が UPLOAD_DIR に
+        ダウンロードしてそのパスを返すため同じ手順で読める（provider.py:162-170）。
+        boto3 は同期なので upstream と同じく asyncio.to_thread に逃がす
+        （backend/open_webui/routers/files.py:799）。
+        """
+        file_id = str(entry.get("file_id") or "")
+        try:
+            record = await Files.get_file_by_id(file_id)
+        except Exception:
+            record = None
+        if record is None or not record.path:
+            raise DescriptError(
+                "TOOL_ARGS_MISSING",
+                "添付ファイルの実体を取得できませんでした。",
+                "ファイルを添付し直すか、動画の URL を指定してください。",
+                {"file_id": file_id},
+            )
+
+        try:
+            path = await asyncio.to_thread(Storage.get_file, record.path)
+            file_size = int(await asyncio.to_thread(os.path.getsize, path))
+        except Exception as exc:
+            raise DescriptError(
+                "TOOL_ARGS_MISSING",
+                "添付ファイルの実体を読み出せませんでした。",
+                "動画の URL を指定して取り込んでください。",
+                {"file_id": file_id, "raw": str(exc)[:800]},
+            ) from exc
+
+        meta = record.meta if isinstance(record.meta, dict) else {}
+        return {
+            "name": entry.get("name") or meta.get("name") or record.filename,
+            "path": path,
+            "file_size": file_size,
+            "content_type": entry.get("content_type")
+            or meta.get("content_type")
+            or "application/octet-stream",
+        }
+
+    async def _upload_media(
+        self, ctx, client, specs, tool_map, arg_maps, *, raw, job_id, uploads
+    ) -> None:
+        """import_media が返した upload_urls に実体を PUT する。
+
+        upload_urls は {メディアキー: {upload_url, asset_id, artifact_id}}。
+        Content-Type: application/octet-stream で送り、宣言した file_size と
+        実サイズを一致させる必要がある（契約書 §2.0.1 ①）。
+        失敗時は report_upload_status で取込ジョブに通知し、待ち続けさせない。
+        """
+        upload_urls = _pick(raw, "upload_urls", "uploadUrls", default={}) or {}
+        if not isinstance(upload_urls, dict):
+            upload_urls = {}
+
+        timeout = httpx.Timeout(float(self.valves.upload_timeout_sec), connect=30.0)
+        async with httpx.AsyncClient(timeout=timeout, follow_redirects=False) as http:
+            for key, entry in uploads.items():
+                target = upload_urls.get(key)
+                if not isinstance(target, dict):
+                    raise DescriptError(
+                        "JOB_FAILED",
+                        f"'{key}' のアップロード先 URL が返りませんでした。",
+                        "動画の URL を指定して取り込んでください。",
+                        {"media": key, "job_id": job_id},
+                    )
+                url = _pick(target, "upload_url", "uploadUrl", "url")
+                media_id = _pick(target, "media_id", "mediaId", "asset_id", "assetId", "artifact_id")
+                if not url:
+                    raise DescriptError(
+                        "JOB_FAILED",
+                        f"'{key}' のアップロード先 URL が返りませんでした。",
+                        "動画の URL を指定して取り込んでください。",
+                        {"media": key, "job_id": job_id},
+                    )
+
+                await ctx["emit_status"](f"『{key}』をアップロードしています")
+                try:
+                    response = await http.put(
+                        str(url),
+                        content=_file_chunks(str(entry.get("path"))),
+                        headers={
+                            "Content-Type": "application/octet-stream",
+                            "Content-Length": str(int(entry.get("file_size") or 0)),
+                        },
+                    )
+                    response.raise_for_status()
+                except Exception as exc:
+                    await self._report_upload_failure(
+                        client, specs, tool_map, arg_maps, job_id, media_id
+                    )
+                    raise DescriptError(
+                        "JOB_FAILED",
+                        f"『{key}』のアップロードに失敗しました。",
+                        "ファイルサイズが変化していないかご確認のうえ、再実行してください。",
+                        {"media": key, "job_id": job_id, "raw": str(exc)[:800]},
+                    ) from exc
+
+    @staticmethod
+    async def _report_upload_failure(client, specs, tool_map, arg_maps, job_id, media_id) -> None:
+        """アップロード失敗を取込ジョブに通知する。通知自体の失敗は握り潰す。"""
+        if not job_id or not media_id:
+            return
+        try:
+            await _mcp_call(
+                client, specs, tool_map, "report_upload_status",
+                {"job_id": str(job_id), "media_id": str(media_id), "status": "failed"},
+                arg_maps,
+            )
+        except Exception:
+            pass
 
     async def _run_agent_edit(
         self, ctx, client, specs, tool_map, arg_maps, *, project_id, composition_id, prompt, conversation_id
@@ -1969,16 +2449,31 @@ class Pipe:
     async def _run_publish(
         self, ctx, client, specs, tool_map, arg_maps, *, project_id, composition_id, media_type, resolution
     ) -> dict:
-        outcome = await self._call_job(
-            ctx, client, specs, tool_map, arg_maps,
-            "publish",
-            {
-                "project_id": project_id,
-                "composition_id": composition_id or None,
-                "media_type": str(media_type or self.valves.default_media_type),
-                "resolution": str(resolution or self.valves.default_resolution),
-            },
-        )
+        """publish_project を呼ぶ。
+
+        media_type は実測値 'Video' / 'Audio' に正規化する（契約書 §2.0.1 ②）。
+        resolution は probe のツール説明に無いため渡さない（引数 resolution は
+        呼び出し側の互換のために受けるだけで、MCP には送らない）。
+        """
+        wanted = _normalize_media_type(media_type or self.valves.default_media_type)
+        args = {
+            "project_id": project_id,
+            "composition_id": composition_id or None,
+            "media_type": wanted,
+        }
+        try:
+            outcome = await self._call_job(
+                ctx, client, specs, tool_map, arg_maps, "publish", args
+            )
+        except DescriptError as exc:
+            # 'Video' を明示しかつ映像が無いと 422。その場合だけ Audio で 1 回再試行する。
+            if wanted != "Video" or not _looks_like_no_video(exc):
+                raise
+            await ctx["emit_status"]("映像トラックが無いため音声として書き出します")
+            outcome = await self._call_job(
+                ctx, client, specs, tool_map, arg_maps, "publish", {**args, "media_type": "Audio"}
+            )
+
         published = _extract_publish(outcome.get("result"))
         published["job_id"] = outcome.get("job_id")
         published["partial"] = outcome.get("partial")
@@ -2004,19 +2499,15 @@ class Pipe:
 
     async def _import_attached_media(self, ctx, client, specs, tool_map, arg_maps) -> str:
         """Filter が退避した添付動画（契約書 §1.4）を取り込み、project_id を返す。"""
-        media = (ctx.get("media") or [{}])[0]
-        name = str(media.get("name") or "").strip()
+        entries = list(ctx.get("media") or [])
+        name = str((entries[0] if entries else {}).get("name") or "").strip()
 
         await ctx["emit_status"]("添付された動画を Descript に取り込んでいます")
-        outcome = await self._call_job(
+        outcome = await self._run_import_media(
             ctx, client, specs, tool_map, arg_maps,
-            "import_media",
-            {
-                "project_id": None,
-                "project_name": name or None,
-                "source_url": media.get("url"),
-                "file_id": media.get("file_id"),
-            },
+            project_id="",
+            project_name=name,
+            entries=entries,
         )
         result = outcome["result"] if isinstance(outcome["result"], dict) else {}
         project_id = str(_pick(result, "project_id", "projectId", default="") or "")

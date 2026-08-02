@@ -86,6 +86,46 @@ pnpm dev                        # :5173
 
 ## 3. Descript MCP を登録する（管理者・1 回）
 
+> ### ⛔ 先に必ず読むこと — `localhost` では登録できません
+>
+> Descript の IdP（Stytch）は、動的クライアント登録（DCR）で受け取る redirect URI に
+> **HTTPS かつ非 loopback** を要求します。`http://localhost:8080` のままだと必ずこのエラーで失敗します。
+>
+> ```
+> Dynamic client registration failed: {"error":"invalid_client_metadata",
+> "error_description":"could not create client: The redirect URL for this non-public client
+> must use the 'https' scheme. Localhost or loopback addresses are not allowed"}
+> ```
+>
+> **原因**: Open WebUI は redirect URI を `{WEBUI_URL}/oauth/clients/{client_id}/callback` として組み立てます
+> （`backend/open_webui/utils/oauth.py:506,510`。コールバックのルートは `main.py:2632`）。
+> さらに DCR では `token_endpoint_auth_method='client_secret_post'`（`utils/oauth.py:96`）を送るため
+> **confidential client** として扱われ、Stytch の厳しい方のルールが適用されます。
+> MCP 仕様自体は localhost を許容しますが、**プロバイダ側のポリシーが仕様より厳しい**という状況です。
+> Open WebUI 側の設定で公開クライアントに変えることはできません。
+>
+> **対処**: `WEBUI_URL` を、この Open WebUI に**実際に到達できる公開 HTTPS URL** にする。
+> Descript がブラウザをリダイレクトした先に届く必要があるため、飾りの URL では動きません。
+>
+> | 方法              | 例                                               | 注意                                                                                                         |
+> | ----------------- | ------------------------------------------------ | ------------------------------------------------------------------------------------------------------------ |
+> | Cloudflare Tunnel | `cloudflared tunnel --url http://localhost:8080` | 無料・即時。ただし quick tunnel は**起動のたびにホスト名が変わる**。繰り返し使うなら named tunnel で固定する |
+> | ngrok             | `ngrok http 8080`                                | 無料枠でも静的ドメインを 1 つ確保でき、ホスト名を固定できる                                                  |
+> | 実ドメイン + TLS  | Caddy / nginx + Let's Encrypt                    | 本番はこれ                                                                                                   |
+>
+> ### ⚠️ `WEBUI_URL` は `.env` を書き換えても反映されません
+>
+> `WEBUI_URL` は **PersistentConfig** です。`models/config.py` の `seed_defaults` は
+> 「Existing DB values take precedence over defaults」と実装されており、
+> **初回起動で DB に入った値が以後は正**になります。
+>
+> 変更は **Admin Panel → Settings → General → `WEBUI_URL`**
+> （`src/lib/components/admin/Settings/General.svelte:356`）で行ってください。
+>
+> 変更したら、**Register Client を押し直す**こと。
+> 前回登録されたクライアントには不正な redirect URI が焼き付いているため作り直しが必要です。
+> また、OAuth を行う間はトンネルを起動したままにしてください。
+
 **Admin Panel → Settings → External Tools → ＋（Add Server）**
 
 | 項目           | 値                                |
@@ -198,29 +238,53 @@ https://github.com/A-clear/short-video-creation/blob/main/functions/descript_gua
 
 ## 7. `probe` でツール名を確定させる（最重要）
 
-Descript MCP は個々のツール名・引数スキーマを公開していないため、**実行時に確認して Valve に固定する**。
+Descript MCP は個々のツール名・引数スキーマを公開ドキュメントに載せていないため、**実行時に確認して Valve に固定する**。
+
+### 7-1. 確定済みの設定値（2026-08-02 時点）
+
+**すでに実機で確認済みなので、以下をそのまま `descript_pipe` の Valves に設定すれば動きます。**
+
+| Valve                  | 設定値                     | 自動解決     |
+| ---------------------- | -------------------------- | ------------ |
+| `tool_list_projects`   | `list_projects`            | ✓            |
+| `tool_get_project`     | `get_project`              | ✓            |
+| `tool_import_media`    | `import_media`             | ✓            |
+| **`tool_agent_edit`**  | **`prompt_project_agent`** | ✗ **要設定** |
+| `tool_publish`         | `publish_project`          | ✓            |
+| **`tool_job_status`**  | **`wait_for_job`**         | ✗ **要設定** |
+| `tool_export_timeline` | `export_timeline`          | —            |
+| `tool_resolution_mode` | `valve_only`               | —            |
+
+`tool_agent_edit` と `tool_job_status` の 2 つは名前が想像しにくく**正規表現では自動解決されません**。必ず手で設定してください。
+
+> **なぜ `valve_only` にするのか**
+> 既定の `regex_then_llm` は、Valve が空のとき正規表現と LLM でツール名を推定する。初回セットアップを楽にするための仕組みだが、推定は外れることがあり、LLM 呼び出しの分だけ遅く高価になる。**ツール名が確定したら `valve_only` に固定するのが本番の正しい状態。**
+
+### 7-2. Descript 側が変わったときの確認方法
+
+上表が合わなくなった場合（Descript のアップデート等）は、次の手順で取り直す。
 
 1. チャットで何か 1 通送信し、アシスタントの応答を出す
 2. 応答メッセージの下に出る **「Descript MCP 診断」** ボタンを押す
-3. ツール一覧が表として表示される
+3. 全ツールの名前・説明・必須引数が表として表示される
+4. 表の「推定」列を見て、各論理操作に対応する実ツール名を読み取り Valve に転記する
 
-| ツール名           | 推定                 | 説明 / 必須引数 |
-| ------------------ | -------------------- | --------------- |
-| （実際のツール名） | `list_projects` など | …               |
+### 7-3. 参考：確認できた全 12 ツール
 
-4. 表の「推定」列を見て、6 つの論理操作それぞれに対応する実ツール名を読み取る
-5. **`descript_pipe` の Valves に転記する**
-
-| Valve                | 対応する論理操作          |
-| -------------------- | ------------------------- |
-| `tool_list_projects` | プロジェクト一覧          |
-| `tool_get_project`   | プロジェクト詳細          |
-| `tool_import_media`  | メディア取込              |
-| `tool_agent_edit`    | Underlord 編集            |
-| `tool_publish`       | 書き出し / 共有リンク生成 |
-| `tool_job_status`    | 非同期ジョブの状態取得    |
-
-6. 全部埋めたら **`tool_resolution_mode` を `valve_only` に変更する**
+| ツール名               | 用途                                                                       |
+| ---------------------- | -------------------------------------------------------------------------- |
+| `list_projects`        | プロジェクト一覧（カーソルページング対応）                                 |
+| `get_project`          | プロジェクト詳細（メディア・コンポジション・既存の publish 一覧）          |
+| `list_folders`         | フォルダ階層の閲覧                                                         |
+| `import_media`         | メディア取込（URL / Google Drive / Dropbox / 直接アップロード）            |
+| `prompt_project_agent` | Underlord による自然言語編集                                               |
+| `publish_project`      | 共有リンクの生成（Video / Audio）                                          |
+| **`export_timeline`**  | **タイムライン書き出し（FCPXML / Premiere / DaVinci / AAF / EDL / SESX）** |
+| `export_transcript`    | 文字起こし書き出し（txt / markdown / html / rtf / **srt**）                |
+| `wait_for_job`         | ジョブ完了待ち（ブロッキング。既定 300 秒）                                |
+| `list_jobs`            | ジョブ一覧                                                                 |
+| `cancel_job`           | ジョブのキャンセル                                                         |
+| `report_upload_status` | 直接アップロードの失敗通知                                                 |
 
 > **なぜ `valve_only` にするのか**
 > 既定の `regex_then_llm` は、Valve が空のとき正規表現と LLM でツール名を推定する。これは初回セットアップを楽にするための仕組みだが、推定は外れることがあり、LLM 呼び出しの分だけ遅く高価になる。**ツール名が確定したら `valve_only` に固定するのが本番の正しい状態。**
@@ -305,11 +369,35 @@ Descript MCP は個々のツール名・引数スキーマを公開していな�
 
 ### 9-4. エクスポート
 
-「タイムラインのエクスポート」ボタン → プロジェクト選択 → 共有リンクと Descript App へのリンクが表示される。
+「タイムラインのエクスポート」ボタン → プロジェクト選択 → **出力形式の選択** → 結果が表示される。
 
-**FCPXML（Final Cut Pro 形式）への書き出しは Descript App 側で行う。** リンクから遷移し、Descript のタイムラインエクスポート機能を使う。
+選べる形式は 8 つ。
 
-> ℹ️ Descript の Public API に FCPXML 書き出しのエンドポイントは存在しない（`JobStatus` の discriminator に `export/timeline` のマッピングだけがあり、スキーマもエンドポイントも未定義）。MCP 側にあるかは未確認。設計上は共有リンクと App URL の提示までで閉じている。
+| 選択肢                         | 出力                                  | 使うツール                            |
+| ------------------------------ | ------------------------------------- | ------------------------------------- |
+| 動画の共有リンク（Video）      | `https://share.descript.com/view/...` | `publish_project`                     |
+| 音声の共有リンク（Audio）      | 同上（Video とは別 URL）              | `publish_project`                     |
+| **Final Cut Pro X（.fcpxml）** | ダウンロードリンク                    | `export_timeline` (`fcp`)             |
+| Premiere Pro XML               | 同上                                  | `export_timeline` (`premiere`)        |
+| DaVinci Resolve XML            | 同上                                  | `export_timeline` (`davinci_resolve`) |
+| Pro Tools / Logic（AAF）       | 同上                                  | `export_timeline` (`aaf`)             |
+| EDL（Samplitude / Reaper）     | 同上                                  | `export_timeline` (`edl`)             |
+| Adobe Audition（.sesx）        | 同上                                  | `export_timeline` (`sesx`)            |
+
+既定の形式は `descript_studio` の UserValve `default_export_format` で変えられる。
+
+> ⚠️ **タイムライン書き出しにメディアファイルは含まれない。** タイムライン / XML / EDL ファイルのみが出力される。編集先の NLE で元素材をリンクし直す必要がある。
+>
+> ⚠️ **ダウンロードリンクは期限付き**（`download_url_expires_at` まで）。チャット履歴には残らないので、その場でダウンロードすること。期限が切れたらもう一度エクスポートすればよい。
+
+<details>
+<summary>設計変更の経緯（当初の記述からの訂正）</summary>
+
+当初この手順書には「FCPXML への書き出しは Descript App 側で行う。Public API にエンドポイントが存在しない」と記載していた。これは `docs/RequirementDefinition/DA/descript_api.json`（REST API 仕様）に `export/timeline` の schema もエンドポイントも定義されていないことに基づく判断だった。
+
+しかし実機で `probe` を実行したところ、**MCP には `export_timeline` ツールが存在**し、`format: "fcp"` で .fcpxml を直接取得できることが判明した。BA 要件の「FCPXML 双方向連携」は MCP 経由で直接満たせる。
+
+</details>
 
 ---
 
