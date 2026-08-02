@@ -36,22 +36,21 @@ git submodule status                        # 現在ピン留めされている�
 
 `full-stack/open-webui` 配下を変更した場合は、**submodule 内でコミット → 親リポジトリで submodule ポインタをコミット**の 2 段階が必要。
 
-フォーク独自の差分は現時点で 2 コミットのみ（upstream との乖離を最小に保つ方針）:
+フォーク独自の差分は現時点で 1 コミットのみ（upstream との乖離を最小に保つ方針）:
 
 - `.open-webui/agents.txt`, `llms.txt`, `llms-full.txt` — Open WebUI 公式ドキュメントのエージェント向けインデックス。Open WebUI の仕様を調べるときはまずここ（`https://docs.openwebui.com/api/search?q=...`、任意ページに `.md` を付けると Markdown 取得）を参照する
-- `backend/dev.sh` — 開発起動時に `WEBUI_SECRET_KEY` を自動生成（v0.11.0 以降は必須。未設定だと backend が起動しない）
 
 Open WebUI 本体（`backend/open_webui/`, `src/`）への改変は原則行わない。upstream 追従が壊れるため、機能追加は後述の Functions として実装する。
 
+**submodule を書き換えたくなったら、まず親リポジトリ側で解決できないか検討する。** `kamegin4-aws` は `A-clear/open-webui` に push 権限を持たない（`pull` のみ）ため、submodule にコミットすると親が push できない submodule コミットを pin してしまい、`git push` が `must name a ref` で落ちる。実例として `WEBUI_SECRET_KEY` の自動生成は `backend/dev.sh` を書き換えず、親側の `scripts/dev-backend.sh`（ラッパー）に逃がしてある。
+
 ## 開発コマンド
 
-すべて `full-stack/open-webui/` 配下で実行する。フロントエンド（SvelteKit :5173）とバックエンド（FastAPI :8080）を別プロセスで起動する構成。
+フロントエンド（SvelteKit :5173）とバックエンド（FastAPI :8080）を別プロセスで起動する構成。
 
 ```bash
-# バックエンド（Python 3.11 / venv は backend/venv に既存）
-cd full-stack/open-webui/backend
-source venv/bin/activate
-./dev.sh                      # uvicorn --reload、:8080、CORS を :5173 に許可、シークレット鍵を自動生成
+# バックエンド（Python 3.11 / venv は backend/venv に既存）。ルートで実行
+./scripts/dev-backend.sh      # 鍵を用意 → venv 有効化 → submodule の backend/dev.sh に exec
 
 # フロントエンド
 cd full-stack/open-webui
@@ -186,5 +185,5 @@ Function の種別は定義したクラス名で決まる（`Pipe` / `Filter` / 
 - `full-stack/open-webui/.env`（OpenAI API キー等を含む）と `backend/.webui_secret_key` はいずれも gitignore 済みのローカル専用ファイル。中身をログ・コミット・出力に露出させない
 - `.env.example` は 2 つある。**ルート直下のもの**が本プロジェクトの正（PostgreSQL / Redis / PGVector / MinIO / プロバイダ / Tavily / MCP を含むスケーリング構成）。`full-stack/open-webui/.env.example` は upstream 由来で、submodule 単体を開発起動するとき用
 - `WEBUI_SECRET_KEY` は**全レプリカで同一の値**にすること。値が変わると OAuth 連携ツール（Descript MCP など）の保存済みトークンを復号できなくなり `Error decrypting tokens` になる
-- submodule 先 `A-clear/open-webui` は別リポジトリ。親を public にしても連動しないため、private のままだと第三者は `git submodule update` に失敗する
+- submodule 先 `A-clear/open-webui` は別リポジトリ（public）。読み取りは誰でもできるが `kamegin4-aws` に push 権限は無い。submodule にコミットを積むと親が push 不能になる点に注意
 - `full-stack/open-webui/backend/venv/` はコミット対象外のローカル環境。作り直す場合は `pip install -r backend/requirements.txt`
