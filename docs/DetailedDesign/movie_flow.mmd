@@ -9,14 +9,14 @@ sequenceDiagram
 
     box Interface
     end
-    
+
     box Application
-    participant OpenWebUI_Backendend
+    participant OpenWebUI_Backend
     end
 
     box Middleware
     end
-    
+
     box Repository
     participant Redis
     participant PostgreSQL
@@ -26,7 +26,6 @@ sequenceDiagram
 
     box Google
     participant OAuthClient
-    participant FoundationModel
     end
 
     box OpenWebUI
@@ -56,121 +55,149 @@ sequenceDiagram
     end
 
     Note over OpenWebUI_Frontend,DescriptApp: 動画のアップロード
-    OpenWebUI_Frontend->>ActionsFunctions: 動画のアップロード
 
+    OpenWebUI_Frontend->>ActionsFunctions: 動画のアップロード(Action ボタン)
+
+    Note over ActionsFunctions: Action には添付ファイルが渡らない<br/>(body.messages に files が無い)ため<br/>フォーム側でファイルを取得する
     ActionsFunctions->>OpenWebUI_Frontend: 入力フォーム(プロジェクト名, 動画)
-    OpenWebUI_Frontend-->>ActionsFunctions: 結果
+    OpenWebUI_Frontend->>OpenWebUI_Backend: ファイルのアップロード
+    OpenWebUI_Backend->>MinIO: 保存
+    OpenWebUI_Backend-->>OpenWebUI_Frontend: file_id
+    OpenWebUI_Frontend-->>ActionsFunctions: プロジェクト名, file_id / URL
 
-    ActionsFunctions->>PipesFunctions: 動画のアップロード
+    ActionsFunctions->>PipesFunctions: ensure_project(name)
+    PipesFunctions->>DescriptMCP: 接続(OAuth トークンは Open WebUI が保持)
+    PipesFunctions->>DescriptMCP: list_projects(name)
+    DescriptMCP->>DescriptApp: List projects
+    DescriptMCP-->>PipesFunctions: 一覧
+    PipesFunctions-->>ActionsFunctions: project_id
 
-    PipesFunctions->>DescriptMCP: プロジェクト一覧
+    ActionsFunctions->>PipesFunctions: import_media(project_id, source_url / file_id)
+    PipesFunctions->>DescriptMCP: import_media
+    DescriptMCP->>DescriptApp: Import media and sequences
+    DescriptMCP-->>PipesFunctions: job_id
 
-    DescriptMCP->>DescriptApp: List projects(name)
-    DescriptMCP->>DescriptApp: Import media and sequences(project_name)
+    loop ジョブが完了するまで(指数バックオフ)
+        PipesFunctions->>DescriptMCP: job_status(job_id)
+        DescriptMCP-->>PipesFunctions: job_state, progress
+        PipesFunctions->>OpenWebUI_Frontend: status イベント(進捗)
+    end
 
-    DescriptMCP-->>PipesFunctions: 結果
+    Note over PipesFunctions: job_state=stopped は「終了」であって成功ではない<br/>result.status(success / partial / error)で判定する
+
+    PipesFunctions->>PostgreSQL: state を保存(chat.chat.descript)
     PipesFunctions-->>ActionsFunctions: 結果
     ActionsFunctions-->>OpenWebUI_Frontend: 結果
 
     Note over OpenWebUI_Frontend,DescriptApp: 動画の編集
-    OpenWebUI_Frontend->>ActionsFunctions: 動画の編集
 
-    ActionsFunctions->>PipesFunctions: プロジェクトの取得
-
-    PipesFunctions->>DescriptMCP: プロジェクト一覧を取得
-
+    OpenWebUI_Frontend->>ActionsFunctions: 動画の編集(Action ボタン)
+    ActionsFunctions->>PipesFunctions: list_projects
+    PipesFunctions->>DescriptMCP: list_projects
     DescriptMCP->>DescriptApp: List projects
+    DescriptMCP-->>PipesFunctions: 一覧
+    PipesFunctions-->>ActionsFunctions: 一覧
 
-    alt 0件以上
-        DescriptMCP-->>PipesFunctions: 結果
-        PipesFunctions-->>ActionsFunctions: 結果
-
+    alt 1件以上
         ActionsFunctions->>OpenWebUI_Frontend: 入力フォーム(プロジェクト名選択)
-        OpenWebUI_Frontend-->>ActionsFunctions: 結果
+        OpenWebUI_Frontend-->>ActionsFunctions: project_id
 
-        ActionsFunctions->>PipesFunctions: プロジェクトの取得
-        
-        PipesFunctions->>DescriptMCP: プロジェクトの取得
-        DescriptMCP->>DescriptApp: Get project details(name)
-        DescriptMCP-->>PipesFunctions: 結果
-        PipesFunctions-->>ActionsFunctions: 結果
+        ActionsFunctions->>PipesFunctions: get_project(project_id)
+        PipesFunctions->>DescriptMCP: get_project
+        DescriptMCP->>DescriptApp: Get project details
+        DescriptMCP-->>PipesFunctions: 詳細
+        PipesFunctions-->>ActionsFunctions: 詳細
 
-        ActionsFunctions->>OpenWebUI_Frontend: 入力フォーム(プロジェクトに含まれている動画の表示, 編集指示)
-        OpenWebUI_Frontend-->>ActionsFunctions: 結果
+        ActionsFunctions->>OpenWebUI_Frontend: embeds(含まれる動画の一覧)
+        ActionsFunctions->>OpenWebUI_Frontend: 入力フォーム(編集指示)
+        OpenWebUI_Frontend-->>ActionsFunctions: 編集指示
 
-        ActionsFunctions->>PipesFunctions: 動画の編集
+        ActionsFunctions->>PipesFunctions: start_edit_loop(project_id, instruction)
+        Note over ActionsFunctions: 以降は Pipe が継続するため<br/>Action はここで早期 return する<br/>(リバースプロキシの切断対策)
 
         PipesFunctions->>Prompts: システムプロンプトの取得
+        Prompts-->>PipesFunctions: システムプロンプト
         PipesFunctions->>Models: モデルの取得
+        Models-->>PipesFunctions: モデル
+        PipesFunctions->>LLMModel: 編集プロンプトの生成(指示 + 機能フラグ + 尺 + アスペクト比)
+        LLMModel-->>PipesFunctions: 編集プロンプト
 
-        Models->>LLMModel: モデルの取得
-        Models-->>PipesFunctions: 結果
+        loop 確定するまで(最大 max_edit_iterations 回)
+            PipesFunctions->>DescriptMCP: agent_edit(project_id, prompt, conversation_id)
+            DescriptMCP->>DescriptApp: Agent edit(Underlord)
+            DescriptMCP-->>PipesFunctions: job_id
 
-        PipesFunctions->>LLMModel: システムプロンプト,編集指示から編集プロンプトを生成
-        
-        loop 確定するまで
-            PipesFunctions->>DescriptMCP: 動画編集
-            DescriptMCP->>DescriptApp: Agent edit(project_name,prompt)
-            DescriptMCP-->>PipesFunctions: 結果
+            loop ジョブが完了するまで
+                PipesFunctions->>DescriptMCP: job_status(job_id)
+                DescriptMCP-->>PipesFunctions: job_state, progress
+                PipesFunctions->>OpenWebUI_Frontend: status イベント(進捗)
+            end
 
-            PipesFunctions->>DescriptMCP: 動画をダウンロード
-            DescriptMCP->>DescriptApp: Publish project media(project_id,media_type)
-            DescriptMCP-->>PipesFunctions: 結果
-            PipesFunctions-->>ActionsFunctions: 結果
+            PipesFunctions->>DescriptMCP: publish(project_id, media_type)
+            DescriptMCP->>DescriptApp: Publish project media
+            DescriptMCP-->>PipesFunctions: job_id
 
-            ActionsFunctions->>OpenWebUI_Frontend: 入力フォーム(exported動画の表示, 編集指示, 確定)
-            OpenWebUI_Frontend-->>ActionsFunctions: 結果
-            ActionsFunctions->>PipesFunctions: 結果
+            loop ジョブが完了するまで
+                PipesFunctions->>DescriptMCP: job_status(job_id)
+                DescriptMCP-->>PipesFunctions: job_state, progress
+            end
 
+            PipesFunctions->>PostgreSQL: state を保存(project_id, conversation_id, revision, share_url)
+            PipesFunctions->>OpenWebUI_Frontend: embeds(プレビュー再生 + 再指示欄 + 確定ボタン)
+
+            Note over PipesFunctions: ここで Pipe は 1 周を終える<br/>__event_call__ を開いたまま待つと<br/>WEBSOCKET_EVENT_CALLER_TIMEOUT(既定 300 秒)に抵触するため
+
+            OpenWebUI_Frontend->>OpenWebUI_Frontend: postMessage(input:prompt:submit)
+            OpenWebUI_Frontend->>FiltersFunctions: inlet(通常チャットとして再入)
+
+            Note over FiltersFunctions: MCP の OAuth 同意を事前検査し<br/>未認可なら LLM を呼ぶ前に打ち切る
+
+            FiltersFunctions->>PipesFunctions: resume_edit_loop(action, text)
+            PipesFunctions->>PostgreSQL: state を復元(project_id, conversation_id, revision)
         end
 
-        PipesFunctions->>DescriptMCP: 動画をダウンロード
-        DescriptMCP->>DescriptApp: Publish project media(project_id,media_type)
-        DescriptMCP-->>PipesFunctions: 結果
-        PipesFunctions-->>ActionsFunctions: 結果
-        ActionsFunctions-->>OpenWebUI_Frontend: 結果
+        PipesFunctions->>DescriptMCP: publish(確定版)
+        DescriptMCP->>DescriptApp: Publish project media
+        DescriptMCP-->>PipesFunctions: share_url
+        PipesFunctions->>FiltersFunctions: outlet
+        Note over FiltersFunctions: 期限付き署名 URL を恒久リンク(share_url)へ差し替える<br/>履歴に残すと後日 403 になるため
+        FiltersFunctions-->>OpenWebUI_Frontend: 結果
 
-        
-    else それ以外
-        DescriptMCP-->>PipesFunctions: 結果
-        PipesFunctions-->>ActionsFunctions: 結果
-        ActionsFunctions-->>OpenWebUI_Frontend: 結果
-
+    else 0件
+        ActionsFunctions-->>OpenWebUI_Frontend: プロジェクトが無い旨を案内
     end
 
     Note over OpenWebUI_Frontend,DescriptApp: タイムラインのエクスポート
-    OpenWebUI_Frontend->>ActionsFunctions: タイムラインのエクスポート
 
-    ActionsFunctions->>PipesFunctions: プロジェクトの取得
-
-    PipesFunctions->>DescriptMCP: プロジェクト一覧を取得
-
+    OpenWebUI_Frontend->>ActionsFunctions: タイムラインのエクスポート(Action ボタン)
+    ActionsFunctions->>PipesFunctions: list_projects
+    PipesFunctions->>DescriptMCP: list_projects
     DescriptMCP->>DescriptApp: List projects
+    DescriptMCP-->>PipesFunctions: 一覧
+    PipesFunctions-->>ActionsFunctions: 一覧
 
-    alt 0件以上
-        DescriptMCP-->>PipesFunctions: 結果
-        PipesFunctions-->>ActionsFunctions: 結果
-
+    alt 1件以上
         ActionsFunctions->>OpenWebUI_Frontend: 入力フォーム(プロジェクト名選択)
-        OpenWebUI_Frontend-->>ActionsFunctions: 結果
+        OpenWebUI_Frontend-->>ActionsFunctions: project_id
 
-        ActionsFunctions->>PipesFunctions: プロジェクトの公開
+        ActionsFunctions->>PipesFunctions: publish(project_id, media_type)
+        PipesFunctions->>DescriptMCP: publish
+        DescriptMCP->>DescriptApp: Publish project media
+        DescriptMCP-->>PipesFunctions: job_id
 
-        PipesFunctions->>DescriptMCP: プロジェクトの公開
-        DescriptMCP->>DescriptApp: Publish project media(project_id,media_type)
-        DescriptMCP-->>PipesFunctions: 結果
-        PipesFunctions-->>ActionsFunctions: 結果
-        ActionsFunctions-->>OpenWebUI_Frontend: 結果
+        loop ジョブが完了するまで
+            PipesFunctions->>DescriptMCP: job_status(job_id)
+            DescriptMCP-->>PipesFunctions: job_state, progress
+        end
+
+        PipesFunctions-->>ActionsFunctions: share_url, Descript App URL
+        ActionsFunctions->>OpenWebUI_Frontend: embeds(プレビュー + リンク)
 
         OpenWebUI_Frontend->>DescriptApp: プロジェクトに遷移
-        
-        DescriptApp->>DescriptApp: Timeline export
-        
-    else それ以外
-        DescriptMCP-->>PipesFunctions: 結果
-        PipesFunctions-->>ActionsFunctions: 結果
-        ActionsFunctions-->>OpenWebUI_Frontend: 結果
+        DescriptApp->>DescriptApp: Timeline export(Final Cut Pro 形式)
 
+        Note over DescriptApp: FCPXML 書き出しは Descript App 側で行う<br/>Public API に該当エンドポイントが存在しないため<br/>(MCP 側にあるかは未確認)
+
+    else 0件
+        ActionsFunctions-->>OpenWebUI_Frontend: プロジェクトが無い旨を案内
     end
-
-    

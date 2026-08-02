@@ -1,2 +1,13 @@
 # Temp
 temp/
+
+# 環境変数（このリポジトリは public。実際の鍵を絶対にコミットしないこと）
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/

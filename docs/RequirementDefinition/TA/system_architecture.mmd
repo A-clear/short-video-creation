@@ -31,18 +31,31 @@ flowchart LR
         subgraph Vercel Compute
             open-webui@{ img: "https://work-kameya-public.s3.ap-northeast-1.amazonaws.com/open-web-ui.png", label: "Open WebUI", w: 60, h: 60, constraint: "on" }
         end
-        
+
     end
-    
+
+    subgraph Data["Data Layer (スケーリング対応)"]
+        direction LR
+        postgres@{ img: "https://api.iconify.design/logos:postgresql.svg", label: "PostgreSQL", w: 60, h: 60, constraint: "on" }
+        pgvector@{ img: "https://api.iconify.design/logos:postgresql.svg", label: "PGVector", w: 60, h: 60, constraint: "on" }
+        redis@{ img: "https://api.iconify.design/logos:redis.svg", label: "Redis", w: 60, h: 60, constraint: "on" }
+        minio@{ img: "https://api.iconify.design/simple-icons:minio.svg", label: "MinIO", w: 60, h: 60, constraint: "on" }
+    end
+
     user <--> |アクセス| internet
-    
+
     internet <--> |WebApp チャットの表示| open-webui
-    
+
     open-webui <--> |認証| oauth-client
     open-webui <--> |プロンプト| gpt
     open-webui <--> |MCPサーバのリクエスト/レスポンス| descript-mcp
 
     descript-mcp <--> |descriptの操作| descript-app
+
+    open-webui <--> |チャット履歴 / 設定 / 編集ジョブの状態| postgres
+    open-webui <--> |ベクトル検索| pgvector
+    open-webui <--> |WebSocket セッション共有| redis
+    open-webui <--> |アップロード動画の共有ストレージ| minio
     
     
     
