@@ -1,0 +1,1057 @@
+# Functions 共通契約（Descript ショート動画作成）
+
+本書は `functions/` 配下の 3 つの Open WebUI Function が共有する契約の**正本**である。
+
+| ファイル                       | function_id       | 種別                    | 責務                                           |
+| ------------------------------ | ----------------- | ----------------------- | ---------------------------------------------- |
+| `functions/descript_studio.py` | `descript_studio` | Action（マルチ 4 サブ） | UI 層。フォーム収集と Pipe への RPC            |
+| `functions/descript_pipe.py`   | `descript_pipe`   | Pipe（単一）            | オーケストレーション層。MCP・ジョブ・LLM・状態 |
+| `functions/descript_guard.py`  | `descript_guard`  | Filter                  | 前後処理。RAG 迂回・URL 恒久化・事前診断       |
+
+> **1 Function = 自己完結した 1 ファイル。** Open WebUI に登録できるのは 1 ファイル分のコードだけで、リポジトリ内の相対 import は解決されない。本書 §5 の共通ヘルパは**各ファイルにインライン展開する**（コピー元は常に本書）。
+
+---
+
+## 1. Action → Pipe の RPC 契約
+
+Action は `open_webui.utils.chat.generate_chat_completion` で Pipe モデルを起動する。`form_data` の `metadata` 以外の任意キーは Pipe の `body` に素通しされる（`backend/open_webui/functions.py:206`）ため、それを RPC 引数として使う。
+
+### 1.1 リクエスト（Action が組み立てる `form_data`）
+
+```python
+{
+    "model":    <valves.pipe_model_id>,      # 既定 "descript_pipe"
+    "messages": [{"role": "user", "content": <人間可読の要約 1 行>}],
+    "stream":   False,                       # ★ 必ず False
+    "descript_op":   "<op 名>",              # §1.3 の一覧
+    "descript_args": {...},                  # op ごとの引数
+    "metadata": {
+        "user_id":    __user__["id"],
+        "chat_id":    body["chat_id"],
+        "session_id": body["session_id"],
+        "message_id": body["id"],            # ★ Action の body['id'] を再利用（新規 UUID 禁止）
+        "task":       None,
+        "files":      [],
+        "tool_ids":   [],
+    },
+}
+```
+
+**`stream=False` が必須の理由**: `True` にすると `StreamingResponse` が返り（`functions.py:333`）、Action の同期 HTTP レスポンスとして JSON シリアライズできない。`False` なら plain dict が返る（`functions.py:334-350`）。
+
+**`message_id` に `body['id']` を再利用する理由**: フロントは `history.messages[event.message_id]` が存在しないイベントを黙って捨てる（`src/lib/components/chat/Chat.svelte:962`）。新規 UUID を振ると `status`/`embeds` が描画されず、`input`/`confirmation` は `cb` が呼ばれないまま 300 秒でタイムアウトする（`backend/open_webui/socket/main.py:1119`）。
+
+呼び出し方:
+
+```python
+res = await generate_chat_completion(
+    __request__, form_data, _as_user_model(__user__), bypass_filter=self.valves.bypass_model_access
+)
+envelope = _unpack_pipe_response(res)   # §5.6
+```
+
+### 1.2 レスポンス（Pipe が返す封筒）
+
+Pipe は**常に単一の JSON 文字列**を返し、それが `choices[0].message.content` に入る。Action は `_unpack_pipe_response()` で復号する。
+
+```jsonc
+// 成功
+{ "ok": true,  "op": "list_projects", "data": { ... }, "state": { ... } }
+// 失敗
+{ "ok": false, "op": "agent_edit", "code": "JOB_FAILED",
+  "message_ja": "編集ジョブが失敗しました。", "hint": "…", "data": { ... } }
+```
+
+`state` は保存後の `chat.chat["descript"]` のスナップショット（Action は表示にのみ使う）。
+
+### 1.3 `descript_op` 一覧
+
+| op                 | `descript_args`                                                                                                   | 成功時 `data`                                                                                | 備考                                                                                                                |
+| ------------------ | ----------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------- |
+| `probe`            | `{}`                                                                                                              | `{"tools": [<tool_spec>...], "resolved": {<論理op>: <実ツール名 or null>}, "server": {...}}` | **依存ゼロ。最初に実装する。** MCP 疎通とツール名確定の唯一の手段                                                   |
+| `list_projects`    | `{"name": str?}`                                                                                                  | `{"projects": [{"id","name","updated_at"?,"folder_path"?}]}`                                 | `name` は部分一致フィルタ                                                                                           |
+| `get_project`      | `{"project_id": str}`                                                                                             | `{"project": {"id","name","media_files":{...},"compositions":[...]}}`                        |                                                                                                                     |
+| `ensure_project`   | `{"name": str}`                                                                                                   | `{"project_id": str, "project_name": str, "created": bool}`                                  | 一覧を引いて同名があれば再利用、無ければ新規扱いにする                                                              |
+| `import_media`     | `{"project_id": str?, "project_name": str?, "source_url": str?, "file_id": str?}`                                 | `{"project_id","project_url","media": {...}}`                                                | `source_url` / `file_id` はどちらか。**どちらを使うかは MCP スキーマ確定後に決定**（§7 未確定事項）                 |
+| `agent_edit`       | `{"project_id": str, "composition_id": str?, "prompt": str, "conversation_id": str?}`                             | `{"agent_response": str, "project_changed": bool, "conversation_id": str?}`                  | `prompt` は Pipe が LLM で合成した最終プロンプト                                                                    |
+| `publish`          | `{"project_id": str, "composition_id": str?, "media_type": str?, "resolution": str?}`                             | `{"share_url": str, "download_url": str?, "composition_id": str?}`                           |                                                                                                                     |
+| `start_edit_loop`  | `{"project_id": str, "instruction": str, "style": str, "aspect": str, "duration_sec": int, "auto_confirm": bool}` | `{"revision": int, "share_url": str, "agent_response": str, "awaiting": "user"\|"done"}`     | プロンプト合成 → agent_edit → publish → プレビュー embed までを 1 周。`awaiting=="user"` なら embeds フォームで継続 |
+| `resume_edit_loop` | `{"action": "revise"\|"confirm", "text": str?}`                                                                   | `start_edit_loop` と同じ                                                                     | embeds フォームからの再入時。`project_id` 等は state から復元                                                       |
+| `job_status`       | `{"job_id": str}`                                                                                                 | `{"job_state": str, "result": {...}}`                                                        | 手動再開・デバッグ用                                                                                                |
+
+すべての op は失敗時に §4 のエラーコードを返す。**例外を Action まで伝播させない**（Action 側は `try/except` で保険を張るが、正常系は封筒で受ける）。
+
+### 1.4 Filter → Pipe の受け渡し契約（通常チャット経路）
+
+Filter が走るのは「ユーザが Descript Pipe モデルを選んで通常チャットした時」だけである（`generate_chat_completion` を使う Action→Pipe 直接経路は `process_chat_payload` を通らない）。この経路で Filter の `inlet` が `body` に載せるキーを以下に定める。
+
+| キー                 | 書き手       | 読み手                | 内容                                                                                                                                                                   |
+| -------------------- | ------------ | --------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `descript_preflight` | Filter.inlet | **Pipe.pipe（必須）** | 事前診断の結果。`{"ok": false, "code": "MCP_OAUTH_REQUIRED", "message_ja": ..., "hint": ...}`。`ok` が false のとき **Pipe は MCP に接続せず、この封筒をそのまま返す** |
+| `descript_media`     | Filter.inlet | **Pipe.pipe（必須）** | RAG から退避した動画添付のリスト。要素は `{"name": str, "url": str\|None, "file_id": str\|None, "content_type": str\|None}`。`import_media` の入力候補として使う       |
+
+**Pipe 側の実装義務**:
+
+```python
+# ディスパッチの最初に置く
+preflight = (body or {}).get("descript_preflight") or {}
+if preflight and preflight.get("ok") is False:
+    return _fail("preflight", preflight.get("code", "INTERNAL"),
+                 preflight.get("message_ja", ""), preflight.get("hint", ""))
+```
+
+`descript_media` は `descript_op` が無い経路（＝通常チャット）で、`import_media` の `source_url` / `file_id` が未指定のときのフォールバック入力として参照する。
+
+> ⚠️ `body` の独自キーが Pipe まで届くことは、Action→Pipe 直接経路については `functions.py:206`（`params = {'body': form_data}`）で確認済み。通常チャット経路（`process_chat_payload` 経由）については**未検証**。`process_chat_payload` が `form_data` のキーを落とさないことを A7 統合レビューで実機確認すること。落ちる場合は `__metadata__` 経由に切り替える。
+
+### 1.5 進捗マーカー（予約。現状は未使用）
+
+Filter の `stream` は `progress_marker_prefix`（既定 `U+2063 INVISIBLE SEPARATOR` + `DSC:`、UTF-8 で `e2 81 a3 44 53 43 3a`）で始まる行を本文から除去する機能を持つ。
+
+**ただし現行の Pipe はマーカーを一切出力しない。** Pipe は単一の JSON 封筒文字列を返す設計であり、進捗は `__event_emitter__` の `status` イベントで直接送っているためである。したがってこの機能は現時点で**予約（デッドパス）**であり、以下の 2 つの目的で残している。
+
+1. 将来 Pipe をストリーミング化したときの受け口
+2. 内部制御文字列が誤って本文に混ざった場合の防御
+
+**将来マーカーを使う場合の必須条件**: SSE チャンクは任意位置で分割されうるため、Filter はチャンクをまたぐマーカーを検出できない。**Pipe 側が「1 マーカー = 1 チャンク、前後を改行で囲む」形で送出すること**を前提とする。バッファリングは本文欠落のリスクが大きいため Filter 側では行わない。
+
+---
+
+## 2. 論理操作 ↔ MCP ツール名
+
+Descript MCP（`https://api.descript.com/v2/mcp`）は**個々のツール名・引数スキーマを公開していない**。よって実行時ディスカバリを前提とする。
+
+呼び出し側は**常に論理操作名だけを書く**:
+
+```python
+projects = await _mcp_call(client, specs_by_name, tool_map, "list_projects", {})
+```
+
+### 2.1 論理操作は 6 つ
+
+`list_projects` / `get_project` / `import_media` / `agent_edit` / `publish` / `job_status`
+
+### 2.2 解決の 3 段フォールバック（`tool_resolution_mode` Valve で切替）
+
+| モード           | 動作                                                                    |
+| ---------------- | ----------------------------------------------------------------------- |
+| `valve_only`     | Valve `tool_*` の値のみ使用。未設定なら `TOOL_UNRESOLVED`。**本番推奨** |
+| `regex_only`     | Valve → §2.3 の正規表現スコアリング                                     |
+| `regex_then_llm` | Valve → 正規表現 → LLM 選択（既定）                                     |
+
+解決結果は `chat.chat["descript"]["tool_map"]` にキャッシュし、同一チャット内で再解決しない。
+
+### 2.3 正規表現候補（優先順）
+
+```python
+_TOOL_PATTERNS = {
+    "list_projects": [r"^list_?projects?$", r"list.*project", r"projects?_?list", r"^get_?projects?$", r"search.*project"],
+    "get_project":   [r"^get_?project$", r"project.*(detail|info|metadata)", r"^describe_?project$", r"open.*project"],
+    "import_media":  [r"import.*(media|file|video|url)", r"^upload", r"(create|add).*(composition|media)", r"add.*file"],
+    "agent_edit":    [r"agent.*edit", r"^agent$", r"underlord", r"^edit$", r"apply.*edit", r"edit.*project"],
+    "publish":       [r"^publish", r"export.*(video|media|link)", r"^share", r"render"],
+    "job_status":    [r"job.*(status|state)", r"^get_?job$", r"^poll", r"task.*status"],
+}
+```
+
+スコアリング: パターン順に前方優先で加点し、`description` に論理操作の日本語/英語キーワードが含まれればさらに加点。最高得点が 1 件に定まらなければ次の段へ落とす。
+
+### 2.4 引数名の写像
+
+Valve `tool_arg_map`（JSON 文字列）で論理引数名 → 実引数名を写像する。
+
+```json
+{
+  "agent_edit": { "project_id": "projectId", "prompt": "instruction" },
+  "publish": { "media_type": "format" }
+}
+```
+
+`_coerce_args()`（§5.4）が `spec["parameters"]` の `properties` / `required` と突き合わせ、
+① Valve の写像を適用 → ② 大文字小文字・アンダースコア差を吸収して再探索 → ③ それでも該当しないキーは**落とす** → ④ `required` の不足を返す。
+
+---
+
+## 3. 状態スキーマ（`chat.chat["descript"]`）
+
+### 3.1 保存先の選定理由
+
+`Chat.meta` 列には汎用 writer が存在しない（`backend/open_webui/models/chats.py` で meta を書くのは tags 専用の `:729-742` のみ）。`Chat.variables` は通常チャット完了時に `main.py:1420` が列ごと置換するため使えない。
+
+したがって **`chat.chat` JSON blob のトップレベル独自キー `descript`** に置く。フロントは `models` / `messages` / `history` / `params` / `files` しか送らず、`routers/chats.py:1358` の `{**chat.chat, **form_data.chat}` は DB を読み直してからマージするため、独自キーは保存され続ける。
+
+> ⚠️ **`update_chat_by_id` の罠**: `chat_item.title = chat['title'] if 'title' in chat else 'New Chat'`（`models/chats.py:608`）。blob に `title` を含めずに渡すと**チャットタイトルが `New Chat` にリセットされる**。§5.3 の `_save_state()` は必ず `title` を保持する。
+
+### 3.2 スキーマ
+
+```jsonc
+{
+  "descript": {
+    "v": 1, // スキーマバージョン
+    "project_id": "…",
+    "project_name": "…",
+    "composition_id": "…",
+    "conversation_id": "…", // Descript agent の会話継続用
+    "last_job_id": "…",
+    "share_url": "…",
+    "revision": 3, // 編集ループの周回数
+    "instruction": "…", // 直近のユーザ編集指示（原文）
+    "edit_prompt": "…", // LLM が合成した最終プロンプト
+    "awaiting": "user", // "user" | "done" | null
+    "style": "jet_cut",
+    "aspect": "9:16",
+    "duration_sec": 60,
+    "tool_map": { "list_projects": "…", "agent_edit": "…" },
+    "history": [
+      {
+        "ts": 1767225600,
+        "op": "agent_edit",
+        "job": "…",
+        "result": "success",
+        "note": "…",
+      },
+    ],
+  },
+}
+```
+
+### 3.3 書き込み規律
+
+- **書き手は Pipe のみ。Action と Filter は読み取り専用**（同時書き込み競合の回避）。
+  - 例外: Filter の `outlet` は `history` への append のみ許可（Pipe の実行が終わった後に走るため競合しない）。
+- `history` は末尾 50 件で切り詰める。
+- `_save_state()` は read-modify-write。`touch=False` を必ず指定し、チャットの更新日時を汚さない。
+
+---
+
+## 4. エラーコード表
+
+Pipe は失敗時に `{"ok": false, "code": ..., "message_ja": ..., "hint": ..., "data": ...}` を返す。Action は `status(done=True)` ＋ `notification` ＋ メッセージ本文の 3 系統に展開する。
+
+| code                 | 検知条件                                                                                      | `message_ja`                                   | リトライ                     |
+| -------------------- | --------------------------------------------------------------------------------------------- | ---------------------------------------------- | ---------------------------- |
+| `MCP_NOT_FOUND`      | `Config.get('tool_server.connections')` に `type=='mcp'` かつ `info.id==server_id` が無い     | Descript MCP が登録されていません。            | 不可                         |
+| `MCP_FORBIDDEN`      | 接続は存在するが `connect_mcp_server` が `None` を返す（`has_connection_access` 失敗）        | Descript MCP へのアクセス権がありません。      | 不可                         |
+| `MCP_OAUTH_REQUIRED` | `oauth_client_manager.get_oauth_token(user.id, f'mcp:{server_id}')` が `None`／connect が 401 | Descript との連携が未認可です。                | 不可（下記固定文言）         |
+| `MCP_CONNECT_FAILED` | `connect` が例外（`MCP_INITIALIZE_TIMEOUT` 既定 10 秒）                                       | Descript MCP に接続できませんでした。          | `mcp_connect_retries` 回     |
+| `TOOL_UNRESOLVED`    | `_resolve_tools` が該当なし                                                                   | 必要な Descript ツールを特定できませんでした。 | 不可（probe 表を自動表示）   |
+| `TOOL_ARGS_MISSING`  | `_coerce_args` が `required` 不足を返す                                                       | ツールの必須引数が不足しています。             | `input` で 1 回だけ追質問    |
+| `JOB_FAILED`         | `job_state=='stopped'` かつ `result.status=='error'`                                          | 処理が失敗しました。                           | 不可                         |
+| `JOB_PARTIAL`        | `result.status=='partial'`                                                                    | 一部のメディアの処理に失敗しました。           | 継続（warning 通知）         |
+| `JOB_CANCELLED`      | `job_state=='cancelled'`                                                                      | 処理がキャンセルされました。                   | 不可                         |
+| `JOB_TIMEOUT`        | `poll_timeout_sec` 超過                                                                       | 処理が既定時間内に完了しませんでした。         | job_id を state に保存し継続 |
+| `QUOTA_EXCEEDED`     | エラー本文に `402` / `credit` / `quota` / `insufficient`                                      | Descript のクレジットが不足しています。        | **リトライしない**           |
+| `RATE_LIMITED`       | エラー本文に `429` / `rate limit` / `too many`                                                | Descript のレート制限に達しました。            | 指数バックオフ最大 3 回      |
+| `UI_DISCONNECTED`    | `__event_call__` が `{"error": ...}` を返す                                                   | 画面との接続が切れました。                     | 進行中ジョブは中断しない     |
+| `USER_CANCELLED`     | `__event_call__` が `False` を返す                                                            | 中止しました。                                 | —                            |
+| `NO_PROJECT`         | `list_projects` が 0 件                                                                       | Descript にプロジェクトがありません。          | —                            |
+| `INTERNAL`           | 上記以外の例外                                                                                | 内部エラーが発生しました。                     | —                            |
+
+### 4.1 `MCP_OAUTH_REQUIRED` の固定文言（そのまま使う）
+
+```
+Descript との連携が未認可です。チャット入力欄の ＋ ボタン → Integrations → Tools から
+Descript を一度有効化し、ブラウザに表示される同意画面を完了してください。
+（一度完了すれば、以降のトークン更新は自動で行われます）
+```
+
+**自動復帰は不可**。チャット補完リクエストの最中にブラウザリダイレクトを起こせないため（Open WebUI 公式ドキュメント「OAuth 2.1 Tools Cannot Be Set as Default Tools」）。同じ理由で、この MCP を**モデルのデフォルトツールに設定してはいけない**。
+
+### 4.2 `TOOL_UNRESOLVED` の動線
+
+`data` に `{"tools": [<tool_spec>...], "op": "<未解決の論理操作>"}` を載せ、Action 側で `_TOOL_TABLE` テンプレート（§6.2）を embeds 表示する。ユーザ／管理者は表から実ツール名を読み取り、対応する `tool_*` Valve に貼る。**これが実装ブロックを解除する中核動線。**
+
+---
+
+## 5. 共通ヘルパ正本
+
+以下を **3 ファイルすべてに同一内容でインライン展開**する。Filter は §5.1〜5.3 と 5.9 のみ使用する。
+
+### 5.0 import 規約
+
+```python
+import asyncio
+import json
+import re
+import time
+from typing import Any, Optional
+
+from pydantic import BaseModel, Field
+
+from open_webui.models.chats import Chats
+from open_webui.models.users import UserModel
+```
+
+> `replace_imports()`（`backend/open_webui/utils/plugin.py:187-203`）は `from utils` / `from apps` / `from main` / `from config` を**素の文字列置換**で書き換える。`from open_webui.…` と最初から書けば安全。逆に `from utils_of_mine import x` のような文字列も壊されるため、この 4 語で始まる import を書かないこと。
+
+### 5.1 定数・例外
+
+```python
+_STATE_KEY = "descript"
+_STATE_VERSION = 1
+_HISTORY_MAX = 50
+_LOGICAL_OPS = ("list_projects", "get_project", "import_media", "agent_edit", "publish", "job_status")
+
+
+class DescriptError(Exception):
+    """Pipe 内部で送出し、封筒に変換して返すためのエラー。"""
+
+    def __init__(self, code: str, message_ja: str, hint: str = "", data: Any = None):
+        super().__init__(f"{code}: {message_ja}")
+        self.code = code
+        self.message_ja = message_ja
+        self.hint = hint
+        self.data = data
+
+    def envelope(self, op: str = "") -> dict:
+        return {
+            "ok": False,
+            "op": op,
+            "code": self.code,
+            "message_ja": self.message_ja,
+            "hint": self.hint,
+            "data": self.data,
+        }
+```
+
+### 5.2 小物
+
+```python
+def _pick(obj: Any, *keys: str, default: Any = None) -> Any:
+    """dict から最初に見つかった非 None の値を返す。MCP の戻り値のキー揺れ吸収用。"""
+    if not isinstance(obj, dict):
+        return default
+    for key in keys:
+        if obj.get(key) is not None:
+            return obj[key]
+    return default
+
+
+def _norm_key(name: Any) -> str:
+    return re.sub(r"[^a-z0-9]", "", str(name).lower())
+
+
+def _esc(text: Any) -> str:
+    """HTML テンプレートに差し込む前のエスケープ。"""
+    return (
+        str("" if text is None else text)
+        .replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+        .replace('"', "&quot;")
+    )
+
+
+def _render(tpl: str, **kwargs: Any) -> str:
+    """{{key}} を置換するだけの軽量テンプレート。
+
+    str.format() を使わないのは、テンプレート中の CSS の { } を
+    すべてエスケープする必要が生じて保守不能になるため。
+    """
+    out = tpl
+    for key, value in kwargs.items():
+        out = out.replace("{{" + key + "}}", "" if value is None else str(value))
+    return out
+
+
+def _as_user_model(user: Any) -> UserModel:
+    """Action/Pipe の __user__（dict）を UserModel に変換する。
+
+    connect_mcp_server / generate_chat_completion は UserModel を要求する。
+    'valves' は UserValves の pydantic インスタンスなので必ず除去する。
+    """
+    if isinstance(user, UserModel):
+        return user
+    return UserModel(**{k: v for k, v in dict(user or {}).items() if k != "valves"})
+```
+
+### 5.3 状態の読み書き
+
+```python
+async def _load_state(chat_id: Optional[str]) -> dict:
+    if not chat_id:
+        return {}
+    try:
+        chat = await Chats.get_chat_by_id(chat_id)
+    except Exception:
+        return {}
+    if chat is None:
+        return {}
+    state = (chat.chat or {}).get(_STATE_KEY)
+    return dict(state) if isinstance(state, dict) else {}
+
+
+async def _save_state(chat_id: Optional[str], patch: dict) -> dict:
+    """chat.chat['descript'] にパッチをマージして保存し、マージ後の state を返す。
+
+    update_chat_by_id は blob に 'title' が無いとチャットタイトルを
+    'New Chat' にリセットする（models/chats.py:608）ため、必ず補う。
+    """
+    if not chat_id:
+        return dict(patch or {})
+    try:
+        chat = await Chats.get_chat_by_id(chat_id)
+    except Exception:
+        return dict(patch or {})
+    if chat is None:
+        return dict(patch or {})
+
+    blob = dict(chat.chat or {})
+    state = dict(blob.get(_STATE_KEY) or {})
+    state.update(patch or {})
+    state["v"] = _STATE_VERSION
+    if isinstance(state.get("history"), list) and len(state["history"]) > _HISTORY_MAX:
+        state["history"] = state["history"][-_HISTORY_MAX:]
+
+    blob[_STATE_KEY] = state
+    if "title" not in blob:
+        blob["title"] = chat.title or "New Chat"
+
+    try:
+        await Chats.update_chat_by_id(chat_id, blob, touch=False)
+    except Exception:
+        pass
+    return state
+
+
+async def _append_history(chat_id: Optional[str], entry: dict) -> None:
+    state = await _load_state(chat_id)
+    history = list(state.get("history") or [])
+    history.append({"ts": int(time.time()), **entry})
+    await _save_state(chat_id, {"history": history})
+```
+
+### 5.4 引数整形
+
+```python
+def _coerce_args(spec: dict, args: dict, arg_map: Optional[dict] = None) -> tuple[dict, list]:
+    """論理引数名を実引数名に写像し、スキーマに無いキーを落とす。
+
+    戻り値は (整形済み引数, 不足している required キー)。
+    spec['parameters'] が空（スキーマ不明）の場合は素通しする。
+    """
+    arg_map = arg_map or {}
+    schema = (spec or {}).get("parameters") or {}
+    props = schema.get("properties") or {}
+    required = list(schema.get("required") or [])
+
+    normalized = {_norm_key(k): k for k in props}
+    out = {}
+    for key, value in (args or {}).items():
+        if value is None:
+            continue
+        name = arg_map.get(key, key)
+        if props:
+            if name not in props:
+                match = normalized.get(_norm_key(name))
+                if match is None:
+                    continue  # スキーマに無い引数は送らない
+                name = match
+        out[name] = value
+
+    missing = [r for r in required if r not in out]
+    return out, missing
+```
+
+### 5.5 MCP 呼び出し
+
+```python
+def _unwrap_mcp(raw: Any) -> Any:
+    """MCPClient.call_tool の戻り値を正規化する。
+
+    call_tool は CallToolResult.content（コンテンツブロックの配列）を返す
+    （utils/mcp/client.py:117-123）。text ブロックを連結し、JSON なら parse する。
+    """
+    if raw is None or isinstance(raw, dict):
+        return raw
+    if not isinstance(raw, list):
+        return raw
+
+    texts = []
+    for block in raw:
+        if not isinstance(block, dict):
+            continue
+        kind = block.get("type")
+        if kind == "text" and isinstance(block.get("text"), str):
+            texts.append(block["text"])
+        elif kind == "resource":
+            resource = block.get("resource") or {}
+            if isinstance(resource.get("text"), str):
+                texts.append(resource["text"])
+
+    if not texts:
+        return raw
+    joined = "\n".join(texts).strip()
+    try:
+        return json.loads(joined)
+    except Exception:
+        return joined
+
+
+def _classify_mcp_error(exc: Exception, tool_name: str) -> DescriptError:
+    text = str(exc).lower()
+    if any(t in text for t in ("402", "credit", "quota", "insufficient", "payment")):
+        return DescriptError(
+            "QUOTA_EXCEEDED",
+            "Descript のクレジットまたはメディア時間が不足しています。",
+            "Descript の残高をご確認ください。",
+            {"tool": tool_name, "raw": str(exc)[:800]},
+        )
+    if any(t in text for t in ("429", "rate limit", "too many")):
+        return DescriptError(
+            "RATE_LIMITED",
+            "Descript のレート制限に達しました。",
+            "しばらく待ってから再実行してください。",
+            {"tool": tool_name, "raw": str(exc)[:800]},
+        )
+    if any(t in text for t in ("401", "unauthorized", "invalid_token", "expired")):
+        return DescriptError(
+            "MCP_OAUTH_REQUIRED",
+            "Descript との連携が未認可です。",
+            _OAUTH_HINT,
+            {"tool": tool_name, "raw": str(exc)[:800]},
+        )
+    if any(t in text for t in ("403", "forbidden")):
+        return DescriptError(
+            "MCP_FORBIDDEN",
+            "Descript の操作権限がありません。",
+            "対象 Drive での編集権限をご確認ください。",
+            {"tool": tool_name, "raw": str(exc)[:800]},
+        )
+    return DescriptError(
+        "JOB_FAILED",
+        f"Descript ツール '{tool_name}' の実行に失敗しました。",
+        "",
+        {"tool": tool_name, "raw": str(exc)[:800]},
+    )
+
+
+async def _mcp_call(client, specs_by_name: dict, tool_map: dict, op: str,
+                    args: dict, arg_maps: Optional[dict] = None) -> Any:
+    """論理操作名で MCP ツールを呼ぶ。呼び出し側は実ツール名を意識しない。"""
+    name = (tool_map or {}).get(op)
+    if not name:
+        raise DescriptError(
+            "TOOL_UNRESOLVED",
+            f"操作 '{op}' に対応する Descript MCP ツールを特定できませんでした。",
+            "「Descript MCP 診断」アクションでツール名を確認し、対応する Valve に設定してください。",
+            {"op": op, "tools": list(specs_by_name.values())},
+        )
+
+    spec = specs_by_name.get(name) or {}
+    payload, missing = _coerce_args(spec, args, (arg_maps or {}).get(op))
+    if missing:
+        raise DescriptError(
+            "TOOL_ARGS_MISSING",
+            f"ツール '{name}' の必須引数が不足しています: {', '.join(missing)}",
+            "tool_arg_map Valve で引数名の対応を設定してください。",
+            {"tool": name, "missing": missing, "spec": spec},
+        )
+
+    try:
+        raw = await client.call_tool(name, payload)
+    except DescriptError:
+        raise
+    except Exception as exc:
+        raise _classify_mcp_error(exc, name) from exc
+
+    return _unwrap_mcp(raw)
+```
+
+### 5.6 封筒の詰め／開け
+
+```python
+def _ok(op: str, data: Any = None, state: Optional[dict] = None) -> str:
+    return json.dumps(
+        {"ok": True, "op": op, "data": data if data is not None else {}, "state": state or {}},
+        ensure_ascii=False,
+    )
+
+
+def _fail(op: str, code: str, message_ja: str, hint: str = "", data: Any = None) -> str:
+    return json.dumps(
+        {"ok": False, "op": op, "code": code, "message_ja": message_ja, "hint": hint, "data": data},
+        ensure_ascii=False,
+    )
+
+
+def _unpack_pipe_response(res: Any) -> dict:
+    """generate_chat_completion(stream=False) の戻り値から封筒を取り出す。"""
+    if isinstance(res, str):
+        content = res
+    elif isinstance(res, dict):
+        try:
+            content = res["choices"][0]["message"]["content"]
+        except Exception:
+            content = json.dumps(res, ensure_ascii=False)
+    else:
+        content = str(res)
+
+    try:
+        envelope = json.loads(content)
+    except Exception:
+        return {
+            "ok": False,
+            "op": "",
+            "code": "INTERNAL",
+            "message_ja": "オーケストレータの応答を解釈できませんでした。",
+            "hint": "",
+            "data": {"raw": str(content)[:2000]},
+        }
+
+    if not isinstance(envelope, dict) or "ok" not in envelope:
+        return {
+            "ok": False,
+            "op": "",
+            "code": "INTERNAL",
+            "message_ja": "オーケストレータの応答形式が不正です。",
+            "hint": "",
+            "data": {"raw": envelope},
+        }
+    return envelope
+```
+
+### 5.7 `__event_call__` の戻り値判定（Action 専用）
+
+```python
+_OAUTH_HINT = (
+    "チャット入力欄の ＋ ボタン → Integrations → Tools から Descript を一度有効化し、"
+    "ブラウザに表示される同意画面を完了してください。"
+    "（一度完了すれば、以降のトークン更新は自動で行われます）"
+)
+
+
+def _form_result(value: Any) -> tuple[bool, Any, Optional[dict]]:
+    """__event_call__ の戻り値を (成功か, 値, エラー封筒) に分解する。
+
+    ユーザキャンセル -> False（Chat.svelte:3758-3769）
+    タイムアウト/切断 -> {'error': ...}（socket/main.py:1119-1127）
+    """
+    if value is False or value is None:
+        return False, None, {
+            "ok": False, "code": "USER_CANCELLED",
+            "message_ja": "中止しました。", "hint": "", "data": None,
+        }
+    if isinstance(value, dict) and "error" in value:
+        return False, None, {
+            "ok": False, "code": "UI_DISCONNECTED",
+            "message_ja": "画面との接続が切れたため入力を受け取れませんでした。",
+            "hint": "もう一度お試しください。", "data": {"raw": value},
+        }
+    return True, value, None
+```
+
+### 5.8 ジョブポーリング（Pipe 専用）
+
+```python
+async def _poll_job(client, specs_by_name: dict, tool_map: dict, arg_maps: dict,
+                    job_id: str, emit_status, valves) -> dict:
+    """Descript の非同期ジョブを完了まで追跡する。
+
+    job_state は queued -> running -> stopped (+ cancelled)。
+    stopped は「終わった」だけで成功ではない。必ず result.status を見る。
+    """
+    started = time.monotonic()
+    interval = float(valves.poll_interval_sec)
+    ticks = 0
+
+    while True:
+        raw = await _mcp_call(client, specs_by_name, tool_map, "job_status", {"job_id": job_id}, arg_maps)
+        state = str(_pick(raw, "job_state", "state", "status", default="") or "").lower()
+        result = _pick(raw, "result", default={}) or {}
+
+        if state in ("stopped", "completed", "succeeded", "success", "finished"):
+            status = str(_pick(result, "status", "result_status", default="") or "").lower()
+            if status == "success":
+                return {"ok": True, "partial": False, "result": result}
+            if status == "partial":
+                return {"ok": True, "partial": True, "result": result}
+            if status == "":
+                # result を返さない実装向けのフォールバック
+                return {"ok": True, "partial": False, "result": result}
+            raise DescriptError(
+                "JOB_FAILED",
+                str(_pick(result, "error_message", "message", default="処理が失敗しました。")),
+                "",
+                {"job_id": job_id, "result": result},
+            )
+
+        if state in ("cancelled", "canceled"):
+            raise DescriptError("JOB_CANCELLED", "処理がキャンセルされました。", "", {"job_id": job_id})
+
+        ticks += 1
+        elapsed = int(time.monotonic() - started)
+        if ticks % max(1, int(valves.poll_status_every_n)) == 0:
+            progress = _pick(raw, "progress", default={}) or {}
+            label = _pick(progress, "label", default="処理中")
+            percent = _pick(progress, "percent")
+            suffix = f" {percent}%" if percent is not None else ""
+            await emit_status(f"{label}{suffix}（{elapsed} 秒経過 / job {str(job_id)[:8]}）")
+
+        if time.monotonic() - started > float(valves.poll_timeout_sec):
+            raise DescriptError(
+                "JOB_TIMEOUT",
+                f"処理が {int(valves.poll_timeout_sec)} 秒以内に完了しませんでした。",
+                "Descript 側では処理が継続している可能性があります。",
+                {"job_id": job_id},
+            )
+
+        await asyncio.sleep(interval)
+        interval = min(interval * 1.5, float(valves.poll_backoff_max_sec))
+```
+
+### 5.9 署名付き URL の秘匿（Filter・Pipe 共用）
+
+> ⚠️ **`outlet` はチャット履歴の保存内容を不可逆に書き換える。** 誤爆すると無関係な URL が壊れ、元に戻せない。
+> したがって検出条件は「**AWS SigV4 / GCS の署名パラメータを持つ**」ことに限定する。
+> 汎用的な `token=` や `Expires=` 単独は**マッチさせない**（`?token=` を使う社内ツールのリンクなどを巻き込むため）。
+
+```python
+# 署名付き URL の検出。
+# ⚠️ 意図的に「AWS SigV4 / GCS 署名の固有パラメータ」だけに絞っている。
+#    汎用的な token= / Expires= を入れると、Descript と無関係な URL まで
+#    outlet で書き換えてしまい、チャット履歴が不可逆に壊れる。
+_SIGNED_URL_RE = re.compile(
+    r"https?://[^\s\"'<>)\]]+?[?&]"
+    r"(?:X-Amz-Signature|X-Amz-Credential|X-Amz-Security-Token|X-Goog-Signature|GoogleAccessId)"
+    r"=[^\s\"'<>)\]]*",
+    re.IGNORECASE,
+)
+
+_SIGNED_URL_PLACEHOLDER = "（ダウンロードリンクは期限切れのため非表示）"
+
+
+def _redact_signed_urls(text: str, replacement: str = "") -> str:
+    """期限付き署名 URL を除去/置換する。
+
+    Descript の download_url は署名付き・期限付きなので、チャット履歴に
+    残すと後日 403 になる。share_url など恒久リンクに差し替える。
+
+    replacement に恒久 URL（share_url）を渡せばリンクとして生き続ける。
+    空なら注記文言に置き換える。
+    """
+    if not text or not isinstance(text, str):
+        return text
+    return _SIGNED_URL_RE.sub(replacement or _SIGNED_URL_PLACEHOLDER, text)
+```
+
+**追加の防御**: Filter の `outlet` で本文を書き換える前に、`chat.chat["descript"]` が存在するチャットかどうかを確認すること。Descript を使っていないチャットの履歴には一切触れない。
+
+> ⚠️ **未確定 — 実機で 1 回だけ確認すること**
+> このパターンは AWS SigV4 と GCS の署名 URL を前提にしている。実際の SigV4 presigned URL は必ず `X-Amz-Signature` を含むため `X-Amz-Algorithm` / `X-Amz-Date` 単独を拾わなくても実害はない。
+> ただし **Descript の `download_url` がこのどちらでもない独自の署名方式だった場合、マッチせず期限切れ URL が履歴に残る**（後日 403 になる）。
+> E2E で `publish` を 1 回実行し、返ってきた `download_url` のクエリパラメータを確認すること。該当しなければパターンにその署名パラメータ名を追加する。
+> 誤爆側（過剰マッチ）より取りこぼし側（過小マッチ）のほうが被害が小さいため、意図的にこの方向に倒している。
+
+---
+
+## 6. HTML テンプレート正本
+
+すべて `embeds` イベントで送る。**iframe は sandbox（`allow-same-origin` は既定 off）なので、高さ報告スクリプトが無いとコンテンツが切れる**（`src/lib/components/common/FullHeightIframe.svelte:161-163`）。
+
+送信は必ず `replace: True` を明示し、こちらで全件を渡すこと。理由: backend は非 replace 時に**保存側だけ既存 embeds に追記**する（`backend/open_webui/socket/main.py:1036-1054`）一方、フロントは全置換する（`Chat.svelte:1007`）ため、DB と表示がズレる。
+
+```python
+await __event_emitter__({"type": "embeds", "data": {"embeds": [html], "replace": True}})
+```
+
+### 6.0 共通フッタ（全テンプレートの末尾に入れる）
+
+```python
+_HEIGHT_JS = """
+<script>
+(function () {
+  function report() {
+    parent.postMessage(
+      { type: 'iframe:height', height: document.documentElement.scrollHeight + 24 }, '*');
+  }
+  try { new ResizeObserver(report).observe(document.documentElement); } catch (e) {}
+  addEventListener('load', report);
+  addEventListener('resize', report);
+  setTimeout(report, 100);
+  setTimeout(report, 600);
+})();
+</script>
+"""
+
+_BASE_CSS = """
+:root { color-scheme: light dark; }
+* { box-sizing: border-box; }
+html, body { margin: 0; padding: 0; }
+body {
+  font: 14px/1.65 system-ui, -apple-system, "Segoe UI", "Noto Sans JP", sans-serif;
+  background: transparent; color: #1a1a1e;
+}
+.wrap { padding: 14px; }
+.card { background: #fff; border: 1px solid #e3e3e8; border-radius: 14px; padding: 14px; }
+.h { font-weight: 650; font-size: 15px; margin: 0 0 10px; }
+.muted { opacity: .62; font-size: 12px; }
+.row { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 12px; }
+.btn { padding: 9px 16px; border-radius: 10px; border: 1px solid #d9d9e0;
+       background: #f4f4f6; color: #1a1a1e; font: inherit; font-size: 13px;
+       cursor: pointer; text-decoration: none; display: inline-block; }
+.btn:hover { background: #ebebef; }
+.btn.primary { background: #3b6fe0; border-color: #3b6fe0; color: #fff; }
+.btn.primary:hover { background: #3260cc; }
+textarea { width: 100%; min-height: 84px; padding: 10px; border-radius: 10px;
+           border: 1px solid #d9d9e0; font: inherit; resize: vertical;
+           background: #fff; color: inherit; }
+table { width: 100%; border-collapse: collapse; font-size: 13px; }
+th, td { text-align: left; padding: 7px 9px; border-bottom: 1px solid #e8e8ee;
+         vertical-align: top; }
+th { font-weight: 600; opacity: .7; font-size: 12px; }
+code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px;
+       background: #f0f0f4; padding: 1px 5px; border-radius: 5px; }
+.scroll { overflow-x: auto; }
+@media (prefers-color-scheme: dark) {
+  body { color: #e8e8ec; }
+  .card { background: #1c1c20; border-color: #303038; }
+  .btn { background: #2a2a31; border-color: #3a3a44; color: #e8e8ec; }
+  .btn:hover { background: #33333c; }
+  textarea { background: #16161a; border-color: #3a3a44; }
+  th, td { border-bottom-color: #2c2c34; }
+  code { background: #26262e; }
+}
+"""
+```
+
+> `embeds` の要素が `http://` / `https://` / `//` で始まると **URL とみなされ iframe の src** になる（`FullHeightIframe.svelte:52`）。生 HTML を渡すときは必ず `<!doctype html>` で始めること。
+
+### 6.1 `_PLAYER` — publish 結果のプレビュー
+
+```python
+_PLAYER = """<!doctype html><html lang="ja"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1"><style>{{css}}</style></head>
+<body><div class="wrap"><div class="card">
+  <p class="h">{{title}}</p>
+  <video src="{{src}}" controls playsinline preload="metadata"
+         style="width:100%;max-height:70vh;border-radius:10px;background:#000;display:block"></video>
+  <div class="row">
+    <a class="btn primary" href="{{app_url}}" target="_blank" rel="noopener">Descript で開く</a>
+    <a class="btn" href="{{share_url}}" target="_blank" rel="noopener">共有リンク</a>
+  </div>
+  <p class="muted" style="margin:10px 0 0">rev {{revision}} ・ {{note}}</p>
+</div></div>{{height_js}}</body></html>"""
+```
+
+差し込み: `_render(_PLAYER, css=_BASE_CSS, height_js=_HEIGHT_JS, title=_esc(...), src=..., app_url=..., share_url=..., revision=..., note=_esc(...))`
+
+`src` に `download_url` を使う場合、**期限切れになるため state には保存しない**（表示のその場限り）。`share_url` は恒久リンクなので保存してよい。
+
+### 6.2 `_TOOL_TABLE` — probe / TOOL_UNRESOLVED のツール一覧
+
+```python
+_TOOL_TABLE = """<!doctype html><html lang="ja"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1"><style>{{css}}</style></head>
+<body><div class="wrap"><div class="card">
+  <p class="h">Descript MCP ツール一覧（{{count}} 件）</p>
+  <p class="muted">{{lead}}</p>
+  <div class="scroll"><table>
+    <thead><tr><th style="width:30%">ツール名</th><th style="width:16%">推定</th><th>説明 / 必須引数</th></tr></thead>
+    <tbody>{{rows}}</tbody>
+  </table></div>
+  <p class="muted" style="margin-top:12px">
+    ここで確認した名前を Admin → Functions → Descript Orchestrator の Valves
+    <code>tool_list_projects</code> / <code>tool_get_project</code> / <code>tool_import_media</code> /
+    <code>tool_agent_edit</code> / <code>tool_publish</code> / <code>tool_job_status</code> に設定してください。
+  </p>
+</div></div>{{height_js}}</body></html>"""
+```
+
+`rows` の 1 行:
+
+```python
+"<tr><td><code>{name}</code></td><td>{guess}</td><td>{desc}<div class='muted'>必須: {required}</div></td></tr>"
+```
+
+`guess` は解決済み論理操作名（未解決なら `—`）。`name` / `desc` / `required` は必ず `_esc()` を通す。
+
+### 6.3 `_EDIT_LOOP_FORM` — 編集ループの継続フォーム
+
+```python
+_EDIT_LOOP_FORM = """<!doctype html><html lang="ja"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1"><style>{{css}}</style></head>
+<body><div class="wrap"><div class="card">
+  <p class="h">{{title}}</p>
+  <video src="{{src}}" controls playsinline preload="metadata"
+         style="width:100%;max-height:60vh;border-radius:10px;background:#000;display:block"></video>
+  <p class="muted" style="margin:10px 0 6px">{{agent_response}}</p>
+  <textarea id="d-input" placeholder="追加の編集指示（例: 冒頭 3 秒をカット、字幕をもう少し大きく）"></textarea>
+  <div class="row">
+    <button class="btn primary" type="button" data-act="revise">この指示で再編集</button>
+    <button class="btn" type="button" data-act="confirm">これで確定する</button>
+    <a class="btn" href="{{app_url}}" target="_blank" rel="noopener">Descript で開く</a>
+  </div>
+  <p class="muted" style="margin:10px 0 0">rev {{revision}} / 残り {{remaining}} 回</p>
+</div></div>
+<script>
+(function () {
+  document.querySelectorAll('button[data-act]').forEach(function (b) {
+    b.addEventListener('click', function () {
+      var payload = JSON.stringify({
+        op: b.getAttribute('data-act'),
+        text: (document.getElementById('d-input') || {}).value || ''
+      });
+      parent.postMessage({ type: 'input:prompt:submit', text: '@descript ' + payload }, '*');
+      document.querySelectorAll('button[data-act]').forEach(function (x) { x.disabled = true; });
+    });
+  });
+})();
+</script>{{height_js}}</body></html>"""
+```
+
+**動作**: iframe 内のボタンが `parent.postMessage({type:'input:prompt:submit', ...})` を送ると、`Chat.svelte:1201-1218` が確認ダイアログを挟んで `submitHandler` に流す。これが Descript Pipe モデルへの**新規チャットメッセージ**として再入する。
+
+**Pipe 側の受け口**: 通常チャット経路で入ってきた `body["messages"][-1]["content"]` が `@descript {` で始まる場合、JSON を復号して `resume_edit_loop` として扱う。`project_id` / `conversation_id` / `revision` は `chat.chat["descript"]` から復元する。
+
+この方式を採る理由は §「300 秒タイムアウト」を踏まないため。`__event_call__` を開いたまま長時間ジョブを回すと `WEBSOCKET_EVENT_CALLER_TIMEOUT`（既定 300 秒）に抵触する。
+
+---
+
+## 7. タイムアウトの規律
+
+| 制約             | 値                                                                               | 対処                                                                                                                                                                                   |
+| ---------------- | -------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `__event_call__` | `WEBSOCKET_EVENT_CALLER_TIMEOUT` 既定 300 秒                                     | フォームは短時間で閉じるものだけに使う。`confirm_timeout_sec`（既定 240）を上限とし、**`asyncio.wait_for` では包まない**（socket の ack を壊す）。戻り値の `{"error": ...}` で判定する |
+| Action の HTTP   | リバースプロキシ依存（nginx `proxy_read_timeout` 既定 60 秒、Vercel の関数上限） | `action_soft_timeout_sec`（既定 45）を超えそうな処理は Action を早期 return し、以降は Pipe ＋ embeds フォームで継続                                                                   |
+| MCP 初期化       | `MCP_INITIALIZE_TIMEOUT` 既定 10 秒                                              | `mcp_connect_retries` 回だけ指数バックオフで再試行                                                                                                                                     |
+| Descript ジョブ  | 不定                                                                             | `_poll_job` の `poll_timeout_sec`（既定 900）。超過しても**ジョブは中断せず** `job_id` を state に保存する                                                                             |
+
+### 順序の原則（この順を守る）
+
+1. `status` で「開始」を出す
+2. 長時間ジョブを回す（`_poll_job` が定期的に `status` を更新）
+3. `status(done=True)` を出す
+4. **その後で** `__event_call__` または embeds フォームを出す
+
+`__event_call__` を開いたままジョブを回してはいけない。
+
+---
+
+## 8. MCP クライアントのライフサイクル
+
+```python
+client = None
+try:
+    connected = await connect_mcp_server(__request__, server_id, user, metadata, extra_params)
+    if connected is None:
+        raise DescriptError(...)          # MCP_NOT_FOUND / MCP_FORBIDDEN を自前で切り分け
+    client, specs = connected
+    ...
+finally:
+    if client is not None:
+        await client.disconnect()
+```
+
+> ⚠️ `disconnect()` は **connect と同一の asyncio タスク**で呼ぶ必要がある（`utils/mcp/client.py:163-172`）。`asyncio.shield` / `asyncio.wait_for` / `anyio.CancelScope` / `anyio.fail_after` で包むと MCP SDK の TaskGroup 制約に違反して壊れる。
+
+`MCP_NOT_FOUND` と `MCP_FORBIDDEN` は `connect_mcp_server` がどちらも `None` を返すため区別できない。Pipe 側で先に `Config.get("tool_server.connections")` を自前走査して切り分ける:
+
+```python
+from open_webui.models.config import Config
+
+connections = await Config.get("tool_server.connections", []) or []
+found = any(
+    c.get("type") == "mcp" and (c.get("info") or {}).get("id") == server_id
+    for c in connections
+)
+```
+
+---
+
+## 9. クラス属性の規律（v0.11.0 の実装に基づく）
+
+`load_function_module_by_id` は `module.Filter()` のように**インスタンス**を返す（`backend/open_webui/utils/plugin.py:296-306`）。以降のすべての検出は `getattr(instance, ...)` で行われる。
+
+したがって次の 3 つは**必ず `class` 直下のクラス属性**として書く。モジュールトップレベルに書くと**エラーも警告も出ないまま無視される**。
+
+| 属性           | 検出箇所                                 | 対象                       |
+| -------------- | ---------------------------------------- | -------------------------- |
+| `actions`      | `backend/open_webui/utils/models.py:246` | Action（マルチアクション） |
+| `file_handler` | `backend/open_webui/utils/filter.py:171` | Filter                     |
+| `toggle`       | `backend/open_webui/utils/models.py:409` | Filter                     |
+
+```python
+class Filter:
+    file_handler = True     # ← ここ。モジュールトップレベルではない
+    toggle = True
+
+    class Valves(BaseModel):
+        priority: int = 0
+
+    def __init__(self):
+        self.valves = self.Valves()   # ← これが無いと Valves が注入されない
+```
+
+> Open WebUI の公式ドキュメントには `file_handler` を「module attribute, not `self.file_handler`」と記載した箇所があるが、v0.11.0 のコードとは一致しない。
+
+### 9.1 `file_handler = True` の副作用
+
+`utils/filter.py:229-233` の `skip_files` による削除は、**全 Filter の inlet 完了後に 1 回だけ**走り、`body["files"]` と `body["metadata"]["files"]` を**丸ごと**消す。
+
+**Filter 単位ではなくパイプライン単位**なので、`file_handler = True` にすると動画以外の添付（PDF、画像など）も RAG に載らなくなる。`toggle = True` でユーザが明示 ON にしたときだけ有効になる前提で許容している。動画以外も扱いたくなった場合は、Filter の inlet で必要なものを退避してから消させること。
+
+### 9.2 Filter の各フックに実際に渡る dunder 引数
+
+`utils/filter.py:123-132` の `get_filter_params` は、**シグネチャに宣言した引数だけ**を渡す（宣言し忘れても `TypeError` にはならず、単に渡らない）。
+
+| フック                                       | 渡る dunder                                                                                                                                                                                                        |
+| -------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `inlet`                                      | `__event_emitter__` `__event_call__` `__user__` `__metadata__` `__oauth_token__` `__request__` `__model__` `__chat_id__` `__message_id__` `__id__`                                                                 |
+| `stream`（経路A: `middleware.py:4218`）      | `__body__` `__event_emitter__` `__event_call__` `__user__` `__metadata__` `__oauth_token__` `__request__` `__model__` `__id__`                                                                                     |
+| `stream`（経路B: `middleware.py:5618/5631`） | 上記から `__body__` を除いたもの。**ただし `__event_emitter__` の値は `None`**（この分岐は `event_emitter` が falsy のときに入るため）                                                                             |
+| `outlet`                                     | `__event_emitter__` `__event_call__` `__user__` `__metadata__` `__request__` `__model__` `__id__`。**`__chat_id__` / `__message_id__` は無い**（`middleware.py:3505-3512`）。chat_id は `body["chat_id"]` から取る |
+
+**`stream` の実装上の注意**（いずれも実ソースで確認済み）:
+
+- 第 1 引数名は `event` 固定（`filter.py:124`）
+- `__event_emitter__` は宣言すれば渡るが、**経路B では `None`**。必ず None ガードすること
+- 経路B の `event` は `response.body_iterator` の生の行なので、**dict ではなく `str` / `bytes` が渡ることがある**（`middleware.py:5630`）。dict 以外は無条件で素通しすること
+- `__user__` を宣言すると `params["__user__"]["valves"]` に UserValves が注入される（`filter.py:181-183`）
+
+### 9.3 Filter が例外を投げてはいけない
+
+Filter が落ちるとチャット全体が止まる。`inlet` / `stream` / `outlet` の**全体を try/except で包み、失敗時は入力をそのまま返す**こと。想定外の入力（`body` が `None`、`files` が非 list、`messages` が無い等）でも例外にならないようにする。
+
+---
+
+## 10. frontmatter 規約
+
+```python
+"""
+title: <表示名>
+author: A-clear
+author_url: https://github.com/A-clear/short-video-creation
+version: 0.1.0
+license: MIT
+description: <1 行説明>
+required_open_webui_version: 0.11.0
+requirements:
+"""
+```
+
+- **1 行目が厳密に `"""` でなければ frontmatter は全無視される**（`backend/open_webui/utils/plugin.py:160-162`）。前に空行・コメント・shebang を置かないこと。
+- キーは `^\s*([a-z_]+):\s*(.*)\s*$` にマッチする必要がある（`plugin.py:156`）。**ハイフンや数字を含むキーは無視される**。
+- **`requirements` は空にする。** 本番では `ENABLE_PIP_INSTALL_FRONTMATTER_REQUIREMENTS=false` を推奨しており（複数ワーカーでの同時 pip install がワーカーをクラッシュさせるため）、そもそも DB 経由ロード時には pip install が走らない（`plugin.py:263-276`）。Open WebUI 同梱の `mcp` / `httpx` / `pydantic` / 標準ライブラリのみを使う。
+- `function_id` は `isidentifier()` を満たし、小文字化しても同一である必要がある（`backend/open_webui/routers/functions.py:206-213`）。
+
+---
+
+## 11. 秘匿情報の規律
+
+**本リポジトリは public**（Functions を GitHub の raw URL から取り込むため）。
+
+- API キー・MCP の URL・Drive 名・プロジェクト名を**コードに直書きしない**。すべて Valves / UserValves に逃がし、値は Open WebUI 側で設定する。
+- `download_url` は署名付き・期限付き。**state に保存せず**、チャット履歴に残さない（Filter の `outlet` が `_redact_signed_urls` で `share_url` に差し替える）。
+- ログ・`status` イベント・エラーの `data` に生のトークンやヘッダを載せない。例外文字列は 800 文字で切り詰める（§5.5）。
+
+---
+
+## 12. 未確定事項（推測で埋めない）
+
+| 項目                                            | 状況                                                                                                                                                                                            | 実装での扱い                                                                                                                            |
+| ----------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------- |
+| Descript MCP の個々のツール名・引数スキーマ     | 公開ドキュメントに存在しない                                                                                                                                                                    | `probe` で実行時確定。Valve で上書き可能にする                                                                                          |
+| メディア取込が URL を取るのかファイルを取るのか | 未確定。**URL 必須の場合、Open WebUI の `/api/v1/files/{id}/content` は認証必須なので Descript から取得できない**（`backend/open_webui/storage/provider.py` に presigned URL 生成は存在しない） | `import_media` に `source_url` と `file_id` の両方を持たせ、スキーマ確定後に選択。MinIO 経由の presigned URL 発行が必要になる可能性あり |
+| FCPXML 書き出しが publish ツールで指定できるか  | 未確定                                                                                                                                                                                          | `movie_flow.mmd` の UC3 どおり「Descript App に遷移してユーザが書き出す」前提。MCP 側は share_url / App URL の提示までで設計を閉じる    |
+| `gpt-realtime-2.1` の接続方法                   | Open WebUI に該当する環境変数が存在しない                                                                                                                                                       | `.env.example` に注記のみ。実接続はスコープ外                                                                                           |

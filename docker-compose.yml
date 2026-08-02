@@ -1,0 +1,203 @@
+# ==============================================================================
+# ショート動画作成ツール - スケーリング対応構成
+# ==============================================================================
+#
+#   PostgreSQL (+ pgvector)  … 本体 DB 兼ベクトル DB
+#   Redis                    … 共有状態ストア / WebSocket マネージャ
+#   MinIO                    … 共有ファイルストレージ（S3 互換）
+#   Open WebUI               … アプリ本体
+#
+# 起動:
+#   cp .env.example .env  で値を埋めてから
+#   docker compose up -d
+#
+# 水平スケール:
+#   docker compose up -d --scale open-webui=3
+#   ⚠️ ただし ENABLE_DB_MIGRATIONS の扱いに注意（下記 open-webui サービスのコメント参照）
+#
+# ⚠️ 本ファイルは意図的に実行しません（リポジトリのルール）。
+#    起動はユーザが明示的に行ってください。
+# ==============================================================================
+
+services:
+  # ----------------------------------------------------------------------------
+  # PostgreSQL + pgvector
+  # ----------------------------------------------------------------------------
+  # 本体 DB とベクトル DB を兼ねます。
+  # 既定の ChromaDB は SQLite ベースで fork-safe ではないため、
+  # 複数ワーカー / 複数レプリカ構成では必ず pgvector に切り替えてください。
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: svc-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-openwebui}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD を .env に設定してください}
+      POSTGRES_DB: ${POSTGRES_DB:-openwebui}
+      # 総接続数 = (DATABASE_POOL_SIZE + DATABASE_POOL_MAX_OVERFLOW) × レプリカ数
+      # .env の既定値（15 + 20）でレプリカ 3 台なら 105。余裕を持たせています。
+      POSTGRES_INITDB_ARGS: "--encoding=UTF8"
+    command:
+      - postgres
+      - -c
+      - max_connections=200
+      - -c
+      - shared_buffers=256MB
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      # pgvector 拡張の作成。PGVECTOR_CREATE_EXTENSION=false で運用する場合に必要。
+      - ./scripts/init-pgvector.sql:/docker-entrypoint-initdb.d/10-pgvector.sql:ro
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "pg_isready -U ${POSTGRES_USER:-openwebui} -d ${POSTGRES_DB:-openwebui}",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+    networks: [svc-net]
+
+  # ----------------------------------------------------------------------------
+  # Redis
+  # ----------------------------------------------------------------------------
+  # ⚠️ 複数レプリカ構成では必須です。
+  #    Functions の __event_emitter__ / __event_call__ は Socket.IO でブラウザと
+  #    通信しますが、WebSocket 接続を保持するのは 1 レプリカだけです。
+  #    Redis を挟まないと、別レプリカで動いた Pipe の進捗表示や入力フォームが
+  #    ユーザに届かず、__event_call__ は 300 秒でタイムアウトします。
+  redis:
+    image: redis:7-alpine
+    container_name: svc-redis
+    restart: unless-stopped
+    command:
+      - redis-server
+      - --maxclients
+      - "10000"
+      - --appendonly
+      - "yes"
+      # Pub/Sub のバッファ上限。既定値だとイベント量が多いときに切断されます。
+      - --client-output-buffer-limit
+      - "pubsub 1073741824 268435456 180"
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    networks: [svc-net]
+
+  # ----------------------------------------------------------------------------
+  # MinIO（S3 互換の共有ファイルストレージ）
+  # ----------------------------------------------------------------------------
+  # 複数レプリカでアップロードファイルを共有するために使います。
+  # 制御対象はアップロードファイルのみで、DB とベクトル DB には影響しません。
+  # （共有ファイルシステムを NFS/EFS でマウントできる環境なら MinIO は不要です）
+  minio:
+    image: minio/minio:latest
+    container_name: svc-minio
+    restart: unless-stopped
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:?MINIO_ROOT_USER を .env に設定してください}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:?MINIO_ROOT_PASSWORD を .env に設定してください}
+    ports:
+      - "${MINIO_CONSOLE_PORT:-9001}:9001"
+    volumes:
+      - minio-data:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+    networks: [svc-net]
+
+  # バケットを 1 回だけ作って終了する初期化ジョブ
+  minio-init:
+    image: minio/mc:latest
+    container_name: svc-minio-init
+    depends_on:
+      minio:
+        condition: service_healthy
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+      S3_BUCKET_NAME: ${S3_BUCKET_NAME:-open-webui}
+    entrypoint: >
+      /bin/sh -c "
+      mc alias set local http://minio:9000 \"$${MINIO_ROOT_USER}\" \"$${MINIO_ROOT_PASSWORD}\" &&
+      mc mb --ignore-existing local/$${S3_BUCKET_NAME} &&
+      echo 'bucket ready: '$${S3_BUCKET_NAME}
+      "
+    restart: "no"
+    networks: [svc-net]
+
+  # ----------------------------------------------------------------------------
+  # Open WebUI
+  # ----------------------------------------------------------------------------
+  open-webui:
+    # upstream との乖離を最小に保つ方針のため、既定では公式イメージを使います。
+    # Functions はイメージに焼き込まず、管理画面の Import From Link で
+    # GitHub の raw URL から取り込みます。
+    image: ghcr.io/open-webui/open-webui:main
+    #
+    # submodule のフォークからビルドする場合は image をコメントアウトして
+    # 以下を有効にしてください。
+    # build:
+    #   context: ./full-stack/open-webui
+    #   dockerfile: Dockerfile
+    #
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    env_file:
+      - .env
+    environment:
+      # .env の値をコンテナ間のホスト名で上書きします。
+      DATABASE_URL: postgresql://${POSTGRES_USER:-openwebui}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-openwebui}
+      PGVECTOR_DB_URL: postgresql://${POSTGRES_USER:-openwebui}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-openwebui}
+      REDIS_URL: redis://redis:6379/0
+      WEBSOCKET_REDIS_URL: redis://redis:6379/0
+      S3_ENDPOINT_URL: http://minio:9000
+      S3_ACCESS_KEY_ID: ${MINIO_ROOT_USER}
+      S3_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD}
+      #
+      # ⚠️ --scale open-webui=N で水平スケールする場合:
+      #    マイグレーションを 1 台だけに任せる必要があります。
+      #    compose の --scale では個別のレプリカに違う環境変数を渡せないため、
+      #    以下のいずれかを選んでください。
+      #      (a) 一度 1 台で起動してマイグレーションを完了させ、
+      #          ENABLE_DB_MIGRATIONS=false にしてから --scale する
+      #      (b) 別途 init コンテナ / ジョブでマイグレーションを実行する
+      #    Kubernetes では initContainer か Job を使ってください。
+      ENABLE_DB_MIGRATIONS: ${ENABLE_DB_MIGRATIONS:-true}
+    ports:
+      - "${OPEN_WEBUI_PORT:-8080}:8080"
+    volumes:
+      # STORAGE_PROVIDER=s3 でもローカルキャッシュや一時ファイルに使われます。
+      - open-webui-data:/app/backend/data
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8080/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+    networks: [svc-net]
+
+volumes:
+  postgres-data:
+  redis-data:
+  minio-data:
+  open-webui-data:
+
+networks:
+  svc-net:
+    driver: bridge
