@@ -119,7 +119,7 @@ Filter の `stream` は `progress_marker_prefix`（既定 `U+2063 INVISIBLE SEPA
 
 ## 2. 論理操作 ↔ MCP ツール名
 
-Descript MCP（`https://api.descript.com/v2/mcp`）は**個々のツール名・引数スキーマを公開していない**。よって実行時ディスカバリを前提とする。
+Descript MCP（`https://api.descript.com/v2/mcp`）は個々のツール名・引数スキーマを公開ドキュメントに載せていない。よって実行時ディスカバリを前提とする設計にしてある。
 
 呼び出し側は**常に論理操作名だけを書く**:
 
@@ -127,9 +127,98 @@ Descript MCP（`https://api.descript.com/v2/mcp`）は**個々のツール名・
 projects = await _mcp_call(client, specs_by_name, tool_map, "list_projects", {})
 ```
 
+### 2.0 実測で確定したツール名（2026-08-02、`probe` 実行結果）
+
+**以下は実機で `list_tool_specs()` を叩いて得た事実であり、推測ではない。** 全 12 ツール。
+
+| 論理操作        | 実ツール名                 | 必須引数        | 自動解決     |
+| --------------- | -------------------------- | --------------- | ------------ |
+| `list_projects` | `list_projects`            | —               | ✓            |
+| `get_project`   | `get_project`              | `project_id`    | ✓            |
+| `import_media`  | `import_media`             | **`add_media`** | ✓            |
+| `agent_edit`    | **`prompt_project_agent`** | `prompt`        | ✗ Valve 必須 |
+| `publish`       | `publish_project`          | `project_id`    | ✓            |
+| `job_status`    | **`wait_for_job`**         | `job_id`        | ✗ Valve 必須 |
+
+論理操作に割り当てていない残り 6 ツール: `list_jobs` / `cancel_job` / `report_upload_status` / `list_folders` / `export_transcript` / **`export_timeline`**
+
+**設定すべき Valve**（`descript_pipe`）:
+
+```
+tool_list_projects = list_projects
+tool_get_project   = get_project
+tool_import_media  = import_media
+tool_agent_edit    = prompt_project_agent
+tool_publish       = publish_project
+tool_job_status    = wait_for_job
+tool_resolution_mode = valve_only
+```
+
+### 2.0.1 引数スキーマの実測（重要な差分）
+
+**① `import_media` — `add_media` は「表示名 → メディア定義」のマップ**
+
+平坦な `source_url` / `file_id` では通らない。`tool_arg_map` はキー名の付け替えしかできないので、**構造変換はコード側で行う**。
+
+```jsonc
+// URL 取込
+{"add_media": {"intro.mp4": {"url": "https://..."}},
+ "project_name": "my-short",
+ "add_compositions": [{"clips": [{"media": "intro.mp4"}]}]}
+
+// 直接アップロード（レスポンスの upload_urls に PUT する）
+{"add_media": {"intro.mp4": {"content_type": "video/mp4", "file_size": 12345678}}}
+```
+
+- **新規プロジェクトには `add_compositions` を渡す。** 渡さないと取り込んだメディアがタイムラインに載らない（ツール説明に「this is the expected default」と明記）
+- **既存プロジェクトには `add_compositions` を渡さない。** 既存の編集を壊す。追記したい場合は `update_compositions`（今回は未使用）
+- 直接アップロードのレスポンス `upload_urls` は `{メディアキー: {upload_url, asset_id, artifact_id}}`。`Content-Type: application/octet-stream` で PUT し、**宣言した `file_size` と実サイズが一致する必要がある**
+- アップロードに失敗した場合は `report_upload_status`（`job_id` / `media_id` / `status`）で通知しないと、import ジョブがそのファイルを待ち続ける
+
+**② `publish_project` — `media_type` は `Video` / `Audio`（先頭大文字）**
+
+`mp4` / `mp3` / `wav` のような拡張子表記では**通らない**。
+
+- `media_type` 省略 かつ 映像なし → Audio として公開される
+- `media_type: "Video"` を明示 かつ 映像なし → **422 で失敗する**
+- 同一コンポジションを再度 publish すると**前回の share URL を再利用して内容を上書き**する。Video と Audio は別々の share URL になる
+
+**③ `wait_for_job` — ポーリングではなくブロッキング待機**
+
+- 既定で **300 秒** 待ち、進捗をストリームする
+- `wait_seconds: 0` で即時リターン（＝従来のポーリング相当）
+- ジョブ状態: `queued` / `running` / `stopped` / `cancelled`。**`stopped` は `result.status` を見る**（契約書の既存の記述と一致）
+- 完了レスポンスに `project_url` が入る。コンポジション ID が判明していれば短縮 ID 付きで該当コンポジションを直接開ける
+- `export_timeline` の完了結果には期限付き `result.download_url` と `result.download_url_expires_at` が入る
+
+> **設計上の含意**: `_poll_job` は `wait_seconds` を明示的に渡すこと。既定のままだと 1 回の呼び出しで 300 秒ブロックし、Action→Pipe の HTTP がリバースプロキシに切られる。
+
+**④ `export_timeline` — FCPXML を直接取得できる**
+
+必須: `project_id`, `format`。`format` の選択肢:
+
+| 値                | 出力                           |
+| ----------------- | ------------------------------ |
+| `fcp`             | **Final Cut Pro X（.fcpxml）** |
+| `premiere`        | Premiere Pro XML               |
+| `davinci_resolve` | DaVinci Resolve XML            |
+| `aaf`             | Pro Tools / Logic（バイナリ）  |
+| `edl`             | Samplitude / Reaper            |
+| `sesx`            | Adobe Audition                 |
+
+**メディアファイルは同梱されない**（タイムライン/XML/EDL ファイルのみ）。非同期で `job_id` を返すので `wait_for_job` で待ち、`result.download_url` を提示する。
+
+> ⚠️ **設計の訂正**: 当初「FCPXML 書き出しは Descript の Public API に存在しないため Descript App に遷移してユーザが手動で行う」と結論していたが、**MCP には `export_timeline` が存在する**。BA 要件の「FCPXML 双方向連携」は MCP 経由で直接満たせる。UC3（タイムラインのエクスポート）はこれを使う。
+
+**⑤ `export_transcript` — 字幕/文字起こしの書き出し**
+
+必須: `project_id`, `format`。`format`: `txt` / `markdown` / `html` / `rtf` / **`srt`**。レスポンスに内容が直接入る（非同期ではない）。`srt` は字幕ファイルとして使える。
+
 ### 2.1 論理操作は 6 つ
 
 `list_projects` / `get_project` / `import_media` / `agent_edit` / `publish` / `job_status`
+
+加えて **`export_timeline`** を 7 番目の論理操作として追加する（§2.0.1 ④）。Valve 名は `tool_export_timeline`（既定 `export_timeline`）。
 
 ### 2.2 解決の 3 段フォールバック（`tool_resolution_mode` Valve で切替）
 
@@ -1049,9 +1138,21 @@ requirements:
 
 ## 12. 未確定事項（推測で埋めない）
 
-| 項目                                            | 状況                                                                                                                                                                                            | 実装での扱い                                                                                                                            |
-| ----------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------- |
-| Descript MCP の個々のツール名・引数スキーマ     | 公開ドキュメントに存在しない                                                                                                                                                                    | `probe` で実行時確定。Valve で上書き可能にする                                                                                          |
-| メディア取込が URL を取るのかファイルを取るのか | 未確定。**URL 必須の場合、Open WebUI の `/api/v1/files/{id}/content` は認証必須なので Descript から取得できない**（`backend/open_webui/storage/provider.py` に presigned URL 生成は存在しない） | `import_media` に `source_url` と `file_id` の両方を持たせ、スキーマ確定後に選択。MinIO 経由の presigned URL 発行が必要になる可能性あり |
-| FCPXML 書き出しが publish ツールで指定できるか  | 未確定                                                                                                                                                                                          | `movie_flow.mmd` の UC3 どおり「Descript App に遷移してユーザが書き出す」前提。MCP 側は share_url / App URL の提示までで設計を閉じる    |
-| `gpt-realtime-2.1` の接続方法                   | Open WebUI に該当する環境変数が存在しない                                                                                                                                                       | `.env.example` に注記のみ。実接続はスコープ外                                                                                           |
+### 12.0 解決済み（2026-08-02、実機 `probe` により確定）
+
+| 項目                                  | 結論                                                                                                                                                                  |
+| ------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Descript MCP のツール名・引数スキーマ | **確定。§2.0 / §2.0.1 を参照。** 全 12 ツール。`agent_edit` は `prompt_project_agent`、`job_status` は `wait_for_job`                                                 |
+| FCPXML 書き出しの可否                 | **可能だった。** `export_timeline`（`format: "fcp"`）で .fcpxml を直接ダウンロードできる。「Descript App で手動書き出し」という当初の結論は**誤り**。UC3 はこれを使う |
+| `publish` の `media_type`             | **`Video` / `Audio`（先頭大文字）**。拡張子表記（`mp4` 等）では 422                                                                                                   |
+| ジョブ待機の方式                      | `wait_for_job` は**ブロッキング待機**（既定 300 秒、進捗ストリーム）。`wait_seconds: 0` で即時リターン                                                                |
+
+### 12.1 未解決
+
+| 項目 | 状況 | 実装での扱い |
+| --- | --- | --- |
+| ローカルファイルの直接アップロード | `import_media` は `add_media` に `content_type` / `file_size` を渡すと `upload_urls` を返し、そこへ `Content-Type: application/octet-stream` で PUT する方式（§2.0.1 ①）。**Open WebUI に保存されたファイルの実体を Function から読む手段**が未確認（`STORAGE_PROVIDER=s3` 構成を含む） | 読めるなら `httpx.AsyncClient` で PUT する。読めないなら `file_id` 経路は明確なエラーにして URL 指定に誘導する。PUT 失敗時は `report_upload_status` で import ジョブを解放する |
+| `publish_project` の `resolution` | probe のツール説明に記載が無い。REST API 側（`descript_api.json`）には `480p`〜`4K` の enum が存在する | 渡さない方向に倒す。`_coerce_args` がスキーマに無いキーを落とすため実害は無い |
+| Descript の `download_url` の署名方式 | AWS SigV4 / GCS のどちらでもない独自方式の可能性がある | §5.9 の注記を参照。E2E で 1 回クエリパラメータを実見して確認する |
+| `WEBUI_URL` を HTTPS 公開 URL にする必要性 | Descript の IdP（Stytch）は confidential client に **HTTPS かつ非 loopback** の redirect URI を要求する。`http://localhost:8080` では動的クライアント登録（DCR）が 400 で失敗する | `WEBUI_URL` を公開 HTTPS URL にする（トンネル or 実ドメイン）。**PersistentConfig なので `.env` ではなく Admin Panel → Settings → General で変更する**（`models/config.py` の `seed_defaults` は既存の DB 値を優先する） |
+| `gpt-realtime-2.1` の接続方法 | Open WebUI v0.11.0 に該当する設定項目が存在しない | `.env.example` に注記のみ。使うなら別途 Pipe Function として実装が必要 |

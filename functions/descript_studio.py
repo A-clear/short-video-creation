@@ -349,6 +349,25 @@ _MEDIA_TABLE = """<!doctype html><html lang="ja"><head><meta charset="utf-8">
   </table></div>
 </div></div>{{height_js}}</body></html>"""
 
+# 契約書 §6 に準じた追加テンプレート（export_timeline の結果カード）。
+# UC3 のタイムライン書き出し用。契約書には未収録のため
+# 採用時は §6.5 として正本に取り込むこと。
+#
+# download_url は署名付き・期限付き（契約書 §11）。この embeds の中だけに置き、
+# 本文（messages）には載せない。
+_TIMELINE_EXPORT = """<!doctype html><html lang="ja"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1"><style>{{css}}</style></head>
+<body><div class="wrap"><div class="card">
+  <p class="h">{{title}}</p>
+  <p class="muted" style="margin:0 0 4px">形式: {{format_label}}</p>
+  <div class="row">
+    <a class="btn primary" href="{{download_url}}" target="_blank" rel="noopener">ダウンロード</a>
+    {{app_link}}
+  </div>
+  <p class="muted" style="margin:12px 0 0">{{notice}}</p>
+  {{expiry}}
+</div></div>{{height_js}}</body></html>"""
+
 
 # ===========================================================================
 # 契約書 §4.1 MCP_OAUTH_REQUIRED の固定文言（そのまま使う）
@@ -363,6 +382,57 @@ _OAUTH_REQUIRED_TEXT = (
 # 契約書 §4 の「リトライ」列に対応する通知レベル。表に無いコードは error 扱い。
 _WARNING_CODES = ("JOB_PARTIAL", "JOB_TIMEOUT", "RATE_LIMITED")
 _INFO_CODES = ("USER_CANCELLED",)
+
+
+# ===========================================================================
+# UC3 のエクスポート形式（契約書 §1.3 / §2.0.1 ②④）
+#
+# share_* は publish（共有リンクを作る）、それ以外は export_timeline
+# （タイムライン/XML ファイルをダウンロードする）に分岐する。
+# publish の media_type は "Video" / "Audio"（先頭大文字）でなければ通らない。
+# export_timeline の value は Descript MCP の format 値そのもの。
+# 先頭要素が select の既定表示になるため、順序に意味がある。
+# ===========================================================================
+
+_EXPORT_FORMATS = (
+    {"value": "share_video", "label": "動画の共有リンク（Video）", "op": "publish", "media_type": "Video"},
+    {"value": "share_audio", "label": "音声の共有リンク（Audio）", "op": "publish", "media_type": "Audio"},
+    {"value": "fcp", "label": "Final Cut Pro X（.fcpxml）", "op": "export_timeline"},
+    {"value": "premiere", "label": "Premiere Pro XML", "op": "export_timeline"},
+    {"value": "davinci_resolve", "label": "DaVinci Resolve XML", "op": "export_timeline"},
+    {"value": "aaf", "label": "Pro Tools / Logic（AAF）", "op": "export_timeline"},
+    {"value": "edl", "label": "EDL（Samplitude / Reaper）", "op": "export_timeline"},
+    {"value": "sesx", "label": "Adobe Audition（.sesx）", "op": "export_timeline"},
+)
+
+# UserValves の select に渡す値の一覧。_EXPORT_FORMATS から導出してドリフトを防ぐ。
+_EXPORT_FORMAT_VALUES = [entry["value"] for entry in _EXPORT_FORMATS]
+_DEFAULT_EXPORT_FORMAT = _EXPORT_FORMAT_VALUES[0]
+
+# タイムライン書き出しの注記。ツール説明に明記されている事実で、
+# 知らないと「動画が入っていない」と誤解される。
+_TIMELINE_NOTICE = "メディアファイルは含まれません。タイムライン/XML ファイルのみです。"
+
+
+def _export_format(value: Any) -> dict:
+    """形式値からエントリを引く。未知の値は既定（先頭 = share_video）に落とす。"""
+    wanted = str(value or "")
+    for entry in _EXPORT_FORMATS:
+        if entry["value"] == wanted:
+            return entry
+    return _EXPORT_FORMATS[0]
+
+
+def _export_format_options(default_value: Any) -> list:
+    """select の選択肢を組み立てる。既定値を先頭に寄せる。
+
+    NativeSelect は value が未設定だと先頭を表示するため、順序自体が
+    既定値の提示になる（value も併せて渡すが、二重の保険）。
+    """
+    default = _export_format(default_value)["value"]
+    ordered = [e for e in _EXPORT_FORMATS if e["value"] == default]
+    ordered += [e for e in _EXPORT_FORMATS if e["value"] != default]
+    return [{"label": e["label"], "value": e["value"]} for e in ordered]
 
 
 # ===========================================================================
@@ -616,6 +686,11 @@ class Action:
             description="編集スタイルのプリセット",
         )
         auto_confirm: bool = Field(default=False, description="編集ループの確認をスキップし 1 周で確定する")
+        default_export_format: str = Field(
+            default=_DEFAULT_EXPORT_FORMAT,
+            json_schema_extra={"input": {"type": "select", "options": _EXPORT_FORMAT_VALUES}},
+            description="エクスポート形式の既定値",
+        )
 
     def __init__(self):
         # ★ 必須。これが無いと Open WebUI が Valves を注入しない（契約書 §9）。
@@ -924,6 +999,43 @@ class Action:
             note=_esc(note),
         )
 
+    @staticmethod
+    def _timeline_export_html(
+        *, title: str, format_label: str, download_url: str, app_url: str, expires_at: str
+    ) -> str:
+        """export_timeline の結果カードを組み立てる（契約書 §2.0.1 ④）。
+
+        download_url は期限付きの署名 URL なので、この embeds の中だけに置く。
+        app_url / expires_at が空のときは、その要素ごと出さない。
+        """
+        app_link = ""
+        if app_url:
+            app_link = (
+                '<a class="btn" href="'
+                + _esc(app_url)
+                + '" target="_blank" rel="noopener">Descript で開く</a>'
+            )
+
+        expiry = ""
+        if expires_at:
+            expiry = (
+                '<p class="muted" style="margin:6px 0 0">このリンクは '
+                + _esc(expires_at)
+                + " まで有効です。</p>"
+            )
+
+        return _render(
+            _TIMELINE_EXPORT,
+            css=_BASE_CSS,
+            height_js=_HEIGHT_JS,
+            title=_esc(title),
+            format_label=_esc(format_label),
+            download_url=_esc(download_url),
+            app_link=app_link,
+            notice=_esc(_TIMELINE_NOTICE),
+            expiry=expiry,
+        )
+
     # -------------------------------------------------------------------
     # 入力フォーム
     # -------------------------------------------------------------------
@@ -984,8 +1096,10 @@ class Action:
         return True, text, None
 
     async def _ask_select(
-        self, event_call: Any, title: str, message: str, options: list, placeholder: str = ""
+        self, event_call: Any, title: str, message: str, options: list, placeholder: str = "", value: str = ""
     ) -> tuple[bool, str, Optional[dict]]:
+        # data.value は ConfirmDialog の初期値になる（Chat.svelte:1126 →
+        # ConfirmDialog.svelte:44 の _inputValue）。select では初期選択として効く。
         ok, raw, err = await self._ask(
             event_call,
             {
@@ -994,6 +1108,7 @@ class Action:
                     "title": title,
                     "message": message,
                     "placeholder": placeholder,
+                    "value": value,
                     "input": {"type": "select", "options": options},
                 },
             },
@@ -1447,6 +1562,22 @@ class Action:
         project_id = picked["project_id"]
         project_name = picked["project_name"]
 
+        # 出力形式の選択。既定値は UserValves（毎回選び直さなくて済むように）。
+        default_format = self._user_valves(user)["default_export_format"]
+        ok, chosen, err = await self._ask_select(
+            event_call,
+            "出力形式",
+            f"「{project_name}」をどの形式で書き出しますか。\n"
+            "※ 映像を含まないプロジェクトで Video を選ぶと失敗します（契約書 §2.0.1 ②）。",
+            _export_format_options(default_format),
+            placeholder="出力形式を選択",
+            value=default_format,
+        )
+        if not ok:
+            return await self._fail(body, emitter, err or {}, status_text="中止しました")
+
+        fmt = _export_format(chosen)
+
         state = await _load_state(body.get("chat_id"))
         composition_id = state.get("composition_id") if state.get("project_id") == project_id else None
 
@@ -1456,19 +1587,61 @@ class Action:
             return self._message(
                 body,
                 "### 書き出しを開始できませんでした\n\n"
-                f"- プロジェクト: **{project_name}**\n\n"
+                f"- プロジェクト: **{project_name}**\n"
+                f"- 形式: **{fmt['label']}**\n\n"
                 "選択に時間がかかり、処理時間の上限に達しました。\n"
                 "もう一度「タイムラインのエクスポート」を実行してください。",
             )
 
-        await self._status(emitter, f"「{project_name}」を書き出しています")
-        env = await self._call_pipe(
-            "publish",
-            {"project_id": project_id, "composition_id": composition_id},
+        if fmt["op"] == "publish":
+            return await self._export_share(
+                body=body,
+                user=user,
+                request=request,
+                emitter=emitter,
+                project_id=project_id,
+                project_name=project_name,
+                composition_id=composition_id,
+                fmt=fmt,
+                revision=state.get("revision"),
+            )
+        return await self._export_timeline(
             body=body,
             user=user,
             request=request,
-            summary=f"Descript: 「{project_name}」を書き出し",
+            emitter=emitter,
+            project_id=project_id,
+            project_name=project_name,
+            composition_id=composition_id,
+            fmt=fmt,
+        )
+
+    async def _export_share(
+        self,
+        *,
+        body: dict,
+        user: Any,
+        request: Any,
+        emitter: Any,
+        project_id: str,
+        project_name: str,
+        composition_id: Optional[str],
+        fmt: dict,
+        revision: Any,
+    ) -> dict:
+        """共有リンク（publish）としての書き出し。"""
+        await self._status(emitter, f"「{project_name}」を書き出しています（{fmt['label']}）")
+        env = await self._call_pipe(
+            "publish",
+            {
+                "project_id": project_id,
+                "composition_id": composition_id,
+                "media_type": fmt["media_type"],
+            },
+            body=body,
+            user=user,
+            request=request,
+            summary=f"Descript: 「{project_name}」を書き出し（{fmt['label']}）",
         )
         if not env.get("ok"):
             return await self._fail(body, emitter, env, status_text="書き出しに失敗しました")
@@ -1490,25 +1663,94 @@ class Action:
                     src=download_url or share_url,
                     app_url=app_url,
                     share_url=share_url,
-                    revision=state.get("revision"),
-                    note="タイムラインの書き出しは Descript App で行います",
+                    revision=revision,
+                    note=fmt["label"],
                 )
             ],
         )
 
         lines = ["### 書き出しが完了しました", ""]
         lines.append(f"- プロジェクト: **{project_name}**")
+        lines.append(f"- 形式: **{fmt['label']}**")
         if share_url:
             lines.append(f"- [共有リンク]({share_url})")
         if app_url and app_url != share_url:
             lines.append(f"- [Descript App で開く]({app_url})")
         lines.append("")
-        lines.append("#### タイムラインのエクスポート手順")
+        lines.append("※ ダウンロードリンクは期限付きのため、履歴には残していません。")
+        return self._message(body, "\n".join(lines))
+
+    async def _export_timeline(
+        self,
+        *,
+        body: dict,
+        user: Any,
+        request: Any,
+        emitter: Any,
+        project_id: str,
+        project_name: str,
+        composition_id: Optional[str],
+        fmt: dict,
+    ) -> dict:
+        """タイムライン/XML ファイルとしての書き出し（契約書 §2.0.1 ④）。"""
+        await self._status(emitter, f"「{project_name}」のタイムラインを書き出しています（{fmt['label']}）")
+        env = await self._call_pipe(
+            "export_timeline",
+            {"project_id": project_id, "composition_id": composition_id, "format": fmt["value"]},
+            body=body,
+            user=user,
+            request=request,
+            summary=f"Descript: 「{project_name}」のタイムラインを書き出し（{fmt['label']}）",
+        )
+        if not env.get("ok"):
+            return await self._fail(body, emitter, env, status_text="書き出しに失敗しました")
+
+        data = env.get("data") or {}
+        # download_url は期限付きの署名 URL。embeds にだけ載せ、本文には残さない（契約書 §5.9 / §11）
+        download_url = str(data.get("download_url") or "")
+        expires_at = str(_pick(data, "expires_at", "download_url_expires_at", default="") or "")
+        app_url = str(_pick(data, "app_url", "project_url", "editor_url", default="") or "")
+
+        if not download_url:
+            return await self._fail(
+                body,
+                emitter,
+                {
+                    "ok": False,
+                    "op": "export_timeline",
+                    "code": "INTERNAL",
+                    "message_ja": "書き出しは終了しましたが、ダウンロード URL を取得できませんでした。",
+                    "hint": "もう一度実行するか、Descript App から書き出してください。",
+                    "data": None,
+                },
+                status_text="書き出しに失敗しました",
+            )
+
+        await self._status(emitter, "書き出しが完了しました", done=True)
+        await self._notify(emitter, "success", f"「{project_name}」を {fmt['label']} で書き出しました。")
+
+        await self._embeds(
+            emitter,
+            [
+                self._timeline_export_html(
+                    title=f"{project_name} のタイムライン書き出し",
+                    format_label=fmt["label"],
+                    download_url=download_url,
+                    app_url=app_url,
+                    expires_at=expires_at,
+                )
+            ],
+        )
+
+        lines = ["### タイムラインの書き出しが完了しました", ""]
+        lines.append(f"- プロジェクト: **{project_name}**")
+        lines.append(f"- 形式: **{fmt['label']}**")
+        if app_url:
+            lines.append(f"- [Descript App で開く]({app_url})")
         lines.append("")
-        lines.append("1. 上のリンクから Descript App でプロジェクトを開く")
-        lines.append("2. File → Export → Timeline を選択")
-        lines.append("3. Final Cut Pro（FCPXML）形式を選んで書き出す")
+        lines.append("上のカードの「ダウンロード」ボタンからファイルを取得してください。")
         lines.append("")
+        lines.append(f"※ {_TIMELINE_NOTICE}")
         lines.append("※ ダウンロードリンクは期限付きのため、履歴には残していません。")
         return self._message(body, "\n".join(lines))
 
@@ -1544,6 +1786,8 @@ class Action:
             "default_duration_sec": int(get("default_duration_sec")),
             "editing_style": str(get("editing_style")),
             "auto_confirm": bool(get("auto_confirm")),
+            # 未知の値（Valve を手で書き換えた等）は _export_format が既定に落とす
+            "default_export_format": _export_format(get("default_export_format"))["value"],
         }
 
     @staticmethod
@@ -1556,7 +1800,7 @@ class Action:
                 "",
                 "- **動画のアップロード** — プロジェクトを作り、動画を Descript に取り込みます",
                 "- **動画の編集** — 編集指示から編集し、プレビューを確認して確定します",
-                "- **タイムラインのエクスポート** — 書き出して Descript App に引き渡します",
+                "- **タイムラインのエクスポート** — 共有リンク / FCPXML など形式を選んで書き出します",
                 "- **Descript MCP 診断** — 接続とツール名の解決状況を確認します",
                 "",
                 "初回は必ず「Descript MCP 診断」から実行してください。",

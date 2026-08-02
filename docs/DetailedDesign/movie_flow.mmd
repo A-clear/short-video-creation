@@ -180,23 +180,44 @@ sequenceDiagram
         ActionsFunctions->>OpenWebUI_Frontend: 入力フォーム(プロジェクト名選択)
         OpenWebUI_Frontend-->>ActionsFunctions: project_id
 
-        ActionsFunctions->>PipesFunctions: publish(project_id, media_type)
-        PipesFunctions->>DescriptMCP: publish
-        DescriptMCP->>DescriptApp: Publish project media
-        DescriptMCP-->>PipesFunctions: job_id
+        ActionsFunctions->>OpenWebUI_Frontend: 入力フォーム(出力形式の選択)
+        Note over ActionsFunctions: 共有リンク(Video / Audio) または<br/>タイムライン 6 形式<br/>(fcp / premiere / davinci_resolve / aaf / edl / sesx)
+        OpenWebUI_Frontend-->>ActionsFunctions: format
 
-        loop ジョブが完了するまで
-            PipesFunctions->>DescriptMCP: job_status(job_id)
-            DescriptMCP-->>PipesFunctions: job_state, progress
+        alt 共有リンク(Video / Audio)
+            ActionsFunctions->>PipesFunctions: publish(project_id, media_type)
+            PipesFunctions->>DescriptMCP: publish_project
+            DescriptMCP->>DescriptApp: Publish project media
+            DescriptMCP-->>PipesFunctions: job_id
+
+            loop ジョブが完了するまで
+                PipesFunctions->>DescriptMCP: wait_for_job(job_id, wait_seconds)
+                DescriptMCP-->>PipesFunctions: job_state, progress
+            end
+
+            Note over PipesFunctions: media_type は Video / Audio(先頭大文字)<br/>映像が無いのに Video を明示すると 422<br/>その場合は Audio で 1 回だけ自動リトライする
+
+            PipesFunctions-->>ActionsFunctions: share_url, Descript App URL
+            ActionsFunctions->>OpenWebUI_Frontend: embeds(プレビュー + 共有リンク)
+
+        else タイムライン形式
+            ActionsFunctions->>PipesFunctions: export_timeline(project_id, format)
+            PipesFunctions->>DescriptMCP: export_timeline
+            DescriptMCP->>DescriptApp: Export timeline
+            DescriptMCP-->>PipesFunctions: job_id
+
+            loop ジョブが完了するまで
+                PipesFunctions->>DescriptMCP: wait_for_job(job_id, wait_seconds)
+                DescriptMCP-->>PipesFunctions: job_state, progress
+            end
+
+            PipesFunctions-->>ActionsFunctions: download_url, download_url_expires_at
+            ActionsFunctions->>OpenWebUI_Frontend: embeds(ダウンロードボタン + 注記)
+
+            Note over ActionsFunctions: download_url は期限付きのため本文には残さない<br/>メディアファイルは同梱されない(タイムライン / XML のみ)
+
+            OpenWebUI_Frontend->>DescriptApp: download_url からファイルを取得
         end
-
-        PipesFunctions-->>ActionsFunctions: share_url, Descript App URL
-        ActionsFunctions->>OpenWebUI_Frontend: embeds(プレビュー + リンク)
-
-        OpenWebUI_Frontend->>DescriptApp: プロジェクトに遷移
-        DescriptApp->>DescriptApp: Timeline export(Final Cut Pro 形式)
-
-        Note over DescriptApp: FCPXML 書き出しは Descript App 側で行う<br/>Public API に該当エンドポイントが存在しないため<br/>(MCP 側にあるかは未確認)
 
     else 0件
         ActionsFunctions-->>OpenWebUI_Frontend: プロジェクトが無い旨を案内
