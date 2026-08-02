@@ -4,14 +4,14 @@ title: 認証・認可
 sequenceDiagram
     autonumber
     box Web
-    participant OpenWebUI-Frontend
+    participant OpenWebUI_Frontend
     end
 
     box Interface
     end
     
     box Application
-    participant OpenWebUI-Backendend
+    participant OpenWebUI_Backendend
     end
 
     box Middleware
@@ -22,6 +22,11 @@ sequenceDiagram
     participant PostgreSQL
     participant PGVector
     participant MinIO
+    end
+
+    box Google
+    participant OAuthClient
+    participant FoundationModel
     end
 
     box OpenWebUI
@@ -36,17 +41,29 @@ sequenceDiagram
     participant ActionsFunctions
     end
 
-    box OpenAI
-    participant LLMModel
-    participant EmbeddingModel
+    box Descript
+    participant DescriptMCP
+    participant DescriptApp
     end
 
     box OpenAI
     participant LLMModel
     participant EmbeddingModel
+    participant DiffusionModel
+    participant STTModel
+    participant TTSModel
+    participant RealtimeModel
     end
 
-    Note over NextJS,Cognito: 認証
-    NextJS->>Cognito: 認証情報
-    Cognito->>Cognito: 認証・認可(OIDC)
-    Cognito-->>NextJS: Claim情報
+    Note over OpenWebUI_Frontend,OAuthClient: 認証
+    OpenWebUI_Frontend->>OAuthClient: 認証・認可(OIDC)
+
+    alt 成功
+        OAuthClient-->>OpenWebUI_Frontend: Claim情報
+        
+    else 失敗
+        OAuthClient-->>OpenWebUI_Frontend: 結果
+
+    end
+
+    
