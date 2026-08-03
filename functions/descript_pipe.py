@@ -28,8 +28,6 @@ import time
 from typing import Any, Optional
 
 import httpx
-from pydantic import BaseModel, Field
-
 from open_webui.models.chats import Chats
 from open_webui.models.config import Config
 from open_webui.models.files import Files
@@ -38,6 +36,7 @@ from open_webui.models.users import UserModel
 from open_webui.storage.provider import Storage
 from open_webui.utils.chat import generate_chat_completion
 from open_webui.utils.middleware import connect_mcp_server
+from pydantic import BaseModel, Field
 
 # ===========================================================================
 # 契約書 §5.1 定数・例外
@@ -46,7 +45,8 @@ from open_webui.utils.middleware import connect_mcp_server
 _STATE_KEY = "descript"
 _STATE_VERSION = 1
 _HISTORY_MAX = 50
-_LOGICAL_OPS = ("list_projects", "get_project", "import_media", "agent_edit", "publish", "job_status")
+_LOGICAL_OPS = ("list_projects", "get_project", "import_media",
+                "agent_edit", "publish", "job_status")
 
 # 契約書 §2.1 の 6 つに加え、実測で存在が確定した 2 ツールを Pipe だけが解決する。
 #   export_timeline      — 7 番目の論理操作（契約書 §2.0.1 ④）
@@ -108,7 +108,8 @@ def _log(level: int, event: str, **fields: Any) -> None:
         if len(text) > _LOG_VALUE_MAX:
             text = text[:_LOG_VALUE_MAX] + "…"
         parts.append(f"{key}={text}")
-    _LOGGER.log(level, "descript %s%s", event, (" " + " ".join(parts)) if parts else "")
+    _LOGGER.log(level, "descript %s%s", event,
+                (" " + " ".join(parts)) if parts else "")
 
 
 def _log_debug(event: str, **fields: Any) -> None:
@@ -182,7 +183,8 @@ def _render(tpl: str, **kwargs: Any) -> str:
     """
     out = tpl
     for key, value in kwargs.items():
-        out = out.replace("{{" + key + "}}", "" if value is None else str(value))
+        out = out.replace("{{" + key + "}}",
+                          "" if value is None else str(value))
     return out
 
 
@@ -365,11 +367,13 @@ def _unwrap_mcp(raw: Any) -> Any:
     value, mode = _json_from_text(joined)
     if value is None:
         # JSON がまったく無い＝本当に人間向けの文章だけ。文字列として返す。
-        _log_warn("mcp.unwrap_text_only", length=len(joined), head=joined[:200])
+        _log_warn("mcp.unwrap_text_only", length=len(
+            joined), head=joined[:200])
         return joined
     if mode != "whole":
         # サーバが JSON に説明文を混ぜている。動作はするが取りこぼしの温床なので残す。
-        _log_warn("mcp.unwrap_mixed", mode=mode, length=len(joined), head=joined[:200])
+        _log_warn("mcp.unwrap_mixed", mode=mode,
+                  length=len(joined), head=joined[:200])
     return value
 
 
@@ -442,7 +446,8 @@ async def _mcp_call(client, specs_by_name: dict, tool_map: dict, op: str,
     except DescriptError:
         raise
     except Exception as exc:
-        _log_error("mcp.error", op=op, tool=name, ms=_ms(started), error=str(exc)[:400])
+        _log_error("mcp.error", op=op, tool=name,
+                   ms=_ms(started), error=str(exc)[:400])
         raise _classify_mcp_error(exc, name) from exc
 
     result = _unwrap_mcp(raw)
@@ -453,7 +458,8 @@ async def _mcp_call(client, specs_by_name: dict, tool_map: dict, op: str,
         tool=name,
         ms=_ms(started),
         type=type(result).__name__,
-        keys=sorted(str(k) for k in result.keys()) if isinstance(result, dict) else None,
+        keys=sorted(str(k) for k in result.keys()) if isinstance(
+            result, dict) else None,
         size=len(result) if isinstance(result, (list, str)) else None,
     )
     return result
@@ -466,14 +472,16 @@ async def _mcp_call(client, specs_by_name: dict, tool_map: dict, op: str,
 
 def _ok(op: str, data: Any = None, state: Optional[dict] = None) -> str:
     return json.dumps(
-        {"ok": True, "op": op, "data": data if data is not None else {}, "state": state or {}},
+        {"ok": True, "op": op, "data": data if data is not None else {},
+            "state": state or {}},
         ensure_ascii=False,
     )
 
 
 def _fail(op: str, code: str, message_ja: str, hint: str = "", data: Any = None) -> str:
     return json.dumps(
-        {"ok": False, "op": op, "code": code, "message_ja": message_ja, "hint": hint, "data": data},
+        {"ok": False, "op": op, "code": code,
+            "message_ja": message_ja, "hint": hint, "data": data},
         ensure_ascii=False,
     )
 
@@ -585,7 +593,8 @@ async def _poll_job(client, specs_by_name: dict, tool_map: dict, arg_maps: dict,
     # 受け付けないツール（＝従来型のポーリング API）なら _coerce_args に
     # 落とされるだけなので、その場合は今までどおり sleep で間隔を空ける。
     wait_seconds = max(0, int(getattr(valves, "poll_wait_seconds", 0) or 0))
-    job_spec = specs_by_name.get((tool_map or {}).get("job_status") or "") or {}
+    job_spec = specs_by_name.get(
+        (tool_map or {}).get("job_status") or "") or {}
     blocking = wait_seconds > 0 and _accepts_arg(
         job_spec, "wait_seconds", (arg_maps or {}).get("job_status")
     )
@@ -601,7 +610,8 @@ async def _poll_job(client, specs_by_name: dict, tool_map: dict, arg_maps: dict,
         # ブロッキング待機のはずが即座に返る実装だった場合、ここで sleep を
         # 飛ばすと API を叩き続ける熱いループになる。実測の待ち時間で判定する。
         waited = time.monotonic() - call_started
-        state = str(_pick(raw, "job_state", "state", "status", default="") or "").lower()
+        state = str(_pick(raw, "job_state", "state",
+                    "status", default="") or "").lower()
         result = _pick(raw, "result", default={}) or {}
         _log_info(
             "job.tick",
@@ -613,18 +623,22 @@ async def _poll_job(client, specs_by_name: dict, tool_map: dict, arg_maps: dict,
         )
 
         if state in ("stopped", "completed", "succeeded", "success", "finished"):
-            status = str(_pick(result, "status", "result_status", default="") or "").lower()
+            status = str(_pick(result, "status", "result_status",
+                         default="") or "").lower()
             if status == "success":
-                _log_info("job.done", job_id=job_id, ms=_ms(started), partial=False)
+                _log_info("job.done", job_id=job_id,
+                          ms=_ms(started), partial=False)
                 return {"ok": True, "partial": False, "result": result}
             if status == "partial":
-                _log_warn("job.done", job_id=job_id, ms=_ms(started), partial=True)
+                _log_warn("job.done", job_id=job_id,
+                          ms=_ms(started), partial=True)
                 return {"ok": True, "partial": True, "result": result}
             if status == "":
                 # result を返さない実装向けのフォールバック
                 _log_warn("job.done_no_status", job_id=job_id, ms=_ms(started))
                 return {"ok": True, "partial": False, "result": result}
-            _log_error("job.failed", job_id=job_id, ms=_ms(started), status=status)
+            _log_error("job.failed", job_id=job_id,
+                       ms=_ms(started), status=status)
             raise DescriptError(
                 "JOB_FAILED",
                 str(_pick(result, "error_message", "message", default="処理が失敗しました。")),
@@ -634,7 +648,8 @@ async def _poll_job(client, specs_by_name: dict, tool_map: dict, arg_maps: dict,
 
         if state in ("cancelled", "canceled"):
             _log_warn("job.cancelled", job_id=job_id, ms=_ms(started))
-            raise DescriptError("JOB_CANCELLED", "処理がキャンセルされました。", "", {"job_id": job_id})
+            raise DescriptError(
+                "JOB_CANCELLED", "処理がキャンセルされました。", "", {"job_id": job_id})
 
         ticks += 1
         elapsed = int(time.monotonic() - started)
@@ -646,7 +661,8 @@ async def _poll_job(client, specs_by_name: dict, tool_map: dict, arg_maps: dict,
             await emit_status(f"{label}{suffix}（{elapsed} 秒経過 / job {str(job_id)[:8]}）")
 
         if time.monotonic() - started > float(valves.poll_timeout_sec):
-            _log_error("job.timeout", job_id=job_id, ms=_ms(started), ticks=ticks)
+            _log_error("job.timeout", job_id=job_id,
+                       ms=_ms(started), ticks=ticks)
             raise DescriptError(
                 "JOB_TIMEOUT",
                 f"処理が {int(valves.poll_timeout_sec)} 秒以内に完了しませんでした。",
@@ -878,7 +894,8 @@ def _make_emit_status(event_emitter):
             return
         try:
             await event_emitter(
-                {"type": "status", "data": {"description": str(description), "done": bool(done)}}
+                {"type": "status", "data": {
+                    "description": str(description), "done": bool(done)}}
             )
         except Exception:
             pass
@@ -927,7 +944,8 @@ def _extract_llm_text(res: Any) -> str:
         if isinstance(content, str):
             return content
         if isinstance(content, list):
-            parts = [p.get("text", "") for p in content if isinstance(p, dict) and p.get("type") == "text"]
+            parts = [p.get("text", "") for p in content if isinstance(
+                p, dict) and p.get("type") == "text"]
             return "".join(parts)
     return ""
 
@@ -1015,7 +1033,8 @@ def _looks_like_no_video(exc: "DescriptError") -> bool:
 
 
 # export_timeline の format（契約書 §2.0.1 ④）
-_TIMELINE_FORMATS = ("fcp", "premiere", "davinci_resolve", "aaf", "edl", "sesx")
+_TIMELINE_FORMATS = ("fcp", "premiere", "davinci_resolve",
+                     "aaf", "edl", "sesx")
 
 
 # ===========================================================================
@@ -1156,7 +1175,8 @@ def _extract_job_id(raw: Any) -> Optional[str]:
         return None
     job_id = _pick(raw, "job_id", "jobId")
     if job_id is None:
-        state_hint = str(_pick(raw, "job_state", "state", "status", default="") or "").lower()
+        state_hint = str(_pick(raw, "job_state", "state",
+                         "status", default="") or "").lower()
         if state_hint in ("queued", "running", "pending", "in_progress", "processing"):
             job_id = _pick(raw, "id")
     return str(job_id) if job_id is not None else None
@@ -1208,7 +1228,8 @@ def _diag_response(raw: Any, sent_keys: Any, limit: int = 900) -> str:
 def _extract_publish(result: Any) -> dict:
     """publish 系ジョブの結果から URL 群を取り出す。"""
     payload = result if isinstance(result, dict) else {}
-    nested = _pick(payload, "media", "output", "asset", "published", default={}) or {}
+    nested = _pick(payload, "media", "output", "asset",
+                   "published", default={}) or {}
     if not isinstance(nested, dict):
         nested = {}
 
@@ -1244,7 +1265,7 @@ class Pipe:
         mcp_connect_retries: int = Field(default=2, description="MCP 接続の再試行回数")
         # --- ツール名オーバーライド（空なら自動推定） ---
         # description の「実測値」は 2026-08-02 に probe で確認した実際のツール名
-        #（契約書 §2.0）。本番は tool_resolution_mode=valve_only にしてここへ明示する。
+        # （契約書 §2.0）。本番は tool_resolution_mode=valve_only にしてここへ明示する。
         tool_list_projects: str = Field(
             default="", description="空なら自動推定。実測値は list_projects"
         )
@@ -1298,7 +1319,8 @@ class Pipe:
             default=5, description="ブロッキング待機が使えないときの再問い合わせ間隔（秒）"
         )
         poll_backoff_max_sec: int = Field(default=30)
-        poll_timeout_sec: int = Field(default=900, description="1 ジョブの上限待ち時間（秒）")
+        poll_timeout_sec: int = Field(
+            default=900, description="1 ジョブの上限待ち時間（秒）")
         poll_status_every_n: int = Field(
             default=3,
             description="N 回に 1 回 status イベントを出す（ブロッキング待機時は毎回）",
@@ -1315,7 +1337,8 @@ class Pipe:
         # --- 出力既定 ---
         default_media_type: str = Field(
             default="Video",
-            json_schema_extra={"input": {"type": "select", "options": ["Video", "Audio"]}},
+            json_schema_extra={
+                "input": {"type": "select", "options": ["Video", "Audio"]}},
             description=(
                 "publish_project の media_type。実測値は Video / Audio のみ。"
                 "Video を明示しかつ映像が無いと 422 で失敗するため、その場合は"
@@ -1334,7 +1357,8 @@ class Pipe:
         )
         default_timeline_format: str = Field(
             default="fcp",
-            json_schema_extra={"input": {"type": "select", "options": list(_TIMELINE_FORMATS)}},
+            json_schema_extra={"input": {"type": "select",
+                                         "options": list(_TIMELINE_FORMATS)}},
             description=(
                 "export_timeline の format。fcp = Final Cut Pro X（.fcpxml）。"
                 "書き出されるのはタイムライン/XML のみでメディアは同梱されない"
@@ -1351,7 +1375,8 @@ class Pipe:
         )
         system_prompt_fallback: str = Field(default=_DEFAULT_SYSTEM_PROMPT)
         # --- 表示 ---
-        embed_player: bool = Field(default=True, description="publish 結果を embeds のプレイヤーで表示する")
+        embed_player: bool = Field(
+            default=True, description="publish 結果を embeds のプレイヤーで表示する")
         redact_download_url: bool = Field(
             default=True, description="署名付き download_url をチャット履歴に残さない"
         )
@@ -1383,15 +1408,19 @@ class Pipe:
                 }
             },
         )
-        enable_filler_removal: bool = Field(default=True, description="言い淀み（フィラー）の自動削除")
+        enable_filler_removal: bool = Field(
+            default=True, description="言い淀み（フィラー）の自動削除")
         enable_silence_cut: bool = Field(default=True, description="無音区間の自動削除")
-        enable_studio_sound: bool = Field(default=True, description="ノイズ除去・音圧の自動マスタリング")
-        enable_auto_captions: bool = Field(default=True, description="自動テロップ生成")
+        enable_studio_sound: bool = Field(
+            default=True, description="ノイズ除去・音圧の自動マスタリング")
+        enable_auto_captions: bool = Field(
+            default=True, description="自動テロップ生成")
         enable_pan_zoom: bool = Field(default=False, description="オートパン&ズーム")
         enable_broll: bool = Field(default=False, description="インサート素材の自動配置")
         caption_language: str = Field(
             default="ja",
-            json_schema_extra={"input": {"type": "select", "options": ["ja", "en", "auto"]}},
+            json_schema_extra={
+                "input": {"type": "select", "options": ["ja", "en", "auto"]}},
         )
 
     def __init__(self):
@@ -1471,14 +1500,17 @@ class Pipe:
                 project_id=(ctx["state"] or {}).get("project_id"),
             )
             envelope = await self._open_mcp_and_run(op, args, ctx)
-            _log_info("pipe.done", op=op, chat_id=ctx["chat_id"], ms=_ms(started))
+            _log_info("pipe.done", op=op,
+                      chat_id=ctx["chat_id"], ms=_ms(started))
             return envelope
         except DescriptError as exc:
             # 封筒として返す失敗はここが唯一の ERROR 行。下位で二重に出さない。
-            _log_error("pipe.fail", op=op, code=exc.code, ms=_ms(started), message=exc.message_ja)
+            _log_error("pipe.fail", op=op, code=exc.code,
+                       ms=_ms(started), message=exc.message_ja)
             return json.dumps(exc.envelope(op), ensure_ascii=False)
         except Exception as exc:  # 例外は絶対に外へ漏らさない
-            _LOGGER.exception("descript pipe.crash op=%s ms=%s", op, _ms(started))
+            _LOGGER.exception(
+                "descript pipe.crash op=%s ms=%s", op, _ms(started))
             return _fail(
                 op,
                 "INTERNAL",
@@ -1506,7 +1538,8 @@ class Pipe:
             if isinstance(parsed, dict):
                 # §6.3 のフォームは {"op": "revise"|"confirm"} を送る。
                 # §1.3 の RPC 引数名は "action"。両方を受ける。
-                action = str(parsed.get("action") or parsed.get("op") or "revise").strip()
+                action = str(parsed.get("action") or parsed.get(
+                    "op") or "revise").strip()
                 return "resume_edit_loop", {"action": action, "text": str(parsed.get("text") or "")}
             return "resume_edit_loop", {"action": "revise", "text": payload}
 
@@ -1516,7 +1549,8 @@ class Pipe:
         if bool(getattr(self.valves, "enable_chat_intents", True)):
             intent = _match_chat_intent(text)
             if intent:
-                _log_info("pipe.intent", op=intent, command=_normalize_command(text))
+                _log_info("pipe.intent", op=intent,
+                          command=_normalize_command(text))
                 # コマンド句自体を編集指示として渡しても意味がないので空にする。
                 return intent, ({"instruction": ""} if intent == "start_edit_loop" else {})
 
@@ -1670,7 +1704,8 @@ class Pipe:
                     "MCP_CONNECT_FAILED",
                     "Descript MCP に接続できませんでした。",
                     "MCP_INITIALIZE_TIMEOUT（既定 10 秒）を延ばすか、しばらく待って再実行してください。",
-                    {"server_id": server_id, "raw": str(last_exc)[:800] if last_exc else ""},
+                    {"server_id": server_id, "raw": str(
+                        last_exc)[:800] if last_exc else ""},
                 )
 
             specs_by_name = {
@@ -1678,13 +1713,15 @@ class Pipe:
                 for spec in (specs or [])
                 if isinstance(spec, dict) and spec.get("name")
             }
-            _log_info("mcp.connected", server_id=server_id, tools=len(specs_by_name))
+            _log_info("mcp.connected", server_id=server_id,
+                      tools=len(specs_by_name))
             tool_map = await self._resolve_tools(ctx, specs_by_name)
             _log_info(
                 "mcp.resolved",
                 mode=self.valves.tool_resolution_mode,
                 resolved={k: v for k, v in tool_map.items() if v},
-                unresolved=[o for o in _LOGICAL_OPS_EXT if not tool_map.get(o)] or None,
+                unresolved=[
+                    o for o in _LOGICAL_OPS_EXT if not tool_map.get(o)] or None,
             )
             arg_maps = _parse_json_valve(self.valves.tool_arg_map)
             return await self._handle(op, args, ctx, client, specs_by_name, tool_map, arg_maps, server_id)
@@ -1925,7 +1962,8 @@ class Pipe:
         projects = await self._list_projects(ctx, client, specs, tool_map, arg_maps)
         name_filter = str(args.get("name") or "").strip().lower()
         if name_filter:
-            projects = [p for p in projects if name_filter in str(p.get("name") or "").lower()]
+            projects = [p for p in projects if name_filter in str(
+                p.get("name") or "").lower()]
         await ctx["emit_status"](f"プロジェクトを {len(projects)} 件取得しました", done=True)
         return _ok("list_projects", {"projects": projects}, ctx.get("state"))
 
@@ -1940,7 +1978,8 @@ class Pipe:
             )
         await ctx["emit_status"]("プロジェクト情報を取得しています")
         raw = await _mcp_call(client, specs, tool_map, "get_project", {"project_id": project_id}, arg_maps)
-        project = raw if isinstance(raw, dict) else {"id": project_id, "raw": raw}
+        project = raw if isinstance(raw, dict) else {
+            "id": project_id, "raw": raw}
         await ctx["emit_status"]("プロジェクト情報を取得しました", done=True)
         return _ok("get_project", {"project": project}, ctx.get("state"))
 
@@ -1955,7 +1994,8 @@ class Pipe:
             )
         project_id, created = await self._ensure_project(name, ctx, client, specs, tool_map, arg_maps)
         state = await _save_state(
-            ctx.get("chat_id"), {"project_id": project_id, "project_name": name}
+            ctx.get("chat_id"), {
+                "project_id": project_id, "project_name": name}
         )
         await ctx["emit_status"](f"プロジェクト『{name}』を確定しました", done=True)
         return _ok(
@@ -1973,12 +2013,14 @@ class Pipe:
                 project_name, ctx, client, specs, tool_map, arg_maps
             )
         if not project_id:
-            project_id = str((ctx.get("state") or {}).get("project_id") or "").strip()
+            project_id = str((ctx.get("state") or {}).get(
+                "project_id") or "").strip()
 
         entries = []
         if args.get("source_url"):
             entries.append(
-                {"name": args.get("name") or args.get("media_name"), "url": args["source_url"]}
+                {"name": args.get("name") or args.get(
+                    "media_name"), "url": args["source_url"]}
             )
         if args.get("file_id"):
             entries.append(
@@ -2012,13 +2054,17 @@ class Pipe:
             project_name=project_name,
             entries=entries,
         )
-        result = outcome["result"] if isinstance(outcome["result"], dict) else {}
+        result = outcome["result"] if isinstance(
+            outcome["result"], dict) else {}
         new_project_id = str(
-            _pick(result, "project_id", "projectId", default=project_id) or project_id or ""
+            _pick(result, "project_id", "projectId",
+                  default=project_id) or project_id or ""
         )
-        project_url = _pick(result, "project_url", "projectUrl", "app_url", "edit_url")
+        project_url = _pick(result, "project_url",
+                            "projectUrl", "app_url", "edit_url")
 
-        patch = {"project_id": new_project_id, "last_job_id": outcome.get("job_id")}
+        patch = {"project_id": new_project_id,
+                 "last_job_id": outcome.get("job_id")}
         if project_name:
             patch["project_name"] = project_name
         if project_url:
@@ -2035,7 +2081,8 @@ class Pipe:
         )
         await ctx["emit_status"]("メディアの取り込みが完了しました", done=True)
 
-        data = {"project_id": new_project_id, "project_url": project_url, "media": result}
+        data = {"project_id": new_project_id,
+                "project_url": project_url, "media": result}
         if outcome.get("partial"):
             data["warning_code"] = "JOB_PARTIAL"
             data["warning_ja"] = "一部のメディアの処理に失敗しました。"
@@ -2049,7 +2096,8 @@ class Pipe:
                 "TOOL_ARGS_MISSING",
                 "project_id または prompt が指定されていません。",
                 "",
-                {"missing": [k for k, v in (("project_id", project_id), ("prompt", prompt)) if not v]},
+                {"missing": [k for k, v in (
+                    ("project_id", project_id), ("prompt", prompt)) if not v]},
             )
 
         await ctx["emit_status"]("Descript Underlord が編集しています")
@@ -2086,7 +2134,8 @@ class Pipe:
         ).strip()
         if not project_id:
             raise DescriptError(
-                "TOOL_ARGS_MISSING", "project_id が指定されていません。", "", {"missing": ["project_id"]}
+                "TOOL_ARGS_MISSING", "project_id が指定されていません。", "", {
+                    "missing": ["project_id"]}
             )
 
         await ctx["emit_status"]("書き出しています")
@@ -2111,10 +2160,12 @@ class Pipe:
         ).strip()
         if not job_id:
             raise DescriptError(
-                "TOOL_ARGS_MISSING", "job_id が指定されていません。", "", {"missing": ["job_id"]}
+                "TOOL_ARGS_MISSING", "job_id が指定されていません。", "", {
+                    "missing": ["job_id"]}
             )
         raw = await _mcp_call(client, specs, tool_map, "job_status", {"job_id": job_id}, arg_maps)
-        job_state = str(_pick(raw, "job_state", "state", "status", default="") or "")
+        job_state = str(_pick(raw, "job_state", "state",
+                        "status", default="") or "")
         result = _pick(raw, "result", default={}) or {}
         await ctx["emit_status"](f"ジョブ {job_id[:8]} の状態: {job_state or '不明'}", done=True)
         return _ok("job_status", {"job_state": job_state, "result": result}, ctx.get("state"))
@@ -2132,7 +2183,8 @@ class Pipe:
         if not project_id:
             project_id = await self._infer_project_id(ctx, client, specs, tool_map, arg_maps)
 
-        fmt = str(args.get("format") or self.valves.default_timeline_format or "fcp").strip().lower()
+        fmt = str(args.get("format")
+                  or self.valves.default_timeline_format or "fcp").strip().lower()
         if fmt not in _TIMELINE_FORMATS:
             raise DescriptError(
                 "TOOL_ARGS_MISSING",
@@ -2151,8 +2203,10 @@ class Pipe:
                 "format": fmt,
             },
         )
-        result = outcome["result"] if isinstance(outcome["result"], dict) else {}
-        download_url = _pick(result, "download_url", "downloadUrl", "url", "file_url")
+        result = outcome["result"] if isinstance(
+            outcome["result"], dict) else {}
+        download_url = _pick(result, "download_url",
+                             "downloadUrl", "url", "file_url")
         expires_at = _pick(
             result, "download_url_expires_at", "downloadUrlExpiresAt", "expires_at", "expiresAt"
         )
@@ -2208,12 +2262,15 @@ class Pipe:
             project_id = await self._infer_project_id(ctx, client, specs, tool_map, arg_maps)
 
         user_valves = ctx["user_valves"]
-        style = str(args.get("style") or user_valves.editing_style or "jet_cut").strip()
+        style = str(args.get("style")
+                    or user_valves.editing_style or "jet_cut").strip()
         aspect = str(
-            args.get("aspect") or _aspect_from_resolution(self.valves.default_resolution)
+            args.get("aspect") or _aspect_from_resolution(
+                self.valves.default_resolution)
         ).strip()
         try:
-            duration_sec = int(args.get("duration_sec") or state.get("duration_sec") or 60)
+            duration_sec = int(args.get("duration_sec")
+                               or state.get("duration_sec") or 60)
         except Exception:
             duration_sec = 60
         instruction = str(args.get("instruction") or "").strip()
@@ -2237,10 +2294,13 @@ class Pipe:
         if not project_id:
             project_id = await self._infer_project_id(ctx, client, specs, tool_map, arg_maps)
 
-        action = str(args.get("action") or args.get("op") or "revise").strip().lower()
+        action = str(args.get("action") or args.get(
+            "op") or "revise").strip().lower()
         text = str(args.get("text") or "").strip()
-        style = str(state.get("style") or ctx["user_valves"].editing_style or "jet_cut")
-        aspect = str(state.get("aspect") or _aspect_from_resolution(self.valves.default_resolution))
+        style = str(state.get("style")
+                    or ctx["user_valves"].editing_style or "jet_cut")
+        aspect = str(state.get("aspect") or _aspect_from_resolution(
+            self.valves.default_resolution))
         try:
             duration_sec = int(state.get("duration_sec") or 60)
         except Exception:
@@ -2308,13 +2368,15 @@ class Pipe:
         published = await self._run_publish(
             ctx, client, specs, tool_map, arg_maps,
             project_id=project_id,
-            composition_id=edit.get("composition_id") or (ctx.get("state") or {}).get("composition_id"),
+            composition_id=edit.get("composition_id") or (
+                ctx.get("state") or {}).get("composition_id"),
             media_type=None,
             resolution=None,
         )
 
         next_revision = revision + 1
-        remaining = max(0, int(self.valves.max_edit_iterations) - next_revision)
+        remaining = max(
+            0, int(self.valves.max_edit_iterations) - next_revision)
         awaiting = "done" if (auto_confirm or remaining <= 0) else "user"
 
         # 4) status(done) を先に出してからフォームを出す（契約書 §7 の順序原則）
@@ -2365,7 +2427,8 @@ class Pipe:
                     css=_BASE_CSS,
                     height_js=_HEIGHT_JS,
                     title=_esc(f"プレビュー（rev {next_revision}）"),
-                    src=_esc(published.get("download_url") or published.get("share_url") or ""),
+                    src=_esc(published.get("download_url")
+                             or published.get("share_url") or ""),
                     agent_response=_esc(agent_response or "編集が完了しました。"),
                     app_url=_esc(self._app_url(published, state)),
                     revision=next_revision,
@@ -2440,9 +2503,11 @@ class Pipe:
         if user_valves.enable_silence_cut:
             hints.append("remove silent gaps between sentences")
         if user_valves.enable_filler_removal:
-            hints.append("remove filler words (um, uh, えーっと, あの) while keeping natural flow")
+            hints.append(
+                "remove filler words (um, uh, えーっと, あの) while keeping natural flow")
         if user_valves.enable_studio_sound:
-            hints.append("apply Studio Sound to reduce background noise and normalize loudness")
+            hints.append(
+                "apply Studio Sound to reduce background noise and normalize loudness")
         if user_valves.enable_auto_captions:
             hints.append(
                 f"add captions in {user_valves.caption_language} synced to the transcript"
@@ -2488,7 +2553,8 @@ class Pipe:
             if prompt_model is not None:
                 system_prompt = str(getattr(prompt_model, "content", "") or "")
         if not system_prompt.strip():
-            system_prompt = str(self.valves.system_prompt_fallback or _DEFAULT_SYSTEM_PROMPT)
+            system_prompt = str(
+                self.valves.system_prompt_fallback or _DEFAULT_SYSTEM_PROMPT)
 
         feature_lines = "\n".join(f"- {h}" for h in hints) or "- (指定なし)"
         user_message = (
@@ -2613,7 +2679,8 @@ class Pipe:
         # 新規プロジェクトには add_compositions を渡す。渡さないと取り込んだメディアが
         # タイムラインに載らない。既存プロジェクトには渡さない（既存の編集が壊れる）。
         if not project_id:
-            args["add_compositions"] = [{"clips": [{"media": key} for key in add_media]}]
+            args["add_compositions"] = [
+                {"clips": [{"media": key} for key in add_media]}]
 
         _log_info(
             "import.request",
@@ -2712,9 +2779,11 @@ class Pipe:
             response_type=type(raw).__name__,
         )
         if not upload_urls:
-            _log_warn("import.upload_urls_empty", job_id=job_id, diag=_diag_response(raw, uploads.keys()))
+            _log_warn("import.upload_urls_empty", job_id=job_id,
+                      diag=_diag_response(raw, uploads.keys()))
 
-        timeout = httpx.Timeout(float(self.valves.upload_timeout_sec), connect=30.0)
+        timeout = httpx.Timeout(
+            float(self.valves.upload_timeout_sec), connect=30.0)
         async with httpx.AsyncClient(timeout=timeout, follow_redirects=False) as http:
             for key, entry in uploads.items():
                 target = upload_urls.get(key)
@@ -2731,7 +2800,8 @@ class Pipe:
                         },
                     )
                 url = _pick(target, "upload_url", "uploadUrl", "url")
-                media_id = _pick(target, "media_id", "mediaId", "asset_id", "assetId", "artifact_id")
+                media_id = _pick(target, "media_id", "mediaId",
+                                 "asset_id", "assetId", "artifact_id")
                 if not url:
                     raise DescriptError(
                         "JOB_FAILED",
@@ -2747,7 +2817,8 @@ class Pipe:
 
                 await ctx["emit_status"](f"『{key}』をアップロードしています")
                 file_size = int(entry.get("file_size") or 0)
-                _log_info("upload.start", job_id=job_id, media=key, bytes=file_size)
+                _log_info("upload.start", job_id=job_id,
+                          media=key, bytes=file_size)
                 put_started = time.monotonic()
                 try:
                     response = await http.put(
@@ -2783,7 +2854,8 @@ class Pipe:
                         "JOB_FAILED",
                         f"『{key}』のアップロードに失敗しました。",
                         "ファイルサイズが変化していないかご確認のうえ、再実行してください。",
-                        {"media": key, "job_id": job_id, "raw": str(exc)[:800]},
+                        {"media": key, "job_id": job_id, "raw": str(exc)[
+                            :800]},
                     ) from exc
 
     @staticmethod
@@ -2794,7 +2866,8 @@ class Pipe:
         try:
             await _mcp_call(
                 client, specs, tool_map, "report_upload_status",
-                {"job_id": str(job_id), "media_id": str(media_id), "status": "failed"},
+                {"job_id": str(job_id), "media_id": str(
+                    media_id), "status": "failed"},
                 arg_maps,
             )
         except Exception:
@@ -2813,7 +2886,8 @@ class Pipe:
                 "conversation_id": conversation_id or None,
             },
         )
-        result = outcome["result"] if isinstance(outcome["result"], dict) else {}
+        result = outcome["result"] if isinstance(
+            outcome["result"], dict) else {}
         return {
             "job_id": outcome.get("job_id"),
             "partial": outcome.get("partial"),
@@ -2834,7 +2908,8 @@ class Pipe:
         resolution は probe のツール説明に無いため渡さない（引数 resolution は
         呼び出し側の互換のために受けるだけで、MCP には送らない）。
         """
-        wanted = _normalize_media_type(media_type or self.valves.default_media_type)
+        wanted = _normalize_media_type(
+            media_type or self.valves.default_media_type)
         args = {
             "project_id": project_id,
             "composition_id": composition_id or None,
@@ -2850,7 +2925,8 @@ class Pipe:
                 raise
             await ctx["emit_status"]("映像トラックが無いため音声として書き出します")
             outcome = await self._call_job(
-                ctx, client, specs, tool_map, arg_maps, "publish", {**args, "media_type": "Audio"}
+                ctx, client, specs, tool_map, arg_maps, "publish", {
+                    **args, "media_type": "Audio"}
             )
 
         published = _extract_publish(outcome.get("result"))
@@ -2888,13 +2964,17 @@ class Pipe:
             project_name=name,
             entries=entries,
         )
-        result = outcome["result"] if isinstance(outcome["result"], dict) else {}
-        project_id = str(_pick(result, "project_id", "projectId", default="") or "")
+        result = outcome["result"] if isinstance(
+            outcome["result"], dict) else {}
+        project_id = str(_pick(result, "project_id",
+                         "projectId", default="") or "")
 
-        patch = {"project_id": project_id, "last_job_id": outcome.get("job_id")}
+        patch = {"project_id": project_id,
+                 "last_job_id": outcome.get("job_id")}
         if name:
             patch["project_name"] = name
-        project_url = _pick(result, "project_url", "projectUrl", "app_url", "edit_url")
+        project_url = _pick(result, "project_url",
+                            "projectUrl", "app_url", "edit_url")
         if project_url:
             patch["project_url"] = project_url
         ctx["state"] = await _save_state(ctx.get("chat_id"), patch)
@@ -2919,7 +2999,8 @@ class Pipe:
 
     async def _infer_project_id(self, ctx, client, specs, tool_map, arg_maps) -> str:
         """project_id が渡されなかったとき、state → 一覧の順で確定させる。"""
-        state_project = str((ctx.get("state") or {}).get("project_id") or "").strip()
+        state_project = str((ctx.get("state") or {}).get(
+            "project_id") or "").strip()
         if state_project:
             return state_project
 
@@ -2957,14 +3038,17 @@ class Pipe:
         )
 
     def _render_player(self, ctx, published: dict, state: dict, revision: Optional[int] = None) -> str:
-        rev = revision if revision is not None else int((state or {}).get("revision") or 0)
+        rev = revision if revision is not None else int(
+            (state or {}).get("revision") or 0)
         note = "一部のメディアの処理に失敗しました" if published.get("partial") else "書き出し完了"
         return _render(
             _PLAYER,
             css=_BASE_CSS,
             height_js=_HEIGHT_JS,
-            title=_esc(str((state or {}).get("project_name") or "Descript プレビュー")),
-            src=_esc(published.get("download_url") or published.get("share_url") or ""),
+            title=_esc(str((state or {}).get(
+                "project_name") or "Descript プレビュー")),
+            src=_esc(published.get("download_url")
+                     or published.get("share_url") or ""),
             app_url=_esc(self._app_url(published, state)),
             share_url=_esc(published.get("share_url") or ""),
             revision=rev,
