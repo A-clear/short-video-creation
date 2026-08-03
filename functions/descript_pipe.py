@@ -294,14 +294,56 @@ def _coerce_args(spec: dict, args: dict, arg_map: Optional[dict] = None) -> tupl
 # ===========================================================================
 
 
+def _json_from_text(text: str) -> tuple:
+    """テキストから JSON 値を取り出す。戻り値は (値, 取り出し方)。
+
+    取り出せなければ (None, "")。取り出し方は "whole" / "fence" / "embedded"。
+    MCP サーバは JSON の前後に人間向けの説明文を付けることがあるため、
+    全体 parse だけに頼らない（契約書 §5.5 冒頭の実測）。
+    """
+    body = (text or "").strip()
+    if not body:
+        return None, ""
+    try:
+        return json.loads(body), "whole"
+    except Exception:
+        pass
+
+    # ```json … ``` で囲んで返す実装
+    fence = re.search(r"```(?:json)?\s*(.+?)```", body, re.S)
+    if fence:
+        try:
+            return json.loads(fence.group(1).strip()), "fence"
+        except Exception:
+            pass
+
+    # 前後に説明文が付いている実装。raw_decode は「値の直後で終わらない」ことを
+    # 許すので、最初の { または [ から均衡する位置までを 1 値として取り出せる。
+    decoder = json.JSONDecoder()
+    for index, char in enumerate(body):
+        if char not in "{[":
+            continue
+        try:
+            value, _end = decoder.raw_decode(body, index)
+        except Exception:
+            continue
+        return value, "embedded"
+    return None, ""
+
+
 def _unwrap_mcp(raw: Any) -> Any:
     """MCPClient.call_tool の戻り値を正規化する。
 
     call_tool は CallToolResult.content（コンテンツブロックの配列）を返す
-    （utils/mcp/client.py:117-123）。text ブロックを連結し、JSON なら parse する。
+    （utils/mcp/client.py:117-123）。structuredContent は捨てられるため、
+    text ブロックから JSON を取り出すのが唯一の経路になる。
     """
     if raw is None or isinstance(raw, dict):
         return raw
+    if isinstance(raw, str):
+        # 文字列で返す実装もありうる。JSON なら開いておく。
+        value, _mode = _json_from_text(raw)
+        return raw if value is None else value
     if not isinstance(raw, list):
         return raw
 
@@ -320,10 +362,15 @@ def _unwrap_mcp(raw: Any) -> Any:
     if not texts:
         return raw
     joined = "\n".join(texts).strip()
-    try:
-        return json.loads(joined)
-    except Exception:
+    value, mode = _json_from_text(joined)
+    if value is None:
+        # JSON がまったく無い＝本当に人間向けの文章だけ。文字列として返す。
+        _log_warn("mcp.unwrap_text_only", length=len(joined), head=joined[:200])
         return joined
+    if mode != "whole":
+        # サーバが JSON に説明文を混ぜている。動作はするが取りこぼしの温床なので残す。
+        _log_warn("mcp.unwrap_mixed", mode=mode, length=len(joined), head=joined[:200])
+    return value
 
 
 def _classify_mcp_error(exc: Exception, tool_name: str) -> DescriptError:

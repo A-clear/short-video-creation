@@ -64,6 +64,7 @@ SHARED = [
     "_save_state",
     "_append_history",
     "_coerce_args",
+    "_json_from_text",
     "_unwrap_mcp",
     "_classify_mcp_error",
     "_mcp_call",
