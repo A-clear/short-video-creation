@@ -23,6 +23,7 @@ requirements:
 # ---------------------------------------------------------------------------
 
 import json
+import logging
 import re
 import time
 from typing import Any, Optional
@@ -64,6 +65,74 @@ class DescriptError(Exception):
             "hint": self.hint,
             "data": self.data,
         }
+
+
+# ===========================================================================
+# 契約書 §5.10 ロギング
+# ===========================================================================
+
+_LOG_VALUE_MAX = 300
+
+# Function は function_<function_id> という名前のモジュールとして exec される
+# （backend/open_webui/utils/plugin.py:276）ので、__name__ がそのまま識別子になる。
+_LOGGER = logging.getLogger(__name__)
+
+
+def _log(level: int, event: str, **fields: Any) -> None:
+    """1 行 1 イベントの構造化ログを出す。
+
+    Open WebUI は stdlib logging を GLOBAL_LOG_LEVEL で一括設定する
+    （backend/open_webui/env.py:107-118）。v0.11.0 の SRC_LOG_LEVELS は
+    空の互換用変数なので参照してはいけない（KeyError になる）。
+
+    Uvicorn Workers で複数プロセスに分かれるため、呼び出し側は chat_id と
+    op を必ず渡すこと。値は署名 URL を伏せ、長すぎるものは切り詰める。
+    ⚠️ Valve の値・アクセストークン・ファイル本体は載せない（§11）。
+    """
+    if not _LOGGER.isEnabledFor(level):
+        return
+    parts = []
+    for key, value in fields.items():
+        if value is None:
+            continue
+        text = _redact_signed_urls(str(value)).replace("\n", " ")
+        if len(text) > _LOG_VALUE_MAX:
+            text = text[:_LOG_VALUE_MAX] + "…"
+        parts.append(f"{key}={text}")
+    _LOGGER.log(level, "descript %s%s", event, (" " + " ".join(parts)) if parts else "")
+
+
+def _log_debug(event: str, **fields: Any) -> None:
+    _log(logging.DEBUG, event, **fields)
+
+
+def _log_info(event: str, **fields: Any) -> None:
+    _log(logging.INFO, event, **fields)
+
+
+def _log_warn(event: str, **fields: Any) -> None:
+    _log(logging.WARNING, event, **fields)
+
+
+def _log_error(event: str, **fields: Any) -> None:
+    _log(logging.ERROR, event, **fields)
+
+
+def _apply_log_level(level: Any) -> None:
+    """Valve のレベルをこの Function のロガーにだけ適用する。
+
+    GLOBAL_LOG_LEVEL を上げると Open WebUI 全体が饒舌になるため、
+    Function 単位で切り替えられるようにする。未知の値は無視する。
+    getLevelNamesMapping は Python 3.11+（本プロジェクトの下限）。
+    """
+    name = str(level or "").strip().upper()
+    if name in logging.getLevelNamesMapping():
+        _LOGGER.setLevel(name)
+
+
+def _ms(started: float) -> int:
+    """time.monotonic() の起点からの経過ミリ秒。"""
+    return int((time.monotonic() - started) * 1000)
 
 
 # ===========================================================================
@@ -671,6 +740,16 @@ class Action:
             description="この秒数を超えそうな処理は早期 return する（リバースプロキシ切断対策）",
         )
         debug: bool = Field(default=False, description="詳細を status イベントに出す")
+        log_level: str = Field(
+            default="INFO",
+            description="この Function だけのログレベル。GLOBAL_LOG_LEVEL を上げずに詳細を見たいとき DEBUG にする",
+            json_schema_extra={
+                "input": {
+                    "type": "select",
+                    "options": ["DEBUG", "INFO", "WARNING", "ERROR"],
+                }
+            },
+        )
 
     class UserValves(BaseModel):
         default_aspect: str = Field(
@@ -795,6 +874,14 @@ class Action:
             },
         }
 
+        _log_info(
+            "rpc.start",
+            op=op,
+            chat_id=body.get("chat_id"),
+            model=model_id,
+            args=sorted((args or {}).keys()),
+        )
+        started = time.monotonic()
         try:
             res = await generate_chat_completion(
                 request,
@@ -803,6 +890,7 @@ class Action:
                 bypass_filter=bool(getattr(self.valves, "bypass_model_access", True)),
             )
         except Exception as exc:
+            _log_error("rpc.crash", op=op, ms=_ms(started), error=str(exc)[:400])
             return {
                 "ok": False,
                 "op": op,
@@ -815,7 +903,18 @@ class Action:
                 "data": {"raw": str(exc)[:800]},
             }
 
-        return _unpack_pipe_response(res)
+        envelope = _unpack_pipe_response(res)
+        if envelope.get("ok"):
+            _log_info("rpc.done", op=op, ms=_ms(started))
+        else:
+            _log_warn(
+                "rpc.fail",
+                op=op,
+                ms=_ms(started),
+                code=envelope.get("code"),
+                message=envelope.get("message_ja"),
+            )
+        return envelope
 
     # -------------------------------------------------------------------
     # エラー封筒の展開（契約書 §4）
@@ -1823,6 +1922,10 @@ class Action:
     ) -> dict:
         body = body or {}
         started = time.monotonic()
+        # ★ ログレベルの適用は __init__ ではなくここで行う。Open WebUI は呼び出しの
+        #    たびに function_module.valves をインスタンスごと差し替える
+        #    （utils/actions.py:87）ため、__init__ では常に既定値しか読めない。
+        _apply_log_level(self.valves.log_level)
         # __id__ は sub_action_id（無ければ action_id）が入る（utils/actions.py:100）
         sub = str(__id__ or "").split(".")[-1]
 
@@ -1838,6 +1941,12 @@ class Action:
                 )
 
             await self._debug(__event_emitter__, f"sub_action={sub}")
+            _log_info(
+                "action.start",
+                sub=sub or "(menu)",
+                chat_id=body.get("chat_id"),
+                message_id=body.get("id"),
+            )
 
             if sub == "probe":
                 return await self._act_probe(
@@ -1875,6 +1984,7 @@ class Action:
 
         except Exception as exc:
             # 想定外の例外も日本語メッセージに変換する（正常系は封筒で受ける）
+            _LOGGER.exception("descript action.crash sub=%s ms=%s", sub, _ms(started))
             await self._status(__event_emitter__, "処理を中断しました", done=True)
             await self._notify(__event_emitter__, "error", "内部エラーが発生しました。")
             return self._message(

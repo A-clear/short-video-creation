@@ -21,6 +21,7 @@ requirements:
 
 import asyncio
 import json
+import logging
 import os
 import re
 import time
@@ -73,6 +74,74 @@ class DescriptError(Exception):
             "hint": self.hint,
             "data": self.data,
         }
+
+
+# ===========================================================================
+# 契約書 §5.10 ロギング
+# ===========================================================================
+
+_LOG_VALUE_MAX = 300
+
+# Function は function_<function_id> という名前のモジュールとして exec される
+# （backend/open_webui/utils/plugin.py:276）ので、__name__ がそのまま識別子になる。
+_LOGGER = logging.getLogger(__name__)
+
+
+def _log(level: int, event: str, **fields: Any) -> None:
+    """1 行 1 イベントの構造化ログを出す。
+
+    Open WebUI は stdlib logging を GLOBAL_LOG_LEVEL で一括設定する
+    （backend/open_webui/env.py:107-118）。v0.11.0 の SRC_LOG_LEVELS は
+    空の互換用変数なので参照してはいけない（KeyError になる）。
+
+    Uvicorn Workers で複数プロセスに分かれるため、呼び出し側は chat_id と
+    op を必ず渡すこと。値は署名 URL を伏せ、長すぎるものは切り詰める。
+    ⚠️ Valve の値・アクセストークン・ファイル本体は載せない（§11）。
+    """
+    if not _LOGGER.isEnabledFor(level):
+        return
+    parts = []
+    for key, value in fields.items():
+        if value is None:
+            continue
+        text = _redact_signed_urls(str(value)).replace("\n", " ")
+        if len(text) > _LOG_VALUE_MAX:
+            text = text[:_LOG_VALUE_MAX] + "…"
+        parts.append(f"{key}={text}")
+    _LOGGER.log(level, "descript %s%s", event, (" " + " ".join(parts)) if parts else "")
+
+
+def _log_debug(event: str, **fields: Any) -> None:
+    _log(logging.DEBUG, event, **fields)
+
+
+def _log_info(event: str, **fields: Any) -> None:
+    _log(logging.INFO, event, **fields)
+
+
+def _log_warn(event: str, **fields: Any) -> None:
+    _log(logging.WARNING, event, **fields)
+
+
+def _log_error(event: str, **fields: Any) -> None:
+    _log(logging.ERROR, event, **fields)
+
+
+def _apply_log_level(level: Any) -> None:
+    """Valve のレベルをこの Function のロガーにだけ適用する。
+
+    GLOBAL_LOG_LEVEL を上げると Open WebUI 全体が饒舌になるため、
+    Function 単位で切り替えられるようにする。未知の値は無視する。
+    getLevelNamesMapping は Python 3.11+（本プロジェクトの下限）。
+    """
+    name = str(level or "").strip().upper()
+    if name in logging.getLevelNamesMapping():
+        _LOGGER.setLevel(name)
+
+
+def _ms(started: float) -> int:
+    """time.monotonic() の起点からの経過ミリ秒。"""
+    return int((time.monotonic() - started) * 1000)
 
 
 # ===========================================================================
@@ -310,6 +379,7 @@ async def _mcp_call(client, specs_by_name: dict, tool_map: dict, op: str,
     spec = specs_by_name.get(name) or {}
     payload, missing = _coerce_args(spec, args, (arg_maps or {}).get(op))
     if missing:
+        _log_warn("mcp.args_missing", op=op, tool=name, missing=missing)
         raise DescriptError(
             "TOOL_ARGS_MISSING",
             f"ツール '{name}' の必須引数が不足しています: {', '.join(missing)}",
@@ -317,14 +387,29 @@ async def _mcp_call(client, specs_by_name: dict, tool_map: dict, op: str,
             {"tool": name, "missing": missing, "spec": spec},
         )
 
+    # 引数は「キー名だけ」を出す。値には署名 URL やファイル名が入りうる。
+    _log_info("mcp.call", op=op, tool=name, args=sorted(payload.keys()))
+    started = time.monotonic()
     try:
         raw = await client.call_tool(name, payload)
     except DescriptError:
         raise
     except Exception as exc:
+        _log_error("mcp.error", op=op, tool=name, ms=_ms(started), error=str(exc)[:400])
         raise _classify_mcp_error(exc, name) from exc
 
-    return _unwrap_mcp(raw)
+    result = _unwrap_mcp(raw)
+    # 応答は型とキーだけ。本文を流すとログが肥大し、署名 URL の漏洩経路になる。
+    _log_info(
+        "mcp.result",
+        op=op,
+        tool=name,
+        ms=_ms(started),
+        type=type(result).__name__,
+        keys=sorted(str(k) for k in result.keys()) if isinstance(result, dict) else None,
+        size=len(result) if isinstance(result, (list, str)) else None,
+    )
+    return result
 
 
 # ===========================================================================
@@ -471,16 +556,28 @@ async def _poll_job(client, specs_by_name: dict, tool_map: dict, arg_maps: dict,
         waited = time.monotonic() - call_started
         state = str(_pick(raw, "job_state", "state", "status", default="") or "").lower()
         result = _pick(raw, "result", default={}) or {}
+        _log_info(
+            "job.tick",
+            job_id=job_id,
+            state=state or "(none)",
+            tick=ticks + 1,
+            waited_ms=int(waited * 1000),
+            blocking=blocking,
+        )
 
         if state in ("stopped", "completed", "succeeded", "success", "finished"):
             status = str(_pick(result, "status", "result_status", default="") or "").lower()
             if status == "success":
+                _log_info("job.done", job_id=job_id, ms=_ms(started), partial=False)
                 return {"ok": True, "partial": False, "result": result}
             if status == "partial":
+                _log_warn("job.done", job_id=job_id, ms=_ms(started), partial=True)
                 return {"ok": True, "partial": True, "result": result}
             if status == "":
                 # result を返さない実装向けのフォールバック
+                _log_warn("job.done_no_status", job_id=job_id, ms=_ms(started))
                 return {"ok": True, "partial": False, "result": result}
+            _log_error("job.failed", job_id=job_id, ms=_ms(started), status=status)
             raise DescriptError(
                 "JOB_FAILED",
                 str(_pick(result, "error_message", "message", default="処理が失敗しました。")),
@@ -489,6 +586,7 @@ async def _poll_job(client, specs_by_name: dict, tool_map: dict, arg_maps: dict,
             )
 
         if state in ("cancelled", "canceled"):
+            _log_warn("job.cancelled", job_id=job_id, ms=_ms(started))
             raise DescriptError("JOB_CANCELLED", "処理がキャンセルされました。", "", {"job_id": job_id})
 
         ticks += 1
@@ -501,6 +599,7 @@ async def _poll_job(client, specs_by_name: dict, tool_map: dict, arg_maps: dict,
             await emit_status(f"{label}{suffix}（{elapsed} 秒経過 / job {str(job_id)[:8]}）")
 
         if time.monotonic() - started > float(valves.poll_timeout_sec):
+            _log_error("job.timeout", job_id=job_id, ms=_ms(started), ticks=ticks)
             raise DescriptError(
                 "JOB_TIMEOUT",
                 f"処理が {int(valves.poll_timeout_sec)} 秒以内に完了しませんでした。",
@@ -951,6 +1050,34 @@ def _file_chunks(path: str, chunk_size: int = 1024 * 1024):
             yield chunk
 
 
+def _diag_response(raw: Any, sent_keys: Any, limit: int = 900) -> str:
+    """MCP 応答が期待した形でないときに、どの層で壊れたかを示す診断文を作る。
+
+    Function からはログを出せないため、封筒の data['raw'] に載せるのが唯一の
+    手掛かりになる（Action の _error_markdown が <details> に描画し、
+    _redact_signed_urls で署名 URL を伏せる）。
+
+    型だけで層が切り分けられる:
+      list  … MCPClient.call_tool が返した content が空/非 text。
+              サーバが structuredContent のみを返している可能性
+              （utils/mcp/client.py は content しか返さない）
+      str   … text ブロックが JSON として parse できなかった。
+              人間向けサマリを返すツールだと _unwrap_mcp が素通しする
+      dict  … 応答は取れている。キー名の揺れか、Descript 側が直接
+              アップロードとして受け取っていない
+    """
+    lines = [
+        f"送信した add_media キー: {sorted(sent_keys)}",
+        f"応答の型: {type(raw).__name__}",
+    ]
+    if isinstance(raw, dict):
+        lines.append(f"応答のキー: {sorted(str(k) for k in raw.keys())}")
+    elif isinstance(raw, list):
+        lines.append(f"応答の要素数: {len(raw)}")
+    lines.append(f"応答（先頭 {limit} 文字）: {repr(raw)[:limit]}")
+    return "\n".join(lines)
+
+
 def _extract_publish(result: Any) -> dict:
     """publish 系ジョブの結果から URL 群を取り出す。"""
     payload = result if isinstance(result, dict) else {}
@@ -1101,6 +1228,16 @@ class Pipe:
         redact_download_url: bool = Field(
             default=True, description="署名付き download_url をチャット履歴に残さない"
         )
+        log_level: str = Field(
+            default="INFO",
+            description="この Function だけのログレベル。GLOBAL_LOG_LEVEL を上げずに詳細を見たいとき DEBUG にする",
+            json_schema_extra={
+                "input": {
+                    "type": "select",
+                    "options": ["DEBUG", "INFO", "WARNING", "ERROR"],
+                }
+            },
+        )
 
     class UserValves(BaseModel):
         editing_style: str = Field(
@@ -1142,6 +1279,11 @@ class Pipe:
         __files__=None,
         __metadata__=None,
     ) -> str:
+        # ★ ログレベルの適用は __init__ ではなくここで行う。Open WebUI は呼び出しの
+        #    たびに function_module.valves をインスタンスごと差し替える
+        #    （functions.py:61-66）ため、__init__ では常に既定値しか読めない。
+        _apply_log_level(self.valves.log_level)
+
         # タイトル生成・タグ生成などの内部タスクでは MCP を叩かない（functions.py:262）。
         if __task__ is not None:
             return ""
@@ -1150,6 +1292,11 @@ class Pipe:
         # MCP に接続せず、この封筒をそのまま返す。
         preflight = (body or {}).get("descript_preflight") or {}
         if preflight and preflight.get("ok") is False:
+            _log_warn(
+                "pipe.preflight_blocked",
+                chat_id=__chat_id__,
+                code=preflight.get("code", "INTERNAL"),
+            )
             return _fail(
                 "preflight",
                 preflight.get("code", "INTERNAL"),
@@ -1158,6 +1305,7 @@ class Pipe:
             )
 
         op = ""
+        started = time.monotonic()
         try:
             op, args = self._dispatch(body or {})
             ctx = {
@@ -1180,10 +1328,23 @@ class Pipe:
                 "emit_status": _make_emit_status(__event_emitter__),
             }
             ctx["state"] = await _load_state(ctx["chat_id"])
-            return await self._open_mcp_and_run(op, args, ctx)
+            _log_info(
+                "pipe.start",
+                op=op,
+                chat_id=ctx["chat_id"],
+                args=sorted(args.keys()),
+                media=len(ctx["media"]),
+                project_id=(ctx["state"] or {}).get("project_id"),
+            )
+            envelope = await self._open_mcp_and_run(op, args, ctx)
+            _log_info("pipe.done", op=op, chat_id=ctx["chat_id"], ms=_ms(started))
+            return envelope
         except DescriptError as exc:
+            # 封筒として返す失敗はここが唯一の ERROR 行。下位で二重に出さない。
+            _log_error("pipe.fail", op=op, code=exc.code, ms=_ms(started), message=exc.message_ja)
             return json.dumps(exc.envelope(op), ensure_ascii=False)
         except Exception as exc:  # 例外は絶対に外へ漏らさない
+            _LOGGER.exception("descript pipe.crash op=%s ms=%s", op, _ms(started))
             return _fail(
                 op,
                 "INTERNAL",
@@ -1373,12 +1534,20 @@ class Pipe:
                 for spec in (specs or [])
                 if isinstance(spec, dict) and spec.get("name")
             }
+            _log_info("mcp.connected", server_id=server_id, tools=len(specs_by_name))
             tool_map = await self._resolve_tools(ctx, specs_by_name)
+            _log_info(
+                "mcp.resolved",
+                mode=self.valves.tool_resolution_mode,
+                resolved={k: v for k, v in tool_map.items() if v},
+                unresolved=[o for o in _LOGICAL_OPS_EXT if not tool_map.get(o)] or None,
+            )
             arg_maps = _parse_json_valve(self.valves.tool_arg_map)
             return await self._handle(op, args, ctx, client, specs_by_name, tool_map, arg_maps, server_id)
         finally:
             if client is not None:
                 await client.disconnect()
+                _log_debug("mcp.disconnected", server_id=server_id)
 
     # -- ツール名の解決（契約書 §2） ----------------------------------------
 
@@ -2296,6 +2465,15 @@ class Pipe:
         if not project_id:
             args["add_compositions"] = [{"clips": [{"media": key} for key in add_media]}]
 
+        _log_info(
+            "import.request",
+            chat_id=ctx.get("chat_id"),
+            project_id=project_id or "(new)",
+            media=sorted(add_media.keys()),
+            direct_uploads=sorted(uploads.keys()),
+            compositions="add_compositions" in args,
+        )
+
         raw = await _mcp_call(client, specs, tool_map, "import_media", args, arg_maps)
         job_id = _extract_job_id(raw)
         if uploads:
@@ -2341,7 +2519,7 @@ class Pipe:
             ) from exc
 
         meta = record.meta if isinstance(record.meta, dict) else {}
-        return {
+        resolved = {
             "name": entry.get("name") or meta.get("name") or record.filename,
             "path": path,
             "file_size": file_size,
@@ -2349,6 +2527,16 @@ class Pipe:
             or meta.get("content_type")
             or "application/octet-stream",
         }
+        # content_type が octet-stream に落ちていると Descript 側で弾かれうるので、
+        # 実体のパスではなく「何をどう判定したか」を残す。
+        _log_info(
+            "file.resolved",
+            file_id=file_id,
+            name=resolved["name"],
+            bytes=file_size,
+            content_type=resolved["content_type"],
+        )
+        return resolved
 
     async def _upload_media(
         self, ctx, client, specs, tool_map, arg_maps, *, raw, job_id, uploads
@@ -2364,6 +2552,18 @@ class Pipe:
         if not isinstance(upload_urls, dict):
             upload_urls = {}
 
+        # ここが噛み合わないと「アップロード先 URL が返りませんでした」になる。
+        # 送ったキーと返ってきたキーを必ず突き合わせられるようにしておく。
+        _log_info(
+            "import.upload_urls",
+            job_id=job_id,
+            expected=sorted(uploads.keys()),
+            returned=sorted(str(k) for k in upload_urls.keys()),
+            response_type=type(raw).__name__,
+        )
+        if not upload_urls:
+            _log_warn("import.upload_urls_empty", job_id=job_id, diag=_diag_response(raw, uploads.keys()))
+
         timeout = httpx.Timeout(float(self.valves.upload_timeout_sec), connect=30.0)
         async with httpx.AsyncClient(timeout=timeout, follow_redirects=False) as http:
             for key, entry in uploads.items():
@@ -2373,30 +2573,59 @@ class Pipe:
                         "JOB_FAILED",
                         f"'{key}' のアップロード先 URL が返りませんでした。",
                         "動画の URL を指定して取り込んでください。",
-                        {"media": key, "job_id": job_id},
+                        {
+                            "media": key,
+                            "job_id": job_id,
+                            "stage": "upload_urls_missing",
+                            "raw": _diag_response(raw, uploads.keys()),
+                        },
                     )
                 url = _pick(target, "upload_url", "uploadUrl", "url")
                 media_id = _pick(target, "media_id", "mediaId", "asset_id", "assetId", "artifact_id")
                 if not url:
                     raise DescriptError(
                         "JOB_FAILED",
-                        f"'{key}' のアップロード先 URL が返りませんでした。",
+                        f"'{key}' のアップロード先 URL の形式が想定と異なります。",
                         "動画の URL を指定して取り込んでください。",
-                        {"media": key, "job_id": job_id},
+                        {
+                            "media": key,
+                            "job_id": job_id,
+                            "stage": "upload_url_field_missing",
+                            "raw": _diag_response(target, uploads.keys()),
+                        },
                     )
 
                 await ctx["emit_status"](f"『{key}』をアップロードしています")
+                file_size = int(entry.get("file_size") or 0)
+                _log_info("upload.start", job_id=job_id, media=key, bytes=file_size)
+                put_started = time.monotonic()
                 try:
                     response = await http.put(
                         str(url),
                         content=_file_chunks(str(entry.get("path"))),
                         headers={
                             "Content-Type": "application/octet-stream",
-                            "Content-Length": str(int(entry.get("file_size") or 0)),
+                            "Content-Length": str(file_size),
                         },
                     )
                     response.raise_for_status()
+                    _log_info(
+                        "upload.done",
+                        job_id=job_id,
+                        media=key,
+                        bytes=file_size,
+                        status=response.status_code,
+                        ms=_ms(put_started),
+                    )
                 except Exception as exc:
+                    _log_error(
+                        "upload.failed",
+                        job_id=job_id,
+                        media=key,
+                        bytes=file_size,
+                        ms=_ms(put_started),
+                        error=str(exc)[:400],
+                    )
                     await self._report_upload_failure(
                         client, specs, tool_map, arg_maps, job_id, media_id
                     )

@@ -354,13 +354,14 @@ Descript を一度有効化し、ブラウザに表示される同意画面を�
 
 ## 5. 共通ヘルパ正本
 
-以下を **3 ファイルすべてに同一内容でインライン展開**する。Filter は §5.1〜5.3 と 5.9 のみ使用する。
+以下を **3 ファイルすべてに同一内容でインライン展開**する。Filter は §5.1〜5.3 と 5.9・5.10 のみ使用する。
 
 ### 5.0 import 規約
 
 ```python
 import asyncio
 import json
+import logging
 import re
 import time
 from typing import Any, Optional
@@ -832,6 +833,102 @@ def _redact_signed_urls(text: str, replacement: str = "") -> str:
 > E2E で `publish` を 1 回実行し、返ってきた `download_url` のクエリパラメータを確認すること。該当しなければパターンにその署名パラメータ名を追加する。
 > 誤爆側（過剰マッチ）より取りこぼし側（過小マッチ）のほうが被害が小さいため、意図的にこの方向に倒している。
 
+### 5.10 ロギング（3 ファイル共用）
+
+Functions は Open WebUI のプロセス内で `exec` されるため、**標準ライブラリの `logging` にそのまま乗る**。専用の初期化は不要で、してはいけない。
+
+> ⚠️ **`SRC_LOG_LEVELS` を参照しないこと。** v0.11.0 の `backend/open_webui/env.py:127` では `SRC_LOG_LEVELS = {}`（"Legacy variable, do not remove"）であり、旧来の記事にある `log.setLevel(SRC_LOG_LEVELS["MAIN"])` は **`KeyError` で Function のロードごと失敗する**。
+> 現行の作法はロガーを取るだけ。レベルは `GLOBAL_LOG_LEVEL` が `logging.basicConfig(..., force=True)` で一括設定する（`env.py:107-118`）。
+
+- ロガー名は `logging.getLogger(__name__)` で足りる。Function は `types.ModuleType(f"function_{function_id}")` として `exec` されるため（`backend/open_webui/utils/plugin.py:276`）、`__name__` は `function_descript_pipe` のように **Function ID がそのまま入る**。grep 対象として十分
+- **Uvicorn Workers で複数プロセス / 複数レプリカに分かれる**ため、`chat_id` と `op` が無い行はどのリクエストのものか追えない。イベント名 + `key=value` の 1 行 1 イベント形式に固定する
+- 秘匿情報は §11 の規律をログにも適用する。**Valve の値・アクセストークン・ファイル本体を載せない。** 署名 URL は `_redact_signed_urls`（§5.9）を通す
+- MCP の応答は**型とキーだけ**を DEBUG で出す。本文をそのまま流すとチャンクごとに肥大し、署名 URL の漏洩経路にもなる
+
+```python
+_LOG_VALUE_MAX = 300
+
+# Function は function_<function_id> という名前のモジュールとして exec される
+# （backend/open_webui/utils/plugin.py:276）ので、__name__ がそのまま識別子になる。
+_LOGGER = logging.getLogger(__name__)
+
+
+def _log(level: int, event: str, **fields: Any) -> None:
+    """1 行 1 イベントの構造化ログを出す。
+
+    Open WebUI は stdlib logging を GLOBAL_LOG_LEVEL で一括設定する
+    （backend/open_webui/env.py:107-118）。v0.11.0 の SRC_LOG_LEVELS は
+    空の互換用変数なので参照してはいけない（KeyError になる）。
+
+    Uvicorn Workers で複数プロセスに分かれるため、呼び出し側は chat_id と
+    op を必ず渡すこと。値は署名 URL を伏せ、長すぎるものは切り詰める。
+    ⚠️ Valve の値・アクセストークン・ファイル本体は載せない（§11）。
+    """
+    if not _LOGGER.isEnabledFor(level):
+        return
+    parts = []
+    for key, value in fields.items():
+        if value is None:
+            continue
+        text = _redact_signed_urls(str(value)).replace("\n", " ")
+        if len(text) > _LOG_VALUE_MAX:
+            text = text[:_LOG_VALUE_MAX] + "…"
+        parts.append(f"{key}={text}")
+    _LOGGER.log(level, "descript %s%s", event, (" " + " ".join(parts)) if parts else "")
+
+
+def _log_debug(event: str, **fields: Any) -> None:
+    _log(logging.DEBUG, event, **fields)
+
+
+def _log_info(event: str, **fields: Any) -> None:
+    _log(logging.INFO, event, **fields)
+
+
+def _log_warn(event: str, **fields: Any) -> None:
+    _log(logging.WARNING, event, **fields)
+
+
+def _log_error(event: str, **fields: Any) -> None:
+    _log(logging.ERROR, event, **fields)
+
+
+def _apply_log_level(level: Any) -> None:
+    """Valve のレベルをこの Function のロガーにだけ適用する。
+
+    GLOBAL_LOG_LEVEL を上げると Open WebUI 全体が饒舌になるため、
+    Function 単位で切り替えられるようにする。未知の値は無視する。
+    getLevelNamesMapping は Python 3.11+（本プロジェクトの下限）。
+    """
+    name = str(level or "").strip().upper()
+    if name in logging.getLevelNamesMapping():
+        _LOGGER.setLevel(name)
+
+
+def _ms(started: float) -> int:
+    """time.monotonic() の起点からの経過ミリ秒。"""
+    return int((time.monotonic() - started) * 1000)
+```
+
+**Valve**: 3 ファイルとも `log_level`（既定 `INFO`）を持つ。
+
+> ⚠️ **`_apply_log_level` を `__init__` で呼んではいけない（呼んでも効かない）。**
+> Open WebUI は**呼び出しのたびに `function_module.valves` をインスタンスごと差し替える**（Pipe: `functions.py:61-66` / Action: `utils/actions.py:87` / Filter: `utils/filter.py:113-119`）。
+> `__init__` が読めるのは常に既定値であり、UI で `log_level` を変えても反映されない。
+> **各エントリポイントの先頭**（`Pipe.pipe` / `Action.action` / `Filter.inlet` / `Filter.outlet`）で呼ぶこと。`Filter.stream` はチャンクごとに呼ばれるため対象外（同一リクエストでは先に `inlet` が通る）。
+> これは `self.valves` を読むすべての処理に当てはまる性質であって、ロギング固有の話ではない。
+
+**レベルの使い分け**:
+
+| レベル    | 出すもの                                                                         |
+| --------- | -------------------------------------------------------------------------------- |
+| `INFO`    | 進捗の節目（Action 起動 / RPC 開始・終了 / MCP ツール呼び出し / ジョブ状態遷移） |
+| `DEBUG`   | 引数キー一覧、MCP 応答の型とキー、フォームの往復                                 |
+| `WARNING` | 想定外だが処理を続けられる分岐（`upload_urls` 欠落、部分失敗、ツール未解決）     |
+| `ERROR`   | 封筒 `ok=False` として返す直前の 1 回だけ。同じ失敗を二重に出さない              |
+
+**イベント名は固定文字列**にする（`pipe.start` / `mcp.call` / `mcp.result` / `job.tick` / `import.upload_urls` / `action.start` / `rpc.done` / `filter.inlet` など）。可変文字列を混ぜると grep できなくなる。
+
 ---
 
 ## 6. HTML テンプレート正本
@@ -1149,10 +1246,10 @@ requirements:
 
 ### 12.1 未解決
 
-| 項目 | 状況 | 実装での扱い |
-| --- | --- | --- |
-| ローカルファイルの直接アップロード | `import_media` は `add_media` に `content_type` / `file_size` を渡すと `upload_urls` を返し、そこへ `Content-Type: application/octet-stream` で PUT する方式（§2.0.1 ①）。**Open WebUI に保存されたファイルの実体を Function から読む手段**が未確認（`STORAGE_PROVIDER=s3` 構成を含む） | 読めるなら `httpx.AsyncClient` で PUT する。読めないなら `file_id` 経路は明確なエラーにして URL 指定に誘導する。PUT 失敗時は `report_upload_status` で import ジョブを解放する |
-| `publish_project` の `resolution` | probe のツール説明に記載が無い。REST API 側（`descript_api.json`）には `480p`〜`4K` の enum が存在する | 渡さない方向に倒す。`_coerce_args` がスキーマに無いキーを落とすため実害は無い |
-| Descript の `download_url` の署名方式 | AWS SigV4 / GCS のどちらでもない独自方式の可能性がある | §5.9 の注記を参照。E2E で 1 回クエリパラメータを実見して確認する |
-| `WEBUI_URL` を HTTPS 公開 URL にする必要性 | Descript の IdP（Stytch）は confidential client に **HTTPS かつ非 loopback** の redirect URI を要求する。`http://localhost:8080` では動的クライアント登録（DCR）が 400 で失敗する | `WEBUI_URL` を公開 HTTPS URL にする（トンネル or 実ドメイン）。**PersistentConfig なので `.env` ではなく Admin Panel → Settings → General で変更する**（`models/config.py` の `seed_defaults` は既存の DB 値を優先する） |
-| `gpt-realtime-2.1` の接続方法 | Open WebUI v0.11.0 に該当する設定項目が存在しない | `.env.example` に注記のみ。使うなら別途 Pipe Function として実装が必要 |
+| 項目                                       | 状況                                                                                                                                                                                                                                                                                    | 実装での扱い                                                                                                                                                                                                             |
+| ------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| ローカルファイルの直接アップロード         | `import_media` は `add_media` に `content_type` / `file_size` を渡すと `upload_urls` を返し、そこへ `Content-Type: application/octet-stream` で PUT する方式（§2.0.1 ①）。**Open WebUI に保存されたファイルの実体を Function から読む手段**が未確認（`STORAGE_PROVIDER=s3` 構成を含む） | 読めるなら `httpx.AsyncClient` で PUT する。読めないなら `file_id` 経路は明確なエラーにして URL 指定に誘導する。PUT 失敗時は `report_upload_status` で import ジョブを解放する                                           |
+| `publish_project` の `resolution`          | probe のツール説明に記載が無い。REST API 側（`descript_api.json`）には `480p`〜`4K` の enum が存在する                                                                                                                                                                                  | 渡さない方向に倒す。`_coerce_args` がスキーマに無いキーを落とすため実害は無い                                                                                                                                            |
+| Descript の `download_url` の署名方式      | AWS SigV4 / GCS のどちらでもない独自方式の可能性がある                                                                                                                                                                                                                                  | §5.9 の注記を参照。E2E で 1 回クエリパラメータを実見して確認する                                                                                                                                                         |
+| `WEBUI_URL` を HTTPS 公開 URL にする必要性 | Descript の IdP（Stytch）は confidential client に **HTTPS かつ非 loopback** の redirect URI を要求する。`http://localhost:8080` では動的クライアント登録（DCR）が 400 で失敗する                                                                                                       | `WEBUI_URL` を公開 HTTPS URL にする（トンネル or 実ドメイン）。**PersistentConfig なので `.env` ではなく Admin Panel → Settings → General で変更する**（`models/config.py` の `seed_defaults` は既存の DB 値を優先する） |
+| `gpt-realtime-2.1` の接続方法              | Open WebUI v0.11.0 に該当する設定項目が存在しない                                                                                                                                                                                                                                       | `.env.example` に注記のみ。使うなら別途 Pipe Function として実装が必要                                                                                                                                                   |

@@ -73,8 +73,24 @@ SHARED = [
     "_form_result",
     "_poll_job",
     "_redact_signed_urls",
+    # §5.10 ロギング
+    "_log",
+    "_log_debug",
+    "_log_info",
+    "_log_warn",
+    "_log_error",
+    "_apply_log_level",
+    "_ms",
 ]
-SHARED_CONSTS = ["_STATE_KEY", "_STATE_VERSION", "_HISTORY_MAX", "_SIGNED_URL_RE", "_SIGNED_URL_PLACEHOLDER"]
+SHARED_CONSTS = [
+    "_STATE_KEY",
+    "_STATE_VERSION",
+    "_HISTORY_MAX",
+    "_SIGNED_URL_RE",
+    "_SIGNED_URL_PLACEHOLDER",
+    "_LOG_VALUE_MAX",
+    "_LOGGER",
+]
 
 problems: list[str] = []
 oks: list[str] = []

@@ -27,6 +27,7 @@ requirements:
 
 import asyncio  # noqa: F401  (§5.0 import 規約: 3 ファイルで同一の import 群を保つ)
 import json
+import logging
 import re
 import time
 from typing import Any, Optional
@@ -87,6 +88,74 @@ class DescriptError(Exception):
             "hint": self.hint,
             "data": self.data,
         }
+
+
+# ===========================================================================
+# §5.10 ロギング（契約書からの転記。書き換え禁止）
+# ===========================================================================
+
+_LOG_VALUE_MAX = 300
+
+# Function は function_<function_id> という名前のモジュールとして exec される
+# （backend/open_webui/utils/plugin.py:276）ので、__name__ がそのまま識別子になる。
+_LOGGER = logging.getLogger(__name__)
+
+
+def _log(level: int, event: str, **fields: Any) -> None:
+    """1 行 1 イベントの構造化ログを出す。
+
+    Open WebUI は stdlib logging を GLOBAL_LOG_LEVEL で一括設定する
+    （backend/open_webui/env.py:107-118）。v0.11.0 の SRC_LOG_LEVELS は
+    空の互換用変数なので参照してはいけない（KeyError になる）。
+
+    Uvicorn Workers で複数プロセスに分かれるため、呼び出し側は chat_id と
+    op を必ず渡すこと。値は署名 URL を伏せ、長すぎるものは切り詰める。
+    ⚠️ Valve の値・アクセストークン・ファイル本体は載せない（§11）。
+    """
+    if not _LOGGER.isEnabledFor(level):
+        return
+    parts = []
+    for key, value in fields.items():
+        if value is None:
+            continue
+        text = _redact_signed_urls(str(value)).replace("\n", " ")
+        if len(text) > _LOG_VALUE_MAX:
+            text = text[:_LOG_VALUE_MAX] + "…"
+        parts.append(f"{key}={text}")
+    _LOGGER.log(level, "descript %s%s", event, (" " + " ".join(parts)) if parts else "")
+
+
+def _log_debug(event: str, **fields: Any) -> None:
+    _log(logging.DEBUG, event, **fields)
+
+
+def _log_info(event: str, **fields: Any) -> None:
+    _log(logging.INFO, event, **fields)
+
+
+def _log_warn(event: str, **fields: Any) -> None:
+    _log(logging.WARNING, event, **fields)
+
+
+def _log_error(event: str, **fields: Any) -> None:
+    _log(logging.ERROR, event, **fields)
+
+
+def _apply_log_level(level: Any) -> None:
+    """Valve のレベルをこの Function のロガーにだけ適用する。
+
+    GLOBAL_LOG_LEVEL を上げると Open WebUI 全体が饒舌になるため、
+    Function 単位で切り替えられるようにする。未知の値は無視する。
+    getLevelNamesMapping は Python 3.11+（本プロジェクトの下限）。
+    """
+    name = str(level or "").strip().upper()
+    if name in logging.getLevelNamesMapping():
+        _LOGGER.setLevel(name)
+
+
+def _ms(started: float) -> int:
+    """time.monotonic() の起点からの経過ミリ秒。"""
+    return int((time.monotonic() - started) * 1000)
 
 
 # ===========================================================================
@@ -465,6 +534,16 @@ class Filter:
         append_history_on_outlet: bool = Field(
             default=True, description="実行サマリを state の history に追記する"
         )
+        log_level: str = Field(
+            default="INFO",
+            description="この Function だけのログレベル。GLOBAL_LOG_LEVEL を上げずに詳細を見たいとき DEBUG にする",
+            json_schema_extra={
+                "input": {
+                    "type": "select",
+                    "options": ["DEBUG", "INFO", "WARNING", "ERROR"],
+                }
+            },
+        )
 
     class UserValves(BaseModel):
         show_raw_job_json: bool = Field(default=False, description="デバッグ用。ジョブの生 JSON を本文に残す")
@@ -513,10 +592,16 @@ class Filter:
         __model__=None,
         __event_emitter__=None,
     ) -> dict:
+        # ★ ログレベルの適用は __init__ ではなくここで行う。Open WebUI は呼び出しの
+        #    たびに function_module.valves をインスタンスごと差し替える
+        #    （utils/filter.py:113-119）ため、__init__ では常に既定値しか読めない。
+        _apply_log_level(self.valves.log_level)
         try:
             return await self._inlet(body, __user__, __request__, __metadata__, __model__, __event_emitter__)
         except Exception:
             # Filter の失敗でチャットを止めない。素通しする。
+            # ただし黙って素通しすると原因が追えないので、ログには必ず残す。
+            _LOGGER.exception("descript filter.inlet_crash")
             return body
 
     async def _inlet(self, body, user, request, metadata, model, emitter) -> dict:
@@ -525,6 +610,7 @@ class Filter:
 
         # ④ 対象モデルでなければ ①〜③ をすべてスキップする
         if not self._matches_pipe(_model_id(body, model)):
+            _log_debug("filter.skip", model=_model_id(body, model))
             return body
 
         # ① 動画添付の RAG 迂回（最重要）
@@ -540,6 +626,12 @@ class Filter:
         if self.valves.inject_project_hint:
             await self._inject_hint(body, metadata)
 
+        _log_info(
+            "filter.inlet",
+            chat_id=body.get("chat_id"),
+            media=len(body.get(_MEDIA_KEY) or []),
+            preflight=(body.get(_PREFLIGHT_KEY) or {}).get("code"),
+        )
         return body
 
     def _stash_media(self, body: dict) -> None:
@@ -564,6 +656,18 @@ class Filter:
         media = [f for f in files if _is_video_file(f, extensions)]
         if media:
             body[_MEDIA_KEY] = media
+            # ファイル名は退避できたかの確認に要るが、URL は載せない（署名付きの場合がある）。
+            # files 要素は {'name'...} と {'file': {'filename'...}} の 2 形態がある（_file_label 参照）。
+            _log_info(
+                "filter.stash_media",
+                count=len(media),
+                names=[
+                    _pick(m, "name", "filename")
+                    or _pick(m.get("file") if isinstance(m, dict) else None,
+                             "filename", "name", default="?")
+                    for m in media
+                ],
+            )
 
     async def _preflight(self, body: dict, user, request, emitter) -> None:
         if not self.valves.preflight_mcp_check:
@@ -608,6 +712,7 @@ class Filter:
             {"type": "status", "data": {"description": message, "done": True}},
         )
 
+        _log_warn("filter.preflight_blocked", code="MCP_OAUTH_REQUIRED", server_id=server_id)
         body[_PREFLIGHT_KEY] = {
             "ok": False,
             "code": "MCP_OAUTH_REQUIRED",
@@ -725,9 +830,12 @@ class Filter:
         #   middleware.py:3505-3512 の extra_params に含まれていないため、
         #   宣言すると get_filter_params が値を渡せず呼び出しが失敗する。
         #   chat_id は body['chat_id'] から取る（middleware.py:3492）。
+        _apply_log_level(self.valves.log_level)
         try:
             return await self._outlet(body, __user__)
         except Exception:
+            # inlet と同じく、素通しはするがログには必ず残す。
+            _LOGGER.exception("descript filter.outlet_crash")
             return body
 
     async def _outlet(self, body, user) -> dict:
@@ -791,4 +899,12 @@ class Filter:
             except Exception:
                 pass
 
+        if redacted or folded:
+            _log_info(
+                "filter.outlet",
+                chat_id=chat_id,
+                messages=len(messages),
+                redacted=redacted,
+                folded=folded,
+            )
         return body
