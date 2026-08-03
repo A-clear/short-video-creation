@@ -115,6 +115,32 @@ Filter の `stream` は `progress_marker_prefix`（既定 `U+2063 INVISIBLE SEPA
 
 **将来マーカーを使う場合の必須条件**: SSE チャンクは任意位置で分割されうるため、Filter はチャンクをまたぐマーカーを検出できない。**Pipe 側が「1 マーカー = 1 チャンク、前後を改行で囲む」形で送出すること**を前提とする。バッファリングは本文欠落のリスクが大きいため Filter 側では行わない。
 
+### 1.6 通常チャットのインテント振り分け（`descript_op` が無い経路）
+
+**なぜ Pipe 側で受けるのか。** Action はアシスタントメッセージのツールバーにしか描画されない（`utils/actions.py`）ため、**チャット開始時（まだ 1 通も無い状態）には出せない**。一方、新規チャット画面には Suggestion Prompts が並び（`src/lib/components/chat/Placeholder.svelte:257-261` が `info.meta.suggestion_prompts` → `default_prompt_suggestions` の順に採用）、**クリックすると即送信される**（`Chat.svelte:658-669`。ユーザ設定 `insertSuggestionPrompt` が on のときだけ挿入のみ）。送信先は選択中モデル＝Descript Pipe であり、**Pipe には `__event_call__` が渡る**（`functions.py:263-264`）ので、Action を介さずそのままフローに入れる。
+
+したがって導線は次のようにする:
+
+1. Workspace → Models → Descript Orchestrator → Prompt suggestions に短いコマンド句を登録する
+2. 既定モデルを Descript Orchestrator にする
+3. Pipe の `_dispatch` がその句を `descript_op` に振り分ける（本節）
+
+> ⚠️ **部分一致で振り分けてはいけない。** 「冒頭をカットして**書き出して**」のような本物の編集指示が `export_timeline` に奪われる。
+> **正規化後の文字列が「全体として」短いコマンド句に一致したときだけ**振り分け、それ以外は従来どおり `start_edit_loop`（自然文の編集指示）に落とす。
+> 正規化は「前後空白の除去 → 小文字化 → 空白（半角/全角）の除去 → 末尾の句読点・記号の除去」。長さが `_CHAT_INTENT_MAX_LEN`（24）を超える文字列は**一切振り分けない**。
+
+| 入力例（正規化後が全体一致）                              | 振り分け先 op     |
+| --------------------------------------------------------- | ----------------- |
+| 動画をアップロード / 取り込み / インポート / `upload`     | `import_media`    |
+| 動画を編集 / 編集する / `edit`                            | `start_edit_loop` |
+| タイムラインを書き出す / エクスポート / `export`          | `export_timeline` |
+| プロジェクト一覧 / プロジェクトのリスト / `list projects` | `list_projects`   |
+| 診断 / 接続確認 / `probe`                                 | `probe`           |
+
+- `start_edit_loop` に振り分けたときは **`instruction` を空にする**。コマンド句そのもの（「動画を編集」）を編集指示として LLM に渡しても意味がないため、Valve / UserValves のスタイル既定に委ねる
+- 引数が足りない場合は各 op が既存のエラーコードで返す（動画未添付なら `TOOL_ARGS_MISSING`、プロジェクト不在なら `NO_PROJECT`）。**振り分け側で先回りして検証しない**
+- Valve `enable_chat_intents`（既定 `true`）で機能ごと無効化できる。誤爆したときに即座に従来動作へ戻せるようにするため
+
 ---
 
 ## 2. 論理操作 ↔ MCP ツール名
@@ -1152,12 +1178,12 @@ _EDIT_LOOP_FORM = """<!doctype html><html lang="ja"><head><meta charset="utf-8">
 
 ## 7. タイムアウトの規律
 
-| 制約             | 値                                                                               | 対処                                                                                                                                                                                   |
-| ---------------- | -------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `__event_call__` | `WEBSOCKET_EVENT_CALLER_TIMEOUT` 既定 300 秒                                     | フォームは短時間で閉じるものだけに使う。`confirm_timeout_sec`（既定 240）を上限とし、**`asyncio.wait_for` では包まない**（socket の ack を壊す）。戻り値の `{"error": ...}` で判定する |
-| Action の HTTP   | リバースプロキシ依存（nginx `proxy_read_timeout` 既定 60 秒、Vercel の関数上限） | `action_soft_timeout_sec`（既定 45）を超えそうな処理は Action を早期 return し、以降は Pipe ＋ embeds フォームで継続                                                                   |
-| MCP 初期化       | `MCP_INITIALIZE_TIMEOUT` 既定 10 秒                                              | `mcp_connect_retries` 回だけ指数バックオフで再試行                                                                                                                                     |
-| Descript ジョブ  | 不定                                                                             | `_poll_job` の `poll_timeout_sec`（既定 900）。超過しても**ジョブは中断せず** `job_id` を state に保存する                                                                             |
+| 制約             | 値                                                                                                                                                                                     | 対処                                                                                                                                                                                   |
+| ---------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `__event_call__` | `WEBSOCKET_EVENT_CALLER_TIMEOUT`。**未設定なら無期限**（`env.py:502-510` で `None` になり、`socket/main.py:1119` の `sio.call(timeout=None)` は待ち続ける）。値が不正なときだけ 300 秒 | フォームは短時間で閉じるものだけに使う。`confirm_timeout_sec`（既定 240）を上限とし、**`asyncio.wait_for` では包まない**（socket の ack を壊す）。戻り値の `{"error": ...}` で判定する |
+| Action の HTTP   | リバースプロキシ依存（nginx `proxy_read_timeout` 既定 60 秒、Vercel の関数上限）                                                                                                       | `action_soft_timeout_sec`（既定 45）を超えそうな処理は Action を早期 return し、以降は Pipe ＋ embeds フォームで継続                                                                   |
+| MCP 初期化       | `MCP_INITIALIZE_TIMEOUT` 既定 10 秒                                                                                                                                                    | `mcp_connect_retries` 回だけ指数バックオフで再試行                                                                                                                                     |
+| Descript ジョブ  | 不定                                                                                                                                                                                   | `_poll_job` の `poll_timeout_sec`（既定 900）。超過しても**ジョブは中断せず** `job_id` を state に保存する                                                                             |
 
 ### 順序の原則（この順を守る）
 

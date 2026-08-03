@@ -1018,6 +1018,86 @@ def _looks_like_no_video(exc: "DescriptError") -> bool:
 _TIMELINE_FORMATS = ("fcp", "premiere", "davinci_resolve", "aaf", "edl", "sesx")
 
 
+# ===========================================================================
+# 契約書 §1.6 通常チャットのインテント振り分け
+# ===========================================================================
+
+# これを超える長さの入力は一切振り分けない。自然文の編集指示を守るための上限。
+_CHAT_INTENT_MAX_LEN = 24
+
+# ⚠️ すべて ^…$ で全体一致にすること。部分一致にすると
+#    「冒頭をカットして書き出して」のような本物の編集指示が export に奪われる。
+#    照合対象は _normalize_command() を通した「空白を除いた小文字」。
+_CHAT_INTENTS = (
+    (
+        "probe",
+        re.compile(
+            r"^(?:descript)?(?:mcp)?(?:の)?(?:診断|接続確認|疎通確認|接続テスト)(?:する|して|します)?$"
+            r"|^probe$"
+        ),
+    ),
+    (
+        "list_projects",
+        re.compile(
+            r"^(?:descript)?(?:の)?プロジェクト(?:の)?(?:一覧|リスト)(?:を)?"
+            r"(?:表示|表示する|見る|見せて|ちょうだい)?$"
+            r"|^(?:list)?projects?$"
+        ),
+    ),
+    (
+        "export_timeline",
+        re.compile(
+            r"^(?:タイムライン|動画|映像|プロジェクト)?(?:を|の)?"
+            r"(?:エクスポート|書き出し|書出し|書き出す|書出す|書き出して|出力|fcpxml)"
+            r"(?:する|して|したい|します|お願い)?$"
+            r"|^export(?:timeline)?$"
+        ),
+    ),
+    (
+        "import_media",
+        re.compile(
+            r"^(?:動画|映像|ファイル|素材)?(?:を|の)?"
+            r"(?:アップロード|取り込み|取込み|取り込む|取込む|取込|インポート|追加)"
+            r"(?:する|して|したい|します|お願い)?$"
+            r"|^(?:upload|import)$"
+        ),
+    ),
+    (
+        "start_edit_loop",
+        re.compile(
+            r"^(?:動画|映像|プロジェクト)?(?:を|の)?(?:編集|編集開始|カット編集)"
+            r"(?:する|して|したい|します|開始|を開始)?$"
+            r"|^edit$"
+        ),
+    ),
+)
+
+
+def _normalize_command(text: Any) -> str:
+    """コマンド句の照合用に正規化する（契約書 §1.6）。
+
+    小文字化 → 空白（半角/全角）除去 → 末尾の句読点・記号除去。
+    """
+    body = str(text or "").strip().lower()
+    body = re.sub(r"[\s　]+", "", body)
+    return body.strip("。．.!！?？、,･・")
+
+
+def _match_chat_intent(text: Any) -> Optional[str]:
+    """短いコマンド句を descript_op に振り分ける。該当しなければ None。
+
+    Suggestion Prompts（新規チャット画面）のクリックは、この関数が拾える
+    短い句をそのまま送信してくる（契約書 §1.6）。
+    """
+    body = _normalize_command(text)
+    if not body or len(body) > _CHAT_INTENT_MAX_LEN:
+        return None
+    for op, pattern in _CHAT_INTENTS:
+        if pattern.match(body):
+            return op
+    return None
+
+
 def _media_key(name: Any, url: Any, used: set) -> str:
     """add_media のキー（Descript 上の表示名）を作る。
 
@@ -1275,6 +1355,13 @@ class Pipe:
         redact_download_url: bool = Field(
             default=True, description="署名付き download_url をチャット履歴に残さない"
         )
+        enable_chat_intents: bool = Field(
+            default=True,
+            description=(
+                "通常チャットの短いコマンド句（「動画をアップロード」等）を "
+                "descript_op に振り分ける（契約書 §1.6）。誤爆時は false で従来動作に戻る"
+            ),
+        )
         log_level: str = Field(
             default="INFO",
             description="この Function だけのログレベル。GLOBAL_LOG_LEVEL を上げずに詳細を見たいとき DEBUG にする",
@@ -1422,6 +1509,16 @@ class Pipe:
                 action = str(parsed.get("action") or parsed.get("op") or "revise").strip()
                 return "resume_edit_loop", {"action": action, "text": str(parsed.get("text") or "")}
             return "resume_edit_loop", {"action": "revise", "text": payload}
+
+        # 短いコマンド句だけをインテントとして扱う（契約書 §1.6）。
+        # 新規チャット画面の Suggestion Prompts はクリックで即送信されるため、
+        # ここが Action を介さない開始導線になる。
+        if bool(getattr(self.valves, "enable_chat_intents", True)):
+            intent = _match_chat_intent(text)
+            if intent:
+                _log_info("pipe.intent", op=intent, command=_normalize_command(text))
+                # コマンド句自体を編集指示として渡しても意味がないので空にする。
+                return intent, ({"instruction": ""} if intent == "start_edit_loop" else {})
 
         # 自然文の編集指示
         return "start_edit_loop", {"instruction": text}
@@ -1901,6 +1998,12 @@ class Pipe:
                 "動画の URL、または Open WebUI にアップロード済みのファイル ID を指定してください。",
                 {"missing": ["source_url|file_id"]},
             )
+
+        if not project_id and not project_name:
+            # 通常チャットのインテント経路（契約書 §1.6）では名前が渡ってこない。
+            # 無名で作らせず、最初のメディア名を使う（_import_attached_media と同じ規則）。
+            first = entries[0] if isinstance(entries[0], dict) else {}
+            project_name = str(first.get("name") or "").strip()
 
         await ctx["emit_status"]("Descript にメディアを取り込んでいます")
         outcome = await self._run_import_media(
