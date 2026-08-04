@@ -98,8 +98,7 @@ def _log(level: int, event: str, **fields: Any) -> None:
         if len(text) > _LOG_VALUE_MAX:
             text = text[:_LOG_VALUE_MAX] + "…"
         parts.append(f"{key}={text}")
-    _LOGGER.log(level, "descript %s%s", event,
-                (" " + " ".join(parts)) if parts else "")
+    _LOGGER.log(level, "descript %s%s", event, (" " + " ".join(parts)) if parts else "")
 
 
 def _log_debug(event: str, **fields: Any) -> None:
@@ -173,8 +172,7 @@ def _render(tpl: str, **kwargs: Any) -> str:
     """
     out = tpl
     for key, value in kwargs.items():
-        out = out.replace("{{" + key + "}}",
-                          "" if value is None else str(value))
+        out = out.replace("{{" + key + "}}", "" if value is None else str(value))
     return out
 
 
@@ -439,10 +437,6 @@ _PLAYER = """<!doctype html><html lang="ja"><head><meta charset="utf-8">
   <p class="h">{{title}}</p>
   <video src="{{src}}" controls playsinline preload="metadata"
          style="width:100%;max-height:70vh;border-radius:10px;background:#000;display:block"></video>
-  <div class="row">
-    <a class="btn primary" href="{{app_url}}" target="_blank" rel="noopener">Descript で開く</a>
-    <a class="btn" href="{{share_url}}" target="_blank" rel="noopener">共有リンク</a>
-  </div>
   <p class="muted" style="margin:10px 0 0">rev {{revision}} ・ {{note}}</p>
 </div></div>{{height_js}}</body></html>"""
 
@@ -490,7 +484,6 @@ _TIMELINE_EXPORT = """<!doctype html><html lang="ja"><head><meta charset="utf-8"
   <p class="muted" style="margin:0 0 4px">形式: {{format_label}}</p>
   <div class="row">
     <a class="btn primary" href="{{download_url}}" target="_blank" rel="noopener">ダウンロード</a>
-    {{app_link}}
   </div>
   <p class="muted" style="margin:12px 0 0">{{notice}}</p>
   {{expiry}}
@@ -1165,36 +1158,29 @@ class Action:
         )
 
     @staticmethod
-    def _player_html(title: str, src: str, app_url: str, share_url: str, revision: Any, note: str) -> str:
+    def _player_html(title: str, src: str, revision: Any, note: str) -> str:
+        # 外部サイト（descript.com）への導線はカード内に置かない。
+        # メッセージ本文の Markdown リンクが正（契約書 §6.0.2）。
         return _render(
             _PLAYER,
             css=_BASE_CSS,
             height_js=_HEIGHT_JS,
             title=_esc(title),
             src=src or "",
-            app_url=app_url or share_url or "",
-            share_url=share_url or "",
             revision=_esc(revision if revision is not None else "-"),
             note=_esc(note),
         )
 
     @staticmethod
     def _timeline_export_html(
-        *, title: str, format_label: str, download_url: str, app_url: str, expires_at: str
+        *, title: str, format_label: str, download_url: str, expires_at: str
     ) -> str:
         """export_timeline の結果カードを組み立てる（契約書 §2.0.1 ④）。
 
         download_url は期限付きの署名 URL なので、この embeds の中だけに置く。
-        app_url / expires_at が空のときは、その要素ごと出さない。
+        expires_at が空のときは、その要素ごと出さない。
+        Descript App への導線はカード内に置かない（契約書 §6.0.2）。
         """
-        app_link = ""
-        if app_url:
-            app_link = (
-                '<a class="btn" href="'
-                + _esc(app_url)
-                + '" target="_blank" rel="noopener">Descript で開く</a>'
-            )
-
         expiry = ""
         if expires_at:
             expiry = (
@@ -1210,7 +1196,6 @@ class Action:
             title=_esc(title),
             format_label=_esc(format_label),
             download_url=_esc(download_url),
-            app_link=app_link,
             notice=_esc(_TIMELINE_NOTICE),
             expiry=expiry,
         )
@@ -1858,8 +1843,6 @@ class Action:
                 self._player_html(
                     title=f"{project_name} の書き出し結果",
                     src=download_url or share_url,
-                    app_url=app_url,
-                    share_url=share_url,
                     revision=revision,
                     note=fmt["label"],
                 )
@@ -1936,7 +1919,6 @@ class Action:
                     title=f"{project_name} のタイムライン書き出し",
                     format_label=fmt["label"],
                     download_url=download_url,
-                    app_url=app_url,
                     expires_at=expires_at,
                 )
             ],

@@ -1191,7 +1191,8 @@ async def _emit_scroll_bottom(event_emitter) -> None:
 
 **対処**: 外部サイトへのリンクは **iframe の中に置かない**。トップドキュメント側、すなわち**アシスタントメッセージ本文の Markdown リンク**として出す。メッセージ本文は Open WebUI 本体が描画するので sandbox の影響を受けない。
 
-- カード内のボタンは残してよいが、**本文側のリンクが正**とする。Pipe は結果 `data` に `project_url` を必ず載せ、Action はそれを `- [Descript で開く](...)` として本文に書く。
+- **カード（embeds）内に外部サイトへの導線を置かない。** `project_url` も `share_url` も descript.com なので同じ理由で開けない。押しても動かないボタンを残さない。Pipe は結果 `data` に `project_url` を必ず載せ、Action はそれを `- [Descript で開く](...)` / `- [共有リンク](...)` として本文に書く。テンプレートに `app_url` / `app_link` / `share_url` を渡さないこと。
+- 例外は **`download_url`（署名付きの直リンク）** のみ。ファイルのダウンロードは `allow-downloads` で通り、SPA の起動を伴わないため sandbox の影響を受けない。かつ期限付きなので本文には載せられず、カード内に置くしかない。
 - ユーザ設定 `iframeSandboxAllowSameOrigin` を有効にすればカード内のボタンも通るが、これは **srcdoc の iframe が親オリジンを名乗れる**ようになる設定で、埋め込み HTML から `localStorage` のトークンに手が届く。既定 off のまま運用する。
 
 ### 6.1 `_PLAYER` — publish 結果のプレビュー
@@ -1203,15 +1204,13 @@ _PLAYER = """<!doctype html><html lang="ja"><head><meta charset="utf-8">
   <p class="h">{{title}}</p>
   <video src="{{src}}" controls playsinline preload="metadata"
          style="width:100%;max-height:70vh;border-radius:10px;background:#000;display:block"></video>
-  <div class="row">
-    <a class="btn primary" href="{{app_url}}" target="_blank" rel="noopener">Descript で開く</a>
-    <a class="btn" href="{{share_url}}" target="_blank" rel="noopener">共有リンク</a>
-  </div>
   <p class="muted" style="margin:10px 0 0">rev {{revision}} ・ {{note}}</p>
 </div></div>{{height_js}}</body></html>"""
 ```
 
-差し込み: `_render(_PLAYER, css=_BASE_CSS, height_js=_HEIGHT_JS, title=_esc(...), src=..., app_url=..., share_url=..., revision=..., note=_esc(...))`
+差し込み: `_render(_PLAYER, css=_BASE_CSS, height_js=_HEIGHT_JS, title=_esc(...), src=..., revision=..., note=_esc(...))`
+
+**カードは再生と情報表示だけを担う。** `app_url` も `share_url` もテンプレートに渡さない。どちらも descript.com への遷移で、sandbox を引き継いだタブでは開けない（§6.0.2）。外部サイトへの導線は**メッセージ本文の Markdown リンク**が正。
 
 `src` に `download_url` を使う場合、**期限切れになるため state には保存しない**（表示のその場限り）。`share_url` は恒久リンクなので保存してよい。
 
@@ -1257,7 +1256,6 @@ _EDIT_LOOP_FORM = """<!doctype html><html lang="ja"><head><meta charset="utf-8">
   <div class="row">
     <button class="btn primary" type="button" data-act="revise">この指示で再編集</button>
     <button class="btn" type="button" data-act="confirm">これで確定する</button>
-    <a class="btn" href="{{app_url}}" target="_blank" rel="noopener">Descript で開く</a>
   </div>
   <p class="muted" style="margin:10px 0 0">rev {{revision}} / 残り {{remaining}} 回</p>
 </div></div>

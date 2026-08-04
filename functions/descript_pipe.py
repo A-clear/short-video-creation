@@ -832,10 +832,6 @@ _PLAYER = """<!doctype html><html lang="ja"><head><meta charset="utf-8">
   <p class="h">{{title}}</p>
   <video src="{{src}}" controls playsinline preload="metadata"
          style="width:100%;max-height:70vh;border-radius:10px;background:#000;display:block"></video>
-  <div class="row">
-    <a class="btn primary" href="{{app_url}}" target="_blank" rel="noopener">Descript で開く</a>
-    <a class="btn" href="{{share_url}}" target="_blank" rel="noopener">共有リンク</a>
-  </div>
   <p class="muted" style="margin:10px 0 0">rev {{revision}} ・ {{note}}</p>
 </div></div>{{height_js}}</body></html>"""
 
@@ -866,7 +862,6 @@ _EDIT_LOOP_FORM = """<!doctype html><html lang="ja"><head><meta charset="utf-8">
   <div class="row">
     <button class="btn primary" type="button" data-act="revise">この指示で再編集</button>
     <button class="btn" type="button" data-act="confirm">これで確定する</button>
-    <a class="btn" href="{{app_url}}" target="_blank" rel="noopener">Descript で開く</a>
   </div>
   <p class="muted" style="margin:10px 0 0">rev {{revision}} / 残り {{remaining}} 回</p>
 </div></div>
@@ -2500,7 +2495,6 @@ class Pipe:
                     src=_esc(published.get("download_url")
                              or published.get("share_url") or ""),
                     agent_response=_esc(agent_response or "編集が完了しました。"),
-                    app_url=_esc(self._app_url(published, state)),
                     revision=next_revision,
                     remaining=remaining,
                 ),
@@ -3124,8 +3118,6 @@ class Pipe:
                 "project_name") or "Descript プレビュー")),
             src=_esc(published.get("download_url")
                      or published.get("share_url") or ""),
-            app_url=_esc(self._app_url(published, state)),
-            share_url=_esc(published.get("share_url") or ""),
             revision=rev,
             note=_esc(note),
         )
