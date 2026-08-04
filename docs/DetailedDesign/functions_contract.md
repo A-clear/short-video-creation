@@ -1033,15 +1033,41 @@ await __event_emitter__({"type": "embeds", "data": {"embeds": [html], "replace":
 
 ### 6.0 共通フッタ（全テンプレートの末尾に入れる）
 
+🔴 **高さの測り方を変えてはいけない。iframe 自身の高さに依存する値で測ると無限に伸びる。**
+
+`document.documentElement.scrollHeight` は**ビューポート高（＝親が設定した iframe の高さ）を下回らない**。親はその値を iframe の高さに設定するので、報告値に定数を足すと
+
+```
+親が高さを H にする → 中の scrollHeight が H になる → H + 24 を報告 → 親が H + 24 にする → …
+```
+
+と 1 サイクルごとに +24px 増え続ける。ResizeObserver は毎フレーム発火するので **毎秒約 1,200px** で伸びる。実測（本番のチャットを Playwright で観測）: iframe の高さ 45,008px、増加率 1,196 px/秒、`scrollTop` は 189 のまま `scrollHeight` だけが伸び続ける。これが「チャットが最下部に行かず徐々に上へずれる」の正体で、**§6.0.1 のピン留めでは直せない**（最下部が毎秒 1,200px 逃げていくため）。
+
+守ること:
+
+1. **測るのは `document.body` の内容高**（`getBoundingClientRect().height`）。body の高さは iframe の高さに依存しないので閉じている。`documentElement.scrollHeight` は使わない。
+2. **報告値に定数を足さない。** 測定値へ入力が戻る系に定数を足すと必ず発散する。余白が要るなら CSS 側（`.wrap` の padding）で確保する。
+3. **前回と同じ値なら送らない**（2px 未満の差は無視）。残ったループを断ち切る保険。
+4. `ResizeObserver` は `document.body` を観測する。
+
+同じ理由で、**テンプレート内で `vh` 単位を使うときは注意**する。iframe の高さは自分で決めているので `70vh` のような指定は循環参照になる。係数が 1 未満なら収束するが、上記 2 を破ると一気に発散側へ倒れる。
+
 ```python
 _HEIGHT_JS = """
 <script>
 (function () {
-  function report() {
-    parent.postMessage(
-      { type: 'iframe:height', height: document.documentElement.scrollHeight + 24 }, '*');
+  var last = -1;
+  function measure() {
+    var b = document.body;
+    return b ? Math.ceil(b.getBoundingClientRect().height) : 0;
   }
-  try { new ResizeObserver(report).observe(document.documentElement); } catch (e) {}
+  function report() {
+    var h = measure();
+    if (h <= 0 || Math.abs(h - last) < 2) return;
+    last = h;
+    parent.postMessage({ type: 'iframe:height', height: h }, '*');
+  }
+  try { new ResizeObserver(report).observe(document.body); } catch (e) {}
   addEventListener('load', report);
   addEventListener('resize', report);
   setTimeout(report, 100);

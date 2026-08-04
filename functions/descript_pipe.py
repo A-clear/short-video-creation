@@ -766,11 +766,18 @@ Descript Underlord がそのまま実行できる**英語の編集プロンプ�
 _HEIGHT_JS = """
 <script>
 (function () {
-  function report() {
-    parent.postMessage(
-      { type: 'iframe:height', height: document.documentElement.scrollHeight + 24 }, '*');
+  var last = -1;
+  function measure() {
+    var b = document.body;
+    return b ? Math.ceil(b.getBoundingClientRect().height) : 0;
   }
-  try { new ResizeObserver(report).observe(document.documentElement); } catch (e) {}
+  function report() {
+    var h = measure();
+    if (h <= 0 || Math.abs(h - last) < 2) return;
+    last = h;
+    parent.postMessage({ type: 'iframe:height', height: h }, '*');
+  }
+  try { new ResizeObserver(report).observe(document.body); } catch (e) {}
   addEventListener('load', report);
   addEventListener('resize', report);
   setTimeout(report, 100);

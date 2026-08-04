@@ -28,13 +28,11 @@ import re
 import time
 from typing import Any, Optional
 
-from pydantic import BaseModel, Field
-
 from fastapi.responses import HTMLResponse
-
 from open_webui.models.chats import Chats
 from open_webui.models.users import UserModel
 from open_webui.utils.chat import generate_chat_completion
+from pydantic import BaseModel, Field
 
 # ===========================================================================
 # 契約書 §5.1 定数・例外
@@ -43,7 +41,8 @@ from open_webui.utils.chat import generate_chat_completion
 _STATE_KEY = "descript"
 _STATE_VERSION = 1
 _HISTORY_MAX = 50
-_LOGICAL_OPS = ("list_projects", "get_project", "import_media", "agent_edit", "publish", "job_status")
+_LOGICAL_OPS = ("list_projects", "get_project", "import_media",
+                "agent_edit", "publish", "job_status")
 
 
 class DescriptError(Exception):
@@ -99,7 +98,8 @@ def _log(level: int, event: str, **fields: Any) -> None:
         if len(text) > _LOG_VALUE_MAX:
             text = text[:_LOG_VALUE_MAX] + "…"
         parts.append(f"{key}={text}")
-    _LOGGER.log(level, "descript %s%s", event, (" " + " ".join(parts)) if parts else "")
+    _LOGGER.log(level, "descript %s%s", event,
+                (" " + " ".join(parts)) if parts else "")
 
 
 def _log_debug(event: str, **fields: Any) -> None:
@@ -173,7 +173,8 @@ def _render(tpl: str, **kwargs: Any) -> str:
     """
     out = tpl
     for key, value in kwargs.items():
-        out = out.replace("{{" + key + "}}", "" if value is None else str(value))
+        out = out.replace("{{" + key + "}}",
+                          "" if value is None else str(value))
     return out
 
 
@@ -320,11 +321,18 @@ def _redact_signed_urls(text: str, replacement: str = "") -> str:
 _HEIGHT_JS = """
 <script>
 (function () {
-  function report() {
-    parent.postMessage(
-      { type: 'iframe:height', height: document.documentElement.scrollHeight + 24 }, '*');
+  var last = -1;
+  function measure() {
+    var b = document.body;
+    return b ? Math.ceil(b.getBoundingClientRect().height) : 0;
   }
-  try { new ResizeObserver(report).observe(document.documentElement); } catch (e) {}
+  function report() {
+    var h = measure();
+    if (h <= 0 || Math.abs(h - last) < 2) return;
+    last = h;
+    parent.postMessage({ type: 'iframe:height', height: h }, '*');
+  }
+  try { new ResizeObserver(report).observe(document.body); } catch (e) {}
   addEventListener('load', report);
   addEventListener('resize', report);
   setTimeout(report, 100);
@@ -515,8 +523,10 @@ _INFO_CODES = ("USER_CANCELLED",)
 # ===========================================================================
 
 _EXPORT_FORMATS = (
-    {"value": "share_video", "label": "動画の共有リンク（Video）", "op": "publish", "media_type": "Video"},
-    {"value": "share_audio", "label": "音声の共有リンク（Audio）", "op": "publish", "media_type": "Audio"},
+    {"value": "share_video", "label": "動画の共有リンク（Video）",
+        "op": "publish", "media_type": "Video"},
+    {"value": "share_audio", "label": "音声の共有リンク（Audio）",
+        "op": "publish", "media_type": "Audio"},
     {"value": "fcp", "label": "Final Cut Pro X（.fcpxml）", "op": "export_timeline"},
     {"value": "premiere", "label": "Premiere Pro XML", "op": "export_timeline"},
     {"value": "davinci_resolve", "label": "DaVinci Resolve XML", "op": "export_timeline"},
@@ -778,14 +788,16 @@ class Action:
         )
         form_mode: str = Field(
             default="sequential",
-            json_schema_extra={"input": {"type": "select", "options": ["sequential", "modal"]}},
+            json_schema_extra={"input": {"type": "select",
+                                         "options": ["sequential", "modal"]}},
             description="sequential=input ダイアログを連鎖 / modal=execute でカスタムフォームを表示",
         )
         bypass_model_access: bool = Field(
             default=True,
             description="Pipe モデルのアクセス制御をバイパスする（Action 自体が露出チェック済みのため既定 True）",
         )
-        max_projects_in_select: int = Field(default=50, description="プロジェクト選択に表示する最大件数")
+        max_projects_in_select: int = Field(
+            default=50, description="プロジェクト選択に表示する最大件数")
         action_soft_timeout_sec: int = Field(
             default=45,
             description="この秒数を超えそうな処理は早期 return する（リバースプロキシ切断対策）",
@@ -805,7 +817,8 @@ class Action:
     class UserValves(BaseModel):
         default_aspect: str = Field(
             default="9:16",
-            json_schema_extra={"input": {"type": "select", "options": ["9:16", "1:1", "16:9"]}},
+            json_schema_extra={"input": {"type": "select",
+                                         "options": ["9:16", "1:1", "16:9"]}},
         )
         default_duration_sec: int = Field(default=60, description="既定の出力尺（秒）")
         editing_style: str = Field(
@@ -815,10 +828,12 @@ class Action:
             },
             description="編集スタイルのプリセット",
         )
-        auto_confirm: bool = Field(default=False, description="編集ループの確認をスキップし 1 周で確定する")
+        auto_confirm: bool = Field(
+            default=False, description="編集ループの確認をスキップし 1 周で確定する")
         default_export_format: str = Field(
             default=_DEFAULT_EXPORT_FORMAT,
-            json_schema_extra={"input": {"type": "select", "options": _EXPORT_FORMAT_VALUES}},
+            json_schema_extra={"input": {"type": "select",
+                                         "options": _EXPORT_FORMAT_VALUES}},
             description="エクスポート形式の既定値",
         )
 
@@ -942,10 +957,12 @@ class Action:
                 request,
                 form_data,
                 _as_user_model(user),
-                bypass_filter=bool(getattr(self.valves, "bypass_model_access", True)),
+                bypass_filter=bool(
+                    getattr(self.valves, "bypass_model_access", True)),
             )
         except Exception as exc:
-            _log_error("rpc.crash", op=op, ms=_ms(started), error=str(exc)[:400])
+            _log_error("rpc.crash", op=op, ms=_ms(
+                started), error=str(exc)[:400])
             return {
                 "ok": False,
                 "op": op,
@@ -1001,7 +1018,8 @@ class Action:
             lines.append("「動画のアップロード」から先にプロジェクトを作成してください。")
             lines.append("")
         elif code == "TOOL_UNRESOLVED":
-            lines.append("下の一覧から実ツール名を読み取り、Descript Orchestrator の `tool_*` Valve に設定してください。")
+            lines.append(
+                "下の一覧から実ツール名を読み取り、Descript Orchestrator の `tool_*` Valve に設定してください。")
             lines.append("")
         elif code == "JOB_TIMEOUT":
             job_id = _pick(env.get("data") or {}, "job_id", default=None)
@@ -1069,8 +1087,10 @@ class Action:
                 continue
             name = _pick(spec, "name", "tool_name", default="")
             desc = _pick(spec, "description", "desc", default="")
-            params = _pick(spec, "parameters", "input_schema", "inputSchema", default={}) or {}
-            required_list = params.get("required") if isinstance(params, dict) else None
+            params = _pick(spec, "parameters", "input_schema",
+                           "inputSchema", default={}) or {}
+            required_list = params.get(
+                "required") if isinstance(params, dict) else None
             required = ", ".join(str(r) for r in (required_list or [])) or "—"
             guess = " / ".join(reverse.get(str(name), [])) or "—"
             rows.append(
@@ -1099,7 +1119,8 @@ class Action:
         media_files の形（dict of dict / list）は MCP スキーマ未確定なので
         どちらでも読めるようにしている（契約書 §12）。
         """
-        media = _pick(project or {}, "media_files", "media", "files", default={}) or {}
+        media = _pick(project or {}, "media_files",
+                      "media", "files", default={}) or {}
         if isinstance(media, dict):
             entries = list(media.values()) if media else []
         elif isinstance(media, list):
@@ -1111,14 +1132,18 @@ class Action:
         for item in entries:
             if isinstance(item, str):
                 rows.append(
-                    "<tr><td>{n}</td><td>—</td><td>—</td></tr>".format(n=_esc(item))
+                    "<tr><td>{n}</td><td>—</td><td>—</td></tr>".format(
+                        n=_esc(item))
                 )
                 continue
             if not isinstance(item, dict):
                 continue
-            name = _pick(item, "name", "filename", "title", "id", default="（名称不明）")
-            kind = _pick(item, "type", "media_type", "kind", "mime_type", default="—")
-            duration = _pick(item, "duration", "duration_sec", "length", default=None)
+            name = _pick(item, "name", "filename",
+                         "title", "id", default="（名称不明）")
+            kind = _pick(item, "type", "media_type",
+                         "kind", "mime_type", default="—")
+            duration = _pick(item, "duration", "duration_sec",
+                             "length", default=None)
             note = f"{duration} 秒" if duration is not None else "—"
             rows.append(
                 "<tr><td>{n}</td><td>{k}</td><td>{d}</td></tr>".format(
@@ -1382,7 +1407,8 @@ class Action:
         server = data.get("server") or {}
 
         resolved_count = sum(1 for op in _LOGICAL_OPS if resolved.get(op))
-        server_name = _pick(server, "name", "title", "id", default="Descript MCP")
+        server_name = _pick(server, "name", "title",
+                            "id", default="Descript MCP")
 
         await self._status(
             emitter,
@@ -1403,7 +1429,8 @@ class Action:
         lines = ["### Descript MCP 診断結果", ""]
         lines.append(f"- 接続先: **{server_name}**")
         lines.append(f"- 検出ツール数: **{len(tools)}**")
-        lines.append(f"- 解決済みの論理操作: **{resolved_count} / {len(_LOGICAL_OPS)}**")
+        lines.append(
+            f"- 解決済みの論理操作: **{resolved_count} / {len(_LOGICAL_OPS)}**")
         lines.append("")
         if unresolved:
             lines.append("未解決の論理操作:")
@@ -1436,7 +1463,8 @@ class Action:
         # (HTMLResponse, result_context) タプルで返すと embeds 化と同時に
         # 戻り値も差し替えられる（utils/middleware.py:887-904, actions.py:130-148）。
         return (
-            HTMLResponse(content=html, headers={"Content-Disposition": "inline"}),
+            HTMLResponse(content=html, headers={
+                         "Content-Disposition": "inline"}),
             self._message(body, message),
         )
 
@@ -1447,12 +1475,14 @@ class Action:
     async def _collect_upload_input(
         self, *, event_call: Any, emitter: Any
     ) -> tuple[Optional[dict], Optional[dict]]:
-        mode = str(getattr(self.valves, "form_mode", "sequential") or "sequential").strip()
+        mode = str(getattr(self.valves, "form_mode", "sequential")
+                   or "sequential").strip()
 
         if mode == "modal":
             await self._debug(emitter, "form_mode=modal: execute でカスタムフォームを表示")
             ok, value, err = await self._ask(
-                event_call, {"type": "execute", "data": {"code": _UPLOAD_MODAL_JS}}
+                event_call, {"type": "execute",
+                             "data": {"code": _UPLOAD_MODAL_JS}}
             )
             if not ok:
                 return None, err
@@ -1572,13 +1602,15 @@ class Action:
         data = env.get("data") or {}
         project_url = data.get("project_url")
         media = data.get("media") or {}
-        media_name = _pick(media, "name", "filename", "title", default=collected.get("file_name") or "")
+        media_name = _pick(media, "name", "filename", "title",
+                           default=collected.get("file_name") or "")
 
         await self._status(emitter, "取り込みが完了しました", done=True)
         await self._notify(emitter, "success", f"「{project_name}」に動画を取り込みました。")
 
         lines = ["### 動画を取り込みました", ""]
-        lines.append(f"- プロジェクト: **{project_name}**" + ("（新規作成）" if created else "（既存を再利用）"))
+        lines.append(f"- プロジェクト: **{project_name}**" +
+                     ("（新規作成）" if created else "（既存を再利用）"))
         if media_name:
             lines.append(f"- メディア: {media_name}")
         if project_url:
@@ -1742,7 +1774,8 @@ class Action:
         fmt = _export_format(chosen)
 
         state = await _load_state(body.get("chat_id"))
-        composition_id = state.get("composition_id") if state.get("project_id") == project_id else None
+        composition_id = state.get("composition_id") if state.get(
+            "project_id") == project_id else None
 
         if self._soft_expired(started):
             await self._status(emitter, "処理時間の上限に達しました", done=True)
@@ -1813,7 +1846,8 @@ class Action:
         share_url = str(data.get("share_url") or "")
         # download_url は署名付き・期限付き。表示のその場限りで使い、本文には残さない（契約書 §6.1 / §11）
         download_url = str(data.get("download_url") or "")
-        app_url = str(_pick(data, "app_url", "project_url", "editor_url", default="") or share_url)
+        app_url = str(_pick(data, "app_url", "project_url",
+                      "editor_url", default="") or share_url)
 
         await self._status(emitter, "書き出しが完了しました", done=True)
         await self._notify(emitter, "success", f"「{project_name}」を書き出しました。")
@@ -1859,7 +1893,8 @@ class Action:
         await self._status(emitter, f"「{project_name}」のタイムラインを書き出しています（{fmt['label']}）")
         env = await self._call_pipe(
             "export_timeline",
-            {"project_id": project_id, "composition_id": composition_id, "format": fmt["value"]},
+            {"project_id": project_id, "composition_id": composition_id,
+                "format": fmt["value"]},
             body=body,
             user=user,
             request=request,
@@ -1871,8 +1906,10 @@ class Action:
         data = env.get("data") or {}
         # download_url は期限付きの署名 URL。embeds にだけ載せ、本文には残さない（契約書 §5.9 / §11）
         download_url = str(data.get("download_url") or "")
-        expires_at = str(_pick(data, "expires_at", "download_url_expires_at", default="") or "")
-        app_url = str(_pick(data, "app_url", "project_url", "editor_url", default="") or "")
+        expires_at = str(
+            _pick(data, "expires_at", "download_url_expires_at", default="") or "")
+        app_url = str(_pick(data, "app_url", "project_url",
+                      "editor_url", default="") or "")
 
         if not download_url:
             return await self._fail(
@@ -2048,7 +2085,8 @@ class Action:
 
         except Exception as exc:
             # 想定外の例外も日本語メッセージに変換する（正常系は封筒で受ける）
-            _LOGGER.exception("descript action.crash sub=%s ms=%s", sub, _ms(started))
+            _LOGGER.exception(
+                "descript action.crash sub=%s ms=%s", sub, _ms(started))
             await self._status(__event_emitter__, "処理を中断しました", done=True)
             await self._notify(__event_emitter__, "error", "内部エラーが発生しました。")
             return self._message(
