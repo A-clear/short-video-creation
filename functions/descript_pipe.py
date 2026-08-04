@@ -746,18 +746,329 @@ _ASPECT_BY_RESOLUTION = {
     "1920x1080": "16:9",
 }
 
+# ===========================================================================
+# Descript Underlord の AI Tools カタログ
+# ===========================================================================
+# Underlord は UI 上のツール名で機能を持っている。編集プロンプトにこの英語名を
+# そのまま書くと該当ツールが選ばれやすいので、BA 要件
+# (docs/RequirementDefinition/BA/business_process_architecture.mmd) を
+# 「要件 → Underlord ツール」で写像し、英語の指示句はここだけで持つ。
+#
+#   group   … Underlord の UI 上のカテゴリ
+#   name    … UI 表示名（英語）。プロンプトにはこの綴りで完全一致で書かせる
+#   ja      … 日本語名（ログ・ドキュメント用）
+#   desc_ja … システムプロンプトのカタログに載せる 1 行説明
+#   hint    … 編集プロンプトに埋め込む英語の指示句
+#
+# ⚠️ Repurpose の `Create clips` / `Create highlight reel` は**新しい
+#    コンポジションを作る**。編集ループは state.composition_id を追跡している
+#    ため、既定のトグルからは選ばない（重要度判定は `Find highlights` を使う）。
+_UNDERLORD_TOOLS = {
+    # --- Sound good --------------------------------------------------------
+    "edit_for_clarity": {
+        "group": "Sound good",
+        "name": "Edit for clarity",
+        "ja": "明瞭にするために編集",
+        "desc_ja": "フィラー・脱線・不要な無駄話をまとめて削除する",
+        "hint": (
+            "use Edit for clarity to cut tangents and unnecessary chatter so that "
+            "only the segments carrying the main message remain"
+        ),
+    },
+    "studio_sound": {
+        "group": "Sound good",
+        "name": "Studio Sound",
+        "ja": "スタジオサウンド",
+        "desc_ja": "背景ノイズを除去し、声を強調・クリアにする",
+        "hint": (
+            "apply Studio Sound to remove background and wind noise and to even out "
+            "loudness so the voice stays clear on phone speakers"
+        ),
+    },
+    "remove_filler_words": {
+        "group": "Sound good",
+        "name": "Remove filler words",
+        "ja": "フィラーワードを削除",
+        "desc_ja": "「えー」「あー」、言い間違い・単語の繰り返しを削除する",
+        "hint": (
+            "use Remove filler words to delete um, uh, えーっと and あの, stutters and "
+            "repeated words while keeping the delivery natural"
+        ),
+    },
+    "generate_audio": {
+        "group": "Sound good",
+        "name": "Generate audio",
+        "ja": "音声を生成",
+        "desc_ja": "AI 音楽・効果音をプロンプトから作る",
+        "hint": "use Generate audio to add the music or sound effect the user asked for",
+    },
+    "remove_retakes": {
+        "group": "Sound good",
+        "name": "Remove retakes",
+        "ja": "リテイクを削除",
+        "desc_ja": "ベストテイク以外をすべてカットする",
+        "hint": "use Remove retakes to keep only the best take of every repeated line",
+    },
+    "shorten_word_gaps": {
+        "group": "Sound good",
+        "name": "Shorten word gaps",
+        "ja": "単語間の余白を短縮",
+        "desc_ja": "会話中の無音・隙間を短縮またはカットする",
+        "hint": (
+            "use Shorten word gaps to remove the silent gaps between sentences and "
+            "tighten the remaining pauses"
+        ),
+    },
+    "add_chapters": {
+        "group": "Sound good",
+        "name": "Add chapters",
+        "ja": "チャプターを追加",
+        "desc_ja": "チャプターに分割しマーカーを追加する",
+        "hint": "use Add chapters to split the timeline into chapters with markers",
+    },
+    # --- Look good ---------------------------------------------------------
+    "quick_design": {
+        "group": "Look good",
+        "name": "Quick design",
+        "ja": "クイックデザイン",
+        "desc_ja": "AI がシーン・レイアウト・B ロールを追加して見栄えを整える",
+        "hint": (
+            "use Quick design to add scenes, layouts and b-roll inserts at topic changes "
+            "so the video keeps the viewer watching"
+        ),
+    },
+    "eye_contact": {
+        "group": "Look good",
+        "name": "Eye Contact",
+        "ja": "アイコンタクト",
+        "desc_ja": "外れた目線を自然にカメラへ向ける",
+        "hint": "use Eye Contact to correct the speaker's gaze toward the camera",
+    },
+    "center_active_speaker": {
+        "group": "Look good",
+        "name": "Center active speaker",
+        "ja": "発言者を中央に配置",
+        "desc_ja": "発言中の人を常に画面中央に捉え続ける（ベータ）",
+        "hint": "use Center active speaker to keep whoever is talking centered in frame",
+    },
+    "green_screen": {
+        "group": "Look good",
+        "name": "Green screen",
+        "ja": "グリーンバック（背景除去）",
+        "desc_ja": "背景を自動で取り除き差し替える",
+        "hint": "use Green screen to remove the background and replace it",
+    },
+    "skin_smoothing": {
+        "group": "Look good",
+        "name": "Skin smoothing",
+        "ja": "美肌補正",
+        "desc_ja": "肌の質感だけを均一に補正する",
+        "hint": "use Skin smoothing to even out the speaker's skin texture",
+    },
+    "automatic_multicam": {
+        "group": "Look good",
+        "name": "Automatic multicam",
+        "ja": "自動マルチカム",
+        "desc_ja": "発言者を判定して画面レイアウト・カメラを切り替える",
+        "hint": (
+            "use Automatic multicam to switch the framing and layout with who is speaking "
+            "so the edit feels like a multi-camera shoot"
+        ),
+    },
+    "generate_visuals": {
+        "group": "Look good",
+        "name": "Generate visuals",
+        "ja": "ビジュアル生成",
+        "desc_ja": "言葉の説明から画像・映像を生成する",
+        "hint": "use Generate visuals to create the insert image or clip the user described",
+    },
+    "blur_speaker_background": {
+        "group": "Look good",
+        "name": "Blur speaker background",
+        "ja": "話者の背景をぼかす",
+        "desc_ja": "背景をぼかして視聴者の気を散らさない",
+        "hint": "use Blur speaker background to blur what is behind the speaker",
+    },
+    # --- Repurpose ---------------------------------------------------------
+    "create_clips": {
+        "group": "Repurpose",
+        "name": "Create clips",
+        "ja": "クリップを作成",
+        "desc_ja": "バズりそうな場面を切り抜き動画にする（新規コンポジションを作る）",
+        "hint": "use Create clips to cut the most attention-grabbing moments into short clips",
+    },
+    "create_highlight_reel": {
+        "group": "Repurpose",
+        "name": "Create highlight reel",
+        "ja": "ハイライト動画を作成",
+        "desc_ja": "見どころを集めた新しい動画を作る（新規コンポジションを作る）",
+        "hint": "use Create highlight reel to assemble the best moments into one video",
+    },
+    "find_highlights": {
+        "group": "Repurpose",
+        "name": "Find highlights",
+        "ja": "ハイライトを検出",
+        "desc_ja": "特に魅力的で引き込まれる部分を検出する",
+        "hint": (
+            "use Find highlights to rank the most engaging moments, then keep those and "
+            "drop the rest so the timeline packs into the target length"
+        ),
+    },
+    "translate": {
+        "group": "Repurpose",
+        "name": "Translate",
+        "ja": "翻訳",
+        "desc_ja": "文字起こし・字幕・音声を他言語へ翻訳する",
+        "hint": "use Translate to convert the captions into the requested language",
+    },
+    # --- Publish（テキスト成果物。編集指示ではない）-------------------------
+    "draft_youtube_description": {
+        "group": "Publish",
+        "name": "Draft YouTube description",
+        "ja": "YouTube の概要欄を作成",
+        "desc_ja": "視聴者を惹きつける概要欄を書く",
+        "hint": "use Draft YouTube description to write the video description",
+    },
+    "generate_youtube_thumbnail": {
+        "group": "Publish",
+        "name": "Generate YouTube thumbnail",
+        "ja": "YouTube サムネイルを生成",
+        "desc_ja": "クリックされるカスタム画像を生成する",
+        "hint": "use Generate YouTube thumbnail to create a thumbnail image",
+    },
+    "draft_show_notes": {
+        "group": "Publish",
+        "name": "Draft show notes",
+        "ja": "ショーノートを作成",
+        "desc_ja": "チャプターとタイムスタンプ付きの概要文を書く",
+        "hint": "use Draft show notes to write show notes with chapters and timestamps",
+    },
+    "draft_a_title": {
+        "group": "Publish",
+        "name": "Draft a title",
+        "ja": "タイトル案を作成",
+        "desc_ja": "最も魅力的なポイントを捉えたタイトル案を出す",
+        "hint": "use Draft a title to propose titles for this video",
+    },
+    "summarize": {
+        "group": "Publish",
+        "name": "Summarize",
+        "ja": "要約を作成",
+        "desc_ja": "正確で簡潔なあらすじを作る",
+        "hint": "use Summarize to write a concise summary of the content",
+    },
+    "draft_a_social_post": {
+        "group": "Publish",
+        "name": "Draft a social post",
+        "ja": "SNS 投稿文を作成",
+        "desc_ja": "短く気の利いた SNS 用テキストを作る",
+        "hint": "use Draft a social post to write a short promotional post",
+    },
+    "draft_a_blog_post": {
+        "group": "Publish",
+        "name": "Draft a blog post",
+        "ja": "ブログ記事を作成",
+        "desc_ja": "ブログで読みやすいテキストを生成する",
+        "hint": "use Draft a blog post to turn this video into a blog article",
+    },
+    # --- Write（テキスト成果物。編集指示ではない）---------------------------
+    "brainstorm": {
+        "group": "Write",
+        "name": "Brainstorm",
+        "ja": "ブレインストーミング",
+        "desc_ja": "対話しながらアイデアを洗練させる",
+        "hint": "use Brainstorm to refine the idea with the user",
+    },
+    "write_a_script": {
+        "group": "Write",
+        "name": "Write a script",
+        "ja": "スクリプトを作成",
+        "desc_ja": "トピックと文体から台本の初稿を書く",
+        "hint": "use Write a script to draft the script",
+    },
+    "write_an_outline": {
+        "group": "Write",
+        "name": "Write an outline",
+        "ja": "アウトラインを作成",
+        "desc_ja": "台本やブログの構成案を用意する",
+        "hint": "use Write an outline to draft the structure",
+    },
+    "rewrite": {
+        "group": "Write",
+        "name": "Rewrite",
+        "ja": "リライト",
+        "desc_ja": "下書きを作り直して仕上げる",
+        "hint": "use Rewrite to rework the draft",
+    },
+}
+
+# カタログの表示順（Underlord UI の並びに合わせる）
+_UNDERLORD_GROUPS = ("Sound good", "Look good", "Repurpose", "Publish", "Write")
+
+
+def _underlord_catalog_text() -> str:
+    """システムプロンプトに埋め込む AI Tools カタログを組み立てる。"""
+    lines = []
+    for group in _UNDERLORD_GROUPS:
+        lines.append(f"## {group}")
+        for tool in _UNDERLORD_TOOLS.values():
+            if tool["group"] == group:
+                lines.append(f"- {tool['name']}（{tool['ja']}）: {tool['desc_ja']}")
+        lines.append("")
+    return "\n".join(lines).strip()
+
+
+# 編集スタイルのプリセット → 追加で許可する Underlord ツール
+_STYLE_TOOLS = {
+    "jet_cut": ("edit_for_clarity", "remove_filler_words", "shorten_word_gaps"),
+    "caption_focus": (),
+    "dynamic_effects": ("quick_design", "automatic_multicam"),
+    "full": ("edit_for_clarity", "find_highlights", "quick_design"),
+}
+
+# 編集スタイルのプリセット → ツール名では表現できない強調点
+_STYLE_CLAUSES = {
+    "jet_cut": (
+        "tighten the timeline aggressively so the pacing feels like a jet cut",
+        "keep only the segments that carry the main message",
+    ),
+    "caption_focus": (
+        "make the captions the primary visual element and keep them readable on mobile",
+        "align caption timing tightly to the spoken words",
+    ),
+    "dynamic_effects": (
+        "vary the framing so it feels like a multi-camera edit",
+        "place inserts at topic changes to keep the viewer engaged",
+    ),
+    "full": (
+        "tighten the timeline, keep captions readable, and vary the framing",
+        "prioritize a clean, publish-ready short video",
+    ),
+}
+
 _DEFAULT_SYSTEM_PROMPT = """あなたは Descript Underlord に渡す編集プロンプトを組み立てる動画編集ディレクターです。
 
 ユーザの日本語の編集指示と、有効化されている編集機能フラグ、目標尺・アスペクト比を読み取り、
 Descript Underlord がそのまま実行できる**英語の編集プロンプトを 1 つだけ**生成してください。
 
-制約:
+# Underlord の AI Tools
+Underlord は以下のツールを持っています。**この英語名を完全一致で書くと該当ツールが選ばれます。**
+
+{catalog}
+
+# 制約
 - 出力は編集プロンプトの本文のみ。前置き・解説・引用符・Markdown の装飾を付けない。
 - 命令形の英語で 200 語以内。1〜3 文の連続した指示にまとめる。
+- **使ってよいのは「使用を許可された AI Tools」に挙がっているツールだけ。**
+  カタログの他のツールは、ユーザ指示が明示的に求めている場合に限り使ってよい。
+- ツール名は上のカタログの綴りのまま書く（例: Studio Sound / Remove filler words / Find highlights）。
 - 「有効な編集機能」に挙がっていない編集操作を勝手に足さない。ユーザ指示に無い演出を創作しない。
 - ターゲット尺とアスペクト比が与えられている場合は必ず言及する。
-- 素材に存在しない映像・音声を新規生成させる指示は書かない。
-"""
+- 素材に存在しない映像・音声を新規生成させる指示は書かない
+  （ユーザが明示的に求めた場合の Generate visuals / Generate audio を除く）。
+- **編集は現在のコンポジション上で行わせる。新しいコンポジションやプロジェクトを作らせない。**
+  そのため Create clips / Create highlight reel は、ユーザが明示的に求めた場合以外は使わない。
+""".replace("{catalog}", _underlord_catalog_text())
 
 # ===========================================================================
 # 契約書 §6 HTML テンプレート正本
@@ -1473,15 +1784,31 @@ class Pipe:
                 }
             },
         )
+        # 各トグルは Underlord の AI Tool に対応する（_UNDERLORD_TOOLS 参照）
         enable_filler_removal: bool = Field(
-            default=True, description="言い淀み（フィラー）の自動削除")
-        enable_silence_cut: bool = Field(default=True, description="無音区間の自動削除")
+            default=True, description="言い淀み（フィラー）の自動削除 / Remove filler words")
+        enable_silence_cut: bool = Field(
+            default=True, description="無音区間の自動削除 / Shorten word gaps")
+        enable_clarity_edit: bool = Field(
+            default=True, description="脱線・無駄話の削除 / Edit for clarity")
+        enable_highlight_packing: bool = Field(
+            default=True,
+            description="重要度判定によるタイムライン自動圧縮 / Find highlights",
+        )
+        enable_retake_removal: bool = Field(
+            default=False, description="言い直し（リテイク）の削除 / Remove retakes")
         enable_studio_sound: bool = Field(
-            default=True, description="ノイズ除去・音圧の自動マスタリング")
+            default=True, description="ノイズ除去・音圧の自動マスタリング / Studio Sound")
         enable_auto_captions: bool = Field(
-            default=True, description="自動テロップ生成")
-        enable_pan_zoom: bool = Field(default=False, description="オートパン&ズーム")
-        enable_broll: bool = Field(default=False, description="インサート素材の自動配置")
+            default=True, description="自動テロップ生成とタイムコード同期")
+        enable_pan_zoom: bool = Field(
+            default=False,
+            description="オートパン&ズーム / Automatic multicam・Center active speaker",
+        )
+        enable_broll: bool = Field(
+            default=False,
+            description="インサート素材の自動配置 / Quick design・Generate visuals",
+        )
         caption_language: str = Field(
             default="ja",
             json_schema_extra={
@@ -2408,10 +2735,19 @@ class Pipe:
         # 1) 編集プロンプトの合成
         await emit_status("編集プロンプトを組み立てています")
         hints = self._build_feature_hints(user_valves, style)
+        tool_names = self._selected_tool_names(user_valves, style)
+        _log_debug(
+            "edit_prompt.tools",
+            chat_id=ctx.get("chat_id"),
+            op=op,
+            style=style,
+            tools=",".join(tool_names),
+        )
         edit_prompt = await self._compose_edit_prompt(
             ctx,
             instruction=instruction,
             hints=hints,
+            tool_names=tool_names,
             style=style,
             aspect=aspect,
             duration_sec=duration_sec,
@@ -2561,55 +2897,94 @@ class Pipe:
     # -- 編集プロンプトの合成 -----------------------------------------------
 
     @staticmethod
-    def _build_feature_hints(user_valves, style: str) -> list:
-        """BA 要件の編集機能を Underlord 向けの自然文（英語）に展開する。
+    def _select_underlord_tools(user_valves, style: str) -> list:
+        """BA 要件の編集機能を Underlord の AI Tool に写像する。
 
         docs/RequirementDefinition/BA/business_process_architecture.mmd の
         ジェットカッティング / オートキャプショニング＆音声処理 / ダイナミックエフェクト
-        を UserValves のトグルに対応させる。
+        を UserValves のトグルに対応させ、さらに編集スタイルのプリセットを足す。
+        戻り値は _UNDERLORD_TOOLS のキー。順序がそのまま編集プロンプトの並び順になる。
         """
-        hints = []
-        if user_valves.enable_silence_cut:
-            hints.append("remove silent gaps between sentences")
-        if user_valves.enable_filler_removal:
-            hints.append(
-                "remove filler words (um, uh, えーっと, あの) while keeping natural flow")
-        if user_valves.enable_studio_sound:
-            hints.append(
-                "apply Studio Sound to reduce background noise and normalize loudness")
-        if user_valves.enable_auto_captions:
-            hints.append(
-                f"add captions in {user_valves.caption_language} synced to the transcript"
-            )
-        if user_valves.enable_pan_zoom:
-            hints.append("add subtle auto pan and zoom on emphasis moments")
-        if user_valves.enable_broll:
-            hints.append("suggest and place b-roll inserts at topic changes")
+        keys: list = []
 
-        # スタイルのプリセットで強調点を足す
-        preset = {
-            "jet_cut": [
-                "tighten the timeline aggressively so the pacing feels like a jet cut",
-                "keep only the segments that carry the main message",
-            ],
-            "caption_focus": [
-                "make the captions the primary visual element and keep them readable on mobile",
-                "align caption timing tightly to the spoken words",
-            ],
-            "dynamic_effects": [
-                "vary the framing with pan and zoom so it feels like a multi-camera edit",
-                "place inserts at topic changes to keep the viewer engaged",
-            ],
-            "full": [
-                "tighten the timeline, keep captions readable, and vary the framing",
-                "prioritize a clean, publish-ready short video",
-            ],
-        }.get(style, [])
-        hints.extend(preset)
+        def add(*names) -> None:
+            for name in names:
+                if name in _UNDERLORD_TOOLS and name not in keys:
+                    keys.append(name)
+
+        # 1. 映像編集・構成（インテリジェント・カッティング）
+        if user_valves.enable_clarity_edit:
+            add("edit_for_clarity")
+        if user_valves.enable_filler_removal:
+            add("remove_filler_words")
+        if user_valves.enable_retake_removal:
+            add("remove_retakes")
+        if user_valves.enable_silence_cut:
+            add("shorten_word_gaps")
+        if user_valves.enable_highlight_packing:
+            add("find_highlights")
+        # 2. 字幕・音声処理（コンプレッサー / ノイズリダクション）
+        if user_valves.enable_studio_sound:
+            add("studio_sound")
+        # 2'. 字幕の言語指定。キャプション自体は AI Tool ではなく Descript の標準機能だが、
+        #     指定言語が話者の言語と違う場合に備えて Translate を許可しておく。
+        #     許可しないと hints 側の指示とホワイトリストが矛盾する。
+        if user_valves.enable_auto_captions and str(
+                user_valves.caption_language or "auto") != "auto":
+            add("translate")
+        # 3. 演出・アセット配置（ダイナミック・エフェクト）
+        if user_valves.enable_pan_zoom:
+            add("automatic_multicam", "center_active_speaker")
+        if user_valves.enable_broll:
+            add("quick_design", "generate_visuals")
+
+        add(*_STYLE_TOOLS.get(style, ()))
+        return keys
+
+    @classmethod
+    def _selected_tool_names(cls, user_valves, style: str) -> list:
+        """LLM に渡すホワイトリスト用に、Underlord の UI 表示名へ変換する。"""
+        return [_UNDERLORD_TOOLS[k]["name"]
+                for k in cls._select_underlord_tools(user_valves, style)]
+
+    @classmethod
+    def _build_feature_hints(cls, user_valves, style: str) -> list:
+        """有効な編集機能を Underlord 向けの英語の指示句に展開する。
+
+        指示句の本体は _UNDERLORD_TOOLS の hint（＝ツール名を含む）。
+        AI Tool に対応しない要件（キャプション同期・カット繋ぎ目の間）だけを補う。
+        """
+        keys = cls._select_underlord_tools(user_valves, style)
+        # Translate は「話者の言語と違うときだけ」という条件付きなので、
+        # 汎用の hint ではなくキャプション節でまとめて書く
+        hints = [_UNDERLORD_TOOLS[k]["hint"] for k in keys if k != "translate"]
+
+        # ツール名では表現できない BA 要件を足す
+        if user_valves.enable_silence_cut:
+            # カット繋ぎ目の最適化（ディレイ・コントロール）
+            hints.append(
+                "keep a short natural pause at each cut so the joins do not feel abrupt")
+        if user_valves.enable_auto_captions:
+            lang = str(user_valves.caption_language or "auto")
+            hints.append(
+                f"add captions in {lang} that stay synced to the transcript word by word "
+                "and remain readable on a phone screen"
+            )
+            if "translate" in keys:
+                hints.append(
+                    f"if the speech is not in {lang}, use Translate to produce the "
+                    f"captions in {lang}"
+                )
+        if user_valves.enable_pan_zoom:
+            hints.append(
+                "add subtle pan and zoom on emphasis moments so the framing has variety")
+
+        hints.extend(_STYLE_CLAUSES.get(style, ()))
         return hints
 
     async def _compose_edit_prompt(
-        self, ctx, *, instruction, hints, style, aspect, duration_sec, caption_language
+        self, ctx, *, instruction, hints, tool_names, style, aspect, duration_sec,
+        caption_language,
     ) -> str:
         """システムプロンプト＋ユーザ指示＋機能フラグから最終編集プロンプトを合成する。"""
         system_prompt = ""
@@ -2626,9 +3001,12 @@ class Pipe:
                 self.valves.system_prompt_fallback or _DEFAULT_SYSTEM_PROMPT)
 
         feature_lines = "\n".join(f"- {h}" for h in hints) or "- (指定なし)"
+        tool_lines = "\n".join(f"- {n}" for n in tool_names) or "- (なし)"
         user_message = (
             "# ユーザの編集指示（原文・日本語）\n"
             f"{instruction or '(指示なし。有効な編集機能のみを適用してください)'}\n\n"
+            "# 使用を許可された AI Tools\n"
+            f"{tool_lines}\n\n"
             "# 有効な編集機能\n"
             f"{feature_lines}\n\n"
             "# 出力条件\n"
@@ -2667,9 +3045,14 @@ class Pipe:
 
     @staticmethod
     def _fallback_prompt(instruction: str, hints: list, aspect: str, duration_sec: int) -> str:
+        """LLM が使えないときの決定的な組み立て。
+
+        hints は _UNDERLORD_TOOLS の指示句なのでツール名は既に含まれている。
+        """
         parts = list(hints)
         parts.append(f"target a final length of about {duration_sec} seconds")
         parts.append(f"format the result for a {aspect} vertical short video")
+        parts.append("edit the current composition and do not create a new one")
         body = "; ".join(parts)
         tail = f" Additional request from the user (Japanese): {instruction}" if instruction else ""
         return f"Edit this project as a short-form video: {body}.{tail}"

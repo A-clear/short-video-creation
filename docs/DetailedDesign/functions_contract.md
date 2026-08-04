@@ -291,6 +291,66 @@ Valve `tool_arg_map`（JSON 文字列）で論理引数名 → 実引数名を�
 `_coerce_args()`（§5.4）が `spec["parameters"]` の `properties` / `required` と突き合わせ、
 ① Valve の写像を適用 → ② 大文字小文字・アンダースコア差を吸収して再探索 → ③ それでも該当しないキーは**落とす** → ④ `required` の不足を返す。
 
+### 2.5 `prompt_project_agent` に渡す編集プロンプト（Underlord AI Tools 写像）
+
+`prompt_project_agent` は Descript **Underlord** に自然言語を渡すツールで、Underlord 側は
+UI 上の **AI Tools** という名前付き機能の集合として能力を持っている。
+編集プロンプトに**この英語名を完全一致で書くと該当ツールが選ばれる**ため、
+BA 要件（`docs/RequirementDefinition/BA/business_process_architecture.mmd`）を
+散文ではなく **AI Tool 名**へ写像する。
+
+**実装は `descript_pipe.py` のみ**（Action / Filter は編集プロンプトを組み立てない）。
+カタログの正本は同ファイルの `_UNDERLORD_TOOLS`（`group` / `name` / `ja` / `desc_ja` / `hint`）。
+
+#### 要件 → AI Tool → UserValves
+
+| BA 要件                                | Underlord AI Tool                               | UserValves                 | 既定  |
+| -------------------------------------- | ----------------------------------------------- | -------------------------- | ----- |
+| サイレンスカット（無音区間の削除）     | `Shorten word gaps`                             | `enable_silence_cut`       | true  |
+| フィラーカット（言い淀みの削除）       | `Remove filler words`                           | `enable_filler_removal`    | true  |
+| タイムライン自動圧縮（重要度判定）     | `Find highlights`                               | `enable_highlight_packing` | true  |
+| 〃（脱線・無駄話の削除）               | `Edit for clarity`                              | `enable_clarity_edit`      | true  |
+| カット繋ぎ目の最適化（ディレイ）       | `Shorten word gaps` ＋ 自由文の「間」指示       | `enable_silence_cut`       | true  |
+| （言い直しの削除）                     | `Remove retakes`                                | `enable_retake_removal`    | false |
+| 自動テロップ生成 / タイムコード同期    | **AI Tool ではなく Descript 標準機能**。自由文  | `enable_auto_captions`     | true  |
+| 字幕言語が話者と異なる場合             | `Translate`                                     | `caption_language != auto` | —     |
+| オーディオ・コンプレッサー             | `Studio Sound`                                  | `enable_studio_sound`      | true  |
+| ノイズリダクション（環境音除去）       | `Studio Sound`                                  | `enable_studio_sound`      | true  |
+| オート・パン＆ズーム（マルチカメラ風） | `Automatic multicam` ＋ `Center active speaker` | `enable_pan_zoom`          | false |
+| インサート・アセット配置               | `Quick design` ＋ `Generate visuals`            | `enable_broll`             | false |
+
+編集スタイル（`editing_style`）は上に**追加で**ツールを許可する（`_STYLE_TOOLS`）。
+ツール名で表現できない強調点は `_STYLE_CLAUSES` に自由文で持つ。
+
+#### 二層のホワイトリスト
+
+LLM への入力は 2 か所に分かれる。目的が違うので混ぜない。
+
+1. **システムプロンプト**（`_DEFAULT_SYSTEM_PROMPT` / Valve `system_prompt_fallback`）
+   … AI Tools **カタログ全文**を載せる。ユーザが自由文で「背景をぼかして」と書いたときに
+   `Blur speaker background` を正しい綴りで引けるようにするための語彙。
+2. **ユーザメッセージの「使用を許可された AI Tools」**
+   … トグルとスタイルから決まる**そのターンだけの許可リスト**。
+   システムプロンプトは「許可リスト外は、ユーザ指示が明示的に求めた場合のみ」と縛る。
+
+> ⚠️ 許可リストと hints は必ず整合させること。hints に `use Translate ...` を出すなら
+> 許可リストにも `Translate` を入れる。片方だけだと LLM に矛盾した指示を渡すことになる。
+
+#### 🔴 新しいコンポジションを作らせない
+
+Repurpose の **`Create clips` / `Create highlight reel` は新規コンポジションを作る**。
+編集ループは `chat.chat["descript"].composition_id` を追跡して publish するため、
+Underlord が別コンポジションを作ると**プレビューが編集結果と食い違う**。
+
+- 既定のトグル・スタイルからは選ばない（重要度判定は `Find highlights` を使う）
+- システムプロンプトと `_fallback_prompt` の両方に「現在のコンポジションを編集する」制約を書く
+
+#### LLM が使えないときの縮退
+
+`_compose_edit_prompt` が失敗しても編集は止めない。`_fallback_prompt` が hints を
+`;` で連結して決定的に組み立てる。**hints は `_UNDERLORD_TOOLS` の `hint` なので
+この経路でもツール名は保たれる。**
+
 ---
 
 ## 3. 状態スキーマ（`chat.chat["descript"]`）
