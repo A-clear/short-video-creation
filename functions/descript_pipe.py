@@ -108,8 +108,7 @@ def _log(level: int, event: str, **fields: Any) -> None:
         if len(text) > _LOG_VALUE_MAX:
             text = text[:_LOG_VALUE_MAX] + "…"
         parts.append(f"{key}={text}")
-    _LOGGER.log(level, "descript %s%s", event,
-                (" " + " ".join(parts)) if parts else "")
+    _LOGGER.log(level, "descript %s%s", event, (" " + " ".join(parts)) if parts else "")
 
 
 def _log_debug(event: str, **fields: Any) -> None:
@@ -183,8 +182,7 @@ def _render(tpl: str, **kwargs: Any) -> str:
     """
     out = tpl
     for key, value in kwargs.items():
-        out = out.replace("{{" + key + "}}",
-                          "" if value is None else str(value))
+        out = out.replace("{{" + key + "}}", "" if value is None else str(value))
     return out
 
 
@@ -1182,19 +1180,31 @@ def _extract_job_id(raw: Any) -> Optional[str]:
     return str(job_id) if job_id is not None else None
 
 
-def _file_chunks(path: str, chunk_size: int = 1024 * 1024):
-    """ファイルをチャンクで読む同期ジェネレータ。
+async def _file_chunks(path: str, chunk_size: int = 1024 * 1024):
+    """ファイルをチャンクで読む非同期ジェネレータ。
+
+    ⚠️ 必ず async にすること。httpx.AsyncClient の content= に同期ジェネレータを
+    渡すと同期ストリーム（IteratorByteStream）として包まれ、送信前に
+    RuntimeError: Attempted to send an sync request with an AsyncClient instance.
+    で落ちる（httpx 0.28.1 で確認。契約書 §2.0.1 ① の 🔴 注記）。
+
+    open/read/close は blocking I/O なので asyncio.to_thread に逃がす。
+    170MB クラスの動画を同期 read で回すとイベントループが止まり、
+    __event_emitter__ の進捗表示も届かなくなる。
 
     httpx は Content-Length を明示していれば Transfer-Encoding: chunked を
     付けない（_prepare が既存の Content-Length を尊重する）ため、
     署名付き PUT でも壊れない。
     """
-    with open(path, "rb") as handle:
+    handle = await asyncio.to_thread(open, path, "rb")
+    try:
         while True:
-            chunk = handle.read(chunk_size)
+            chunk = await asyncio.to_thread(handle.read, chunk_size)
             if not chunk:
                 break
             yield chunk
+    finally:
+        await asyncio.to_thread(handle.close)
 
 
 def _diag_response(raw: Any, sent_keys: Any, limit: int = 900) -> str:
