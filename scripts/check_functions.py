@@ -74,6 +74,8 @@ SHARED = [
     "_form_result",
     "_poll_job",
     "_redact_signed_urls",
+    # §6.0.1 embeds 直後の最下部ピン留め
+    "_emit_scroll_bottom",
     # §5.10 ロギング
     "_log",
     "_log_debug",
@@ -91,6 +93,7 @@ SHARED_CONSTS = [
     "_SIGNED_URL_PLACEHOLDER",
     "_LOG_VALUE_MAX",
     "_LOGGER",
+    "_SCROLL_BOTTOM_JS",
 ]
 
 problems: list[str] = []

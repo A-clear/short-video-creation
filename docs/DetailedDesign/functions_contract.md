@@ -1029,6 +1029,8 @@ def _ms(started: float) -> int:
 await __event_emitter__({"type": "embeds", "data": {"embeds": [html], "replace": True}})
 ```
 
+🔴 **embeds を送ったら、続けて最下部へのピン留めを送ること（§6.0.1）。** 送らないとチャットが最下部に戻らない。
+
 ### 6.0 共通フッタ（全テンプレートの末尾に入れる）
 
 ```python
@@ -1090,6 +1092,81 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 1
 ```
 
 > `embeds` の要素が `http://` / `https://` / `//` で始まると **URL とみなされ iframe の src** になる（`FullHeightIframe.svelte:52`）。生 HTML を渡すときは必ず `<!doctype html>` で始めること。
+
+### 6.0.1 `_SCROLL_BOTTOM_JS` — embeds 直後の最下部ピン留め
+
+**症状**: Functions 終了後、チャットが最下部に行かず、時間とともに最下部から遠ざかる。
+
+**原因**: 上流は `embeds` 受信の **100 ms 後**に `scrollIntoView({behavior:'smooth', block:'center'})` を実行する（`Chat.svelte:1012-1017`）。ところがこの時点でレイアウトは確定していない。
+
+1. iframe は sandbox（`allow-same-origin` 既定 off）なので、`resizeSameOrigin()` は例外で抜け、**高さは §6.0 `_HEIGHT_JS` の `postMessage` でしか決まらない**（`FullHeightIframe.svelte:144-163`）。その報告は `load` / **100 ms** / **600 ms** / `ResizeObserver`（`<video>` のメタデータ読み込み等）と後から続く。
+2. さらにメッセージは `content-visibility: auto; contain-intrinsic-size: auto 150px`（`Message.svelte:155-156`）なので、画面外メッセージの高さは**推定値**であり、`scrollHeight` 自体が確定していない。上流の `scrollToBottom` が rAF を 3 段重ねているのはこの補正のため（`Chat.svelte:2110-2131`）。
+3. `block: 'center'` は元々最下部を指していない。embeds の下には操作ボタン列と `bottomPadding` がある。
+
+実測（上記構造を最小再現し Chrome headless で計測）: 現状は最下部から **839 px** 手前で停止。ピン留めを入れると **0 px**。
+
+**対処**: `execute` イベント（`Chat.svelte:1103-1116`）で親ウィンドウの JS を実行し、高さが確定するまで `#messages-container` を最下部へ寄せ直す。`__event_emitter__` と `__event_call__` は同じ `events` チャンネル → 同じ `chatEventHandler` に届く（`socket/main.py:986` / `:1112`）ため、**`execute` は emitter でも動く**。応答を待つ必要はないので必ず emitter を使う（`__event_call__` にすると 300 秒ハングの経路を増やすだけ）。
+
+**待ち方は時間ではなく状態で決める。** 高さ報告がいつ終わるかは `<video>` のメタデータ取得やネットワーク次第で、固定の待ち時間では足りたり足りなかったりする。`scrollHeight` が変化しなくなるまでピン留めし、上限だけ時間で切る。
+
+```python
+_SCROLL_BOTTOM_JS = """
+const TAG = '[descript:scroll]';
+const el = document.getElementById('messages-container');
+if (!el) {
+  console.warn(TAG, 'no #messages-container');
+} else {
+  let stop = false;
+  const abort = (e) => { stop = true; console.log(TAG, 'aborted by ' + e.type); };
+  el.addEventListener('wheel', abort, { passive: true, once: true });
+  el.addEventListener('touchstart', abort, { passive: true, once: true });
+  const gap = () => el.scrollHeight - el.scrollTop - el.clientHeight;
+  console.log(TAG, 'start gap=' + gap() + ' h=' + el.scrollHeight);
+  const t0 = Date.now();
+  let lastH = -1;
+  let stable = 0;
+  const iv = setInterval(() => {
+    if (stop) { clearInterval(iv); return; }
+    el.scrollTop = el.scrollHeight;
+    if (el.scrollHeight === lastH) { stable += 1; } else { stable = 0; lastH = el.scrollHeight; }
+    const over = Date.now() - t0 > 15000;
+    if (stable >= 12 || over) {
+      clearInterval(iv);
+      el.scrollTop = el.scrollHeight;
+      console.log(TAG, 'end gap=' + gap() + ' h=' + el.scrollHeight +
+                  ' ms=' + (Date.now() - t0) + (over ? ' (timeout)' : ''));
+    }
+  }, 80);
+}
+"""
+
+
+async def _emit_scroll_bottom(event_emitter) -> None:
+    """embeds 直後にチャットを最下部へ寄せ直す（契約書 §6.0.1）。"""
+    if event_emitter is None:
+        return
+    try:
+        await event_emitter({"type": "execute", "data": {"code": _SCROLL_BOTTOM_JS}})
+    except Exception:
+        pass
+```
+
+- 終了条件は「`scrollHeight` が **12 tick（約 1 秒）**変わらないこと」。上限 15 秒は保険であって設計値ではない。固定の待ち時間にしないのは、高さ報告がいつ終わるかが `<video>` のメタデータ取得とネットワーク次第だから。
+- **`console.log('[descript:scroll] …')` は残すこと。** 上流の `execute` は `catch` が空で、投げた JS が失敗しても**画面にもサーバログにも何も出ない**（配信バンドルで確認: `catch($e){}`）。効いているかを外から確かめる手段がこれしかない。
+- ユーザが `wheel` / `touchstart` で自分でスクロールしたら即座に降りる。ユーザ操作と綱引きしない。
+- **embeds が空配列のときは送らない。** 打ち消し用の `replace: True, embeds: []` でスクロールを動かす理由がない。
+- `execute` は `Chat.svelte:964` の `if (message)` の内側にあるため、`message_id` が history に存在しないと**無視される**。§1.1 のとおり Action の `body['id']` を再利用していることが前提。
+
+### 6.0.2 🔴 embeds 内のリンクで外部サイトを開かせない
+
+**症状**: 埋め込みカードの「Descript で開く」を押すと、タブは開くのにアプリが表示されない。ブラウザ拡張が `Failed to connect to MetaMask / extension not found` を投げることがある。
+
+**原因**: 埋め込み iframe の `sandbox` は `allow-scripts allow-forms allow-popups allow-downloads`（`allow-same-origin` は設定次第）で、**`allow-popups-to-escape-sandbox` が無い**（配信バンドルで確認）。HTML 仕様上、`allow-popups-to-escape-sandbox` が無い sandbox から開いた新規ウィンドウは**同じ sandbox フラグを引き継ぐ**。結果、`https://web.descript.com/...` は**オリジンが `null`（opaque）**の状態で読み込まれ、Cookie も `localStorage` も使えないので SPA が起動しない。拡張の `inpage.js` が「見つからない」と言うのも、opaque オリジンでは拡張のブリッジが張れないため。原因ではなく**症状**である。
+
+**対処**: 外部サイトへのリンクは **iframe の中に置かない**。トップドキュメント側、すなわち**アシスタントメッセージ本文の Markdown リンク**として出す。メッセージ本文は Open WebUI 本体が描画するので sandbox の影響を受けない。
+
+- カード内のボタンは残してよいが、**本文側のリンクが正**とする。Pipe は結果 `data` に `project_url` を必ず載せ、Action はそれを `- [Descript で開く](...)` として本文に書く。
+- ユーザ設定 `iframeSandboxAllowSameOrigin` を有効にすればカード内のボタンも通るが、これは **srcdoc の iframe が親オリジンを名乗れる**ようになる設定で、埋め込み HTML から `localStorage` のトークンに手が届く。既定 off のまま運用する。
 
 ### 6.1 `_PLAYER` — publish 結果のプレビュー
 

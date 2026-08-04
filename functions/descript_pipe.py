@@ -901,6 +901,58 @@ def _make_emit_status(event_emitter):
     return emit
 
 
+# 契約書 §6.0.1 embeds 直後の最下部ピン留め（3 ファイル共通展開）
+_SCROLL_BOTTOM_JS = """
+const TAG = '[descript:scroll]';
+const el = document.getElementById('messages-container');
+if (!el) {
+  console.warn(TAG, 'no #messages-container');
+} else {
+  let stop = false;
+  const abort = (e) => { stop = true; console.log(TAG, 'aborted by ' + e.type); };
+  el.addEventListener('wheel', abort, { passive: true, once: true });
+  el.addEventListener('touchstart', abort, { passive: true, once: true });
+  const gap = () => el.scrollHeight - el.scrollTop - el.clientHeight;
+  console.log(TAG, 'start gap=' + gap() + ' h=' + el.scrollHeight);
+  const t0 = Date.now();
+  let lastH = -1;
+  let stable = 0;
+  const iv = setInterval(() => {
+    if (stop) { clearInterval(iv); return; }
+    el.scrollTop = el.scrollHeight;
+    if (el.scrollHeight === lastH) { stable += 1; } else { stable = 0; lastH = el.scrollHeight; }
+    const over = Date.now() - t0 > 15000;
+    if (stable >= 12 || over) {
+      clearInterval(iv);
+      el.scrollTop = el.scrollHeight;
+      console.log(TAG, 'end gap=' + gap() + ' h=' + el.scrollHeight +
+                  ' ms=' + (Date.now() - t0) + (over ? ' (timeout)' : ''));
+    }
+  }, 80);
+}
+"""
+
+
+async def _emit_scroll_bottom(event_emitter) -> None:
+    """embeds 直後にチャットを最下部へ寄せ直す（契約書 §6.0.1）。
+
+    上流は embeds 受信の 100ms 後に scrollIntoView({block:'center'}) を撃つが
+    （Chat.svelte:1012-1017）、その時点では iframe の高さが未確定。
+    _HEIGHT_JS が load / 100ms / 600ms / ResizeObserver で高さを報告するたびに
+    レイアウトが伸びるため、そのスクロール位置は最下部から離れていく。
+    高さが落ち着くまで #messages-container を最下部へ寄せ直す。
+
+    execute は emitter でも届く（socket/main.py:986 と :1112 は同じ events
+    チャンネル）。応答は不要なので __event_call__ は使わない。
+    """
+    if event_emitter is None:
+        return
+    try:
+        await event_emitter({"type": "execute", "data": {"code": _SCROLL_BOTTOM_JS}})
+    except Exception:
+        pass
+
+
 async def _emit_embeds(event_emitter, html: str) -> None:
     """embeds を全置換で送る（backend は追記・frontend は全置換のため replace 必須）。"""
     if event_emitter is None or not html:
@@ -909,6 +961,7 @@ async def _emit_embeds(event_emitter, html: str) -> None:
         await event_emitter({"type": "embeds", "data": {"embeds": [html], "replace": True}})
     except Exception:
         pass
+    await _emit_scroll_bottom(event_emitter)
 
 
 def _parse_json_valve(raw: Any) -> dict:
@@ -2453,6 +2506,9 @@ class Pipe:
             "share_url": published.get("share_url"),
             "agent_response": agent_response,
             "awaiting": awaiting,
+            # embeds の中のリンクでは Descript を開けない（契約書 §6.0.2）ので、
+            # Action がメッセージ本文にリンクを書けるよう必ず返す。
+            "project_url": self._app_url(published, state),
         }
         if not self.valves.redact_download_url and published.get("download_url"):
             data["download_url"] = published["download_url"]
@@ -2494,6 +2550,8 @@ class Pipe:
             "share_url": published.get("share_url"),
             "agent_response": "編集を確定しました。",
             "awaiting": "done",
+            # 契約書 §6.0.2
+            "project_url": self._app_url(published, new_state),
         }
         if not self.valves.redact_download_url and published.get("download_url"):
             data["download_url"] = published["download_url"]
