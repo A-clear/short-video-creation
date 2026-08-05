@@ -23,17 +23,16 @@ requirements:
 # ---------------------------------------------------------------------------
 
 import json
+import logging
 import re
 import time
 from typing import Any, Optional
 
-from pydantic import BaseModel, Field
-
 from fastapi.responses import HTMLResponse
-
 from open_webui.models.chats import Chats
 from open_webui.models.users import UserModel
 from open_webui.utils.chat import generate_chat_completion
+from pydantic import BaseModel, Field
 
 # ===========================================================================
 # 契約書 §5.1 定数・例外
@@ -42,7 +41,8 @@ from open_webui.utils.chat import generate_chat_completion
 _STATE_KEY = "descript"
 _STATE_VERSION = 1
 _HISTORY_MAX = 50
-_LOGICAL_OPS = ("list_projects", "get_project", "import_media", "agent_edit", "publish", "job_status")
+_LOGICAL_OPS = ("list_projects", "get_project", "import_media",
+                "agent_edit", "publish", "job_status")
 
 
 class DescriptError(Exception):
@@ -64,6 +64,74 @@ class DescriptError(Exception):
             "hint": self.hint,
             "data": self.data,
         }
+
+
+# ===========================================================================
+# 契約書 §5.10 ロギング
+# ===========================================================================
+
+_LOG_VALUE_MAX = 300
+
+# Function は function_<function_id> という名前のモジュールとして exec される
+# （backend/open_webui/utils/plugin.py:276）ので、__name__ がそのまま識別子になる。
+_LOGGER = logging.getLogger(__name__)
+
+
+def _log(level: int, event: str, **fields: Any) -> None:
+    """1 行 1 イベントの構造化ログを出す。
+
+    Open WebUI は stdlib logging を GLOBAL_LOG_LEVEL で一括設定する
+    （backend/open_webui/env.py:107-118）。v0.11.0 の SRC_LOG_LEVELS は
+    空の互換用変数なので参照してはいけない（KeyError になる）。
+
+    Uvicorn Workers で複数プロセスに分かれるため、呼び出し側は chat_id と
+    op を必ず渡すこと。値は署名 URL を伏せ、長すぎるものは切り詰める。
+    ⚠️ Valve の値・アクセストークン・ファイル本体は載せない（§11）。
+    """
+    if not _LOGGER.isEnabledFor(level):
+        return
+    parts = []
+    for key, value in fields.items():
+        if value is None:
+            continue
+        text = _redact_signed_urls(str(value)).replace("\n", " ")
+        if len(text) > _LOG_VALUE_MAX:
+            text = text[:_LOG_VALUE_MAX] + "…"
+        parts.append(f"{key}={text}")
+    _LOGGER.log(level, "descript %s%s", event, (" " + " ".join(parts)) if parts else "")
+
+
+def _log_debug(event: str, **fields: Any) -> None:
+    _log(logging.DEBUG, event, **fields)
+
+
+def _log_info(event: str, **fields: Any) -> None:
+    _log(logging.INFO, event, **fields)
+
+
+def _log_warn(event: str, **fields: Any) -> None:
+    _log(logging.WARNING, event, **fields)
+
+
+def _log_error(event: str, **fields: Any) -> None:
+    _log(logging.ERROR, event, **fields)
+
+
+def _apply_log_level(level: Any) -> None:
+    """Valve のレベルをこの Function のロガーにだけ適用する。
+
+    GLOBAL_LOG_LEVEL を上げると Open WebUI 全体が饒舌になるため、
+    Function 単位で切り替えられるようにする。未知の値は無視する。
+    getLevelNamesMapping は Python 3.11+（本プロジェクトの下限）。
+    """
+    name = str(level or "").strip().upper()
+    if name in logging.getLevelNamesMapping():
+        _LOGGER.setLevel(name)
+
+
+def _ms(started: float) -> int:
+    """time.monotonic() の起点からの経過ミリ秒。"""
+    return int((time.monotonic() - started) * 1000)
 
 
 # ===========================================================================
@@ -251,11 +319,18 @@ def _redact_signed_urls(text: str, replacement: str = "") -> str:
 _HEIGHT_JS = """
 <script>
 (function () {
-  function report() {
-    parent.postMessage(
-      { type: 'iframe:height', height: document.documentElement.scrollHeight + 24 }, '*');
+  var last = -1;
+  function measure() {
+    var b = document.body;
+    return b ? Math.ceil(b.getBoundingClientRect().height) : 0;
   }
-  try { new ResizeObserver(report).observe(document.documentElement); } catch (e) {}
+  function report() {
+    var h = measure();
+    if (h <= 0 || Math.abs(h - last) < 2) return;
+    last = h;
+    parent.postMessage({ type: 'iframe:height', height: h }, '*');
+  }
+  try { new ResizeObserver(report).observe(document.body); } catch (e) {}
   addEventListener('load', report);
   addEventListener('resize', report);
   setTimeout(report, 100);
@@ -263,6 +338,57 @@ _HEIGHT_JS = """
 })();
 </script>
 """
+
+# 契約書 §6.0.1 embeds 直後の最下部ピン留め（3 ファイル共通展開）
+_SCROLL_BOTTOM_JS = """
+const TAG = '[descript:scroll]';
+const el = document.getElementById('messages-container');
+if (!el) {
+  console.warn(TAG, 'no #messages-container');
+} else {
+  let stop = false;
+  const abort = (e) => { stop = true; console.log(TAG, 'aborted by ' + e.type); };
+  el.addEventListener('wheel', abort, { passive: true, once: true });
+  el.addEventListener('touchstart', abort, { passive: true, once: true });
+  const gap = () => el.scrollHeight - el.scrollTop - el.clientHeight;
+  console.log(TAG, 'start gap=' + gap() + ' h=' + el.scrollHeight);
+  const t0 = Date.now();
+  let lastH = -1;
+  let stable = 0;
+  const iv = setInterval(() => {
+    if (stop) { clearInterval(iv); return; }
+    el.scrollTop = el.scrollHeight;
+    if (el.scrollHeight === lastH) { stable += 1; } else { stable = 0; lastH = el.scrollHeight; }
+    const over = Date.now() - t0 > 15000;
+    if (stable >= 12 || over) {
+      clearInterval(iv);
+      el.scrollTop = el.scrollHeight;
+      console.log(TAG, 'end gap=' + gap() + ' h=' + el.scrollHeight +
+                  ' ms=' + (Date.now() - t0) + (over ? ' (timeout)' : ''));
+    }
+  }, 80);
+}
+"""
+
+
+async def _emit_scroll_bottom(event_emitter) -> None:
+    """embeds 直後にチャットを最下部へ寄せ直す（契約書 §6.0.1）。
+
+    上流は embeds 受信の 100ms 後に scrollIntoView({block:'center'}) を撃つが
+    （Chat.svelte:1012-1017）、その時点では iframe の高さが未確定。
+    _HEIGHT_JS が load / 100ms / 600ms / ResizeObserver で高さを報告するたびに
+    レイアウトが伸びるため、そのスクロール位置は最下部から離れていく。
+    高さが落ち着くまで #messages-container を最下部へ寄せ直す。
+
+    execute は emitter でも届く（socket/main.py:986 と :1112 は同じ events
+    チャンネル）。応答は不要なので __event_call__ は使わない。
+    """
+    if event_emitter is None:
+        return
+    try:
+        await event_emitter({"type": "execute", "data": {"code": _SCROLL_BOTTOM_JS}})
+    except Exception:
+        pass
 
 _BASE_CSS = """
 :root { color-scheme: light dark; }
@@ -311,10 +437,6 @@ _PLAYER = """<!doctype html><html lang="ja"><head><meta charset="utf-8">
   <p class="h">{{title}}</p>
   <video src="{{src}}" controls playsinline preload="metadata"
          style="width:100%;max-height:70vh;border-radius:10px;background:#000;display:block"></video>
-  <div class="row">
-    <a class="btn primary" href="{{app_url}}" target="_blank" rel="noopener">Descript で開く</a>
-    <a class="btn" href="{{share_url}}" target="_blank" rel="noopener">共有リンク</a>
-  </div>
   <p class="muted" style="margin:10px 0 0">rev {{revision}} ・ {{note}}</p>
 </div></div>{{height_js}}</body></html>"""
 
@@ -362,7 +484,6 @@ _TIMELINE_EXPORT = """<!doctype html><html lang="ja"><head><meta charset="utf-8"
   <p class="muted" style="margin:0 0 4px">形式: {{format_label}}</p>
   <div class="row">
     <a class="btn primary" href="{{download_url}}" target="_blank" rel="noopener">ダウンロード</a>
-    {{app_link}}
   </div>
   <p class="muted" style="margin:12px 0 0">{{notice}}</p>
   {{expiry}}
@@ -395,8 +516,10 @@ _INFO_CODES = ("USER_CANCELLED",)
 # ===========================================================================
 
 _EXPORT_FORMATS = (
-    {"value": "share_video", "label": "動画の共有リンク（Video）", "op": "publish", "media_type": "Video"},
-    {"value": "share_audio", "label": "音声の共有リンク（Audio）", "op": "publish", "media_type": "Audio"},
+    {"value": "share_video", "label": "動画の共有リンク（Video）",
+        "op": "publish", "media_type": "Video"},
+    {"value": "share_audio", "label": "音声の共有リンク（Audio）",
+        "op": "publish", "media_type": "Audio"},
     {"value": "fcp", "label": "Final Cut Pro X（.fcpxml）", "op": "export_timeline"},
     {"value": "premiere", "label": "Premiere Pro XML", "op": "export_timeline"},
     {"value": "davinci_resolve", "label": "DaVinci Resolve XML", "op": "export_timeline"},
@@ -658,24 +781,37 @@ class Action:
         )
         form_mode: str = Field(
             default="sequential",
-            json_schema_extra={"input": {"type": "select", "options": ["sequential", "modal"]}},
+            json_schema_extra={"input": {"type": "select",
+                                         "options": ["sequential", "modal"]}},
             description="sequential=input ダイアログを連鎖 / modal=execute でカスタムフォームを表示",
         )
         bypass_model_access: bool = Field(
             default=True,
             description="Pipe モデルのアクセス制御をバイパスする（Action 自体が露出チェック済みのため既定 True）",
         )
-        max_projects_in_select: int = Field(default=50, description="プロジェクト選択に表示する最大件数")
+        max_projects_in_select: int = Field(
+            default=50, description="プロジェクト選択に表示する最大件数")
         action_soft_timeout_sec: int = Field(
             default=45,
             description="この秒数を超えそうな処理は早期 return する（リバースプロキシ切断対策）",
         )
         debug: bool = Field(default=False, description="詳細を status イベントに出す")
+        log_level: str = Field(
+            default="INFO",
+            description="この Function だけのログレベル。GLOBAL_LOG_LEVEL を上げずに詳細を見たいとき DEBUG にする",
+            json_schema_extra={
+                "input": {
+                    "type": "select",
+                    "options": ["DEBUG", "INFO", "WARNING", "ERROR"],
+                }
+            },
+        )
 
     class UserValves(BaseModel):
         default_aspect: str = Field(
             default="9:16",
-            json_schema_extra={"input": {"type": "select", "options": ["9:16", "1:1", "16:9"]}},
+            json_schema_extra={"input": {"type": "select",
+                                         "options": ["9:16", "1:1", "16:9"]}},
         )
         default_duration_sec: int = Field(default=60, description="既定の出力尺（秒）")
         editing_style: str = Field(
@@ -685,10 +821,12 @@ class Action:
             },
             description="編集スタイルのプリセット",
         )
-        auto_confirm: bool = Field(default=False, description="編集ループの確認をスキップし 1 周で確定する")
+        auto_confirm: bool = Field(
+            default=False, description="編集ループの確認をスキップし 1 周で確定する")
         default_export_format: str = Field(
             default=_DEFAULT_EXPORT_FORMAT,
-            json_schema_extra={"input": {"type": "select", "options": _EXPORT_FORMAT_VALUES}},
+            json_schema_extra={"input": {"type": "select",
+                                         "options": _EXPORT_FORMAT_VALUES}},
             description="エクスポート形式の既定値",
         )
 
@@ -731,10 +869,14 @@ class Action:
         """
         if emitter is None:
             return
+        embeds = list(html_list or [])
         try:
-            await emitter({"type": "embeds", "data": {"embeds": list(html_list or []), "replace": True}})
+            await emitter({"type": "embeds", "data": {"embeds": embeds, "replace": True}})
         except Exception:
             pass
+        # 打ち消し用の空送信でスクロールを動かす理由はない（契約書 §6.0.1）
+        if embeds:
+            await _emit_scroll_bottom(emitter)
 
     # -------------------------------------------------------------------
     # 戻り値の組み立て
@@ -795,14 +937,25 @@ class Action:
             },
         }
 
+        _log_info(
+            "rpc.start",
+            op=op,
+            chat_id=body.get("chat_id"),
+            model=model_id,
+            args=sorted((args or {}).keys()),
+        )
+        started = time.monotonic()
         try:
             res = await generate_chat_completion(
                 request,
                 form_data,
                 _as_user_model(user),
-                bypass_filter=bool(getattr(self.valves, "bypass_model_access", True)),
+                bypass_filter=bool(
+                    getattr(self.valves, "bypass_model_access", True)),
             )
         except Exception as exc:
+            _log_error("rpc.crash", op=op, ms=_ms(
+                started), error=str(exc)[:400])
             return {
                 "ok": False,
                 "op": op,
@@ -815,7 +968,18 @@ class Action:
                 "data": {"raw": str(exc)[:800]},
             }
 
-        return _unpack_pipe_response(res)
+        envelope = _unpack_pipe_response(res)
+        if envelope.get("ok"):
+            _log_info("rpc.done", op=op, ms=_ms(started))
+        else:
+            _log_warn(
+                "rpc.fail",
+                op=op,
+                ms=_ms(started),
+                code=envelope.get("code"),
+                message=envelope.get("message_ja"),
+            )
+        return envelope
 
     # -------------------------------------------------------------------
     # エラー封筒の展開（契約書 §4）
@@ -847,7 +1011,8 @@ class Action:
             lines.append("「動画のアップロード」から先にプロジェクトを作成してください。")
             lines.append("")
         elif code == "TOOL_UNRESOLVED":
-            lines.append("下の一覧から実ツール名を読み取り、Descript Orchestrator の `tool_*` Valve に設定してください。")
+            lines.append(
+                "下の一覧から実ツール名を読み取り、Descript Orchestrator の `tool_*` Valve に設定してください。")
             lines.append("")
         elif code == "JOB_TIMEOUT":
             job_id = _pick(env.get("data") or {}, "job_id", default=None)
@@ -915,8 +1080,10 @@ class Action:
                 continue
             name = _pick(spec, "name", "tool_name", default="")
             desc = _pick(spec, "description", "desc", default="")
-            params = _pick(spec, "parameters", "input_schema", "inputSchema", default={}) or {}
-            required_list = params.get("required") if isinstance(params, dict) else None
+            params = _pick(spec, "parameters", "input_schema",
+                           "inputSchema", default={}) or {}
+            required_list = params.get(
+                "required") if isinstance(params, dict) else None
             required = ", ".join(str(r) for r in (required_list or [])) or "—"
             guess = " / ".join(reverse.get(str(name), [])) or "—"
             rows.append(
@@ -945,7 +1112,8 @@ class Action:
         media_files の形（dict of dict / list）は MCP スキーマ未確定なので
         どちらでも読めるようにしている（契約書 §12）。
         """
-        media = _pick(project or {}, "media_files", "media", "files", default={}) or {}
+        media = _pick(project or {}, "media_files",
+                      "media", "files", default={}) or {}
         if isinstance(media, dict):
             entries = list(media.values()) if media else []
         elif isinstance(media, list):
@@ -957,14 +1125,18 @@ class Action:
         for item in entries:
             if isinstance(item, str):
                 rows.append(
-                    "<tr><td>{n}</td><td>—</td><td>—</td></tr>".format(n=_esc(item))
+                    "<tr><td>{n}</td><td>—</td><td>—</td></tr>".format(
+                        n=_esc(item))
                 )
                 continue
             if not isinstance(item, dict):
                 continue
-            name = _pick(item, "name", "filename", "title", "id", default="（名称不明）")
-            kind = _pick(item, "type", "media_type", "kind", "mime_type", default="—")
-            duration = _pick(item, "duration", "duration_sec", "length", default=None)
+            name = _pick(item, "name", "filename",
+                         "title", "id", default="（名称不明）")
+            kind = _pick(item, "type", "media_type",
+                         "kind", "mime_type", default="—")
+            duration = _pick(item, "duration", "duration_sec",
+                             "length", default=None)
             note = f"{duration} 秒" if duration is not None else "—"
             rows.append(
                 "<tr><td>{n}</td><td>{k}</td><td>{d}</td></tr>".format(
@@ -986,36 +1158,29 @@ class Action:
         )
 
     @staticmethod
-    def _player_html(title: str, src: str, app_url: str, share_url: str, revision: Any, note: str) -> str:
+    def _player_html(title: str, src: str, revision: Any, note: str) -> str:
+        # 外部サイト（descript.com）への導線はカード内に置かない。
+        # メッセージ本文の Markdown リンクが正（契約書 §6.0.2）。
         return _render(
             _PLAYER,
             css=_BASE_CSS,
             height_js=_HEIGHT_JS,
             title=_esc(title),
             src=src or "",
-            app_url=app_url or share_url or "",
-            share_url=share_url or "",
             revision=_esc(revision if revision is not None else "-"),
             note=_esc(note),
         )
 
     @staticmethod
     def _timeline_export_html(
-        *, title: str, format_label: str, download_url: str, app_url: str, expires_at: str
+        *, title: str, format_label: str, download_url: str, expires_at: str
     ) -> str:
         """export_timeline の結果カードを組み立てる（契約書 §2.0.1 ④）。
 
         download_url は期限付きの署名 URL なので、この embeds の中だけに置く。
-        app_url / expires_at が空のときは、その要素ごと出さない。
+        expires_at が空のときは、その要素ごと出さない。
+        Descript App への導線はカード内に置かない（契約書 §6.0.2）。
         """
-        app_link = ""
-        if app_url:
-            app_link = (
-                '<a class="btn" href="'
-                + _esc(app_url)
-                + '" target="_blank" rel="noopener">Descript で開く</a>'
-            )
-
         expiry = ""
         if expires_at:
             expiry = (
@@ -1031,7 +1196,6 @@ class Action:
             title=_esc(title),
             format_label=_esc(format_label),
             download_url=_esc(download_url),
-            app_link=app_link,
             notice=_esc(_TIMELINE_NOTICE),
             expiry=expiry,
         )
@@ -1228,7 +1392,8 @@ class Action:
         server = data.get("server") or {}
 
         resolved_count = sum(1 for op in _LOGICAL_OPS if resolved.get(op))
-        server_name = _pick(server, "name", "title", "id", default="Descript MCP")
+        server_name = _pick(server, "name", "title",
+                            "id", default="Descript MCP")
 
         await self._status(
             emitter,
@@ -1249,7 +1414,8 @@ class Action:
         lines = ["### Descript MCP 診断結果", ""]
         lines.append(f"- 接続先: **{server_name}**")
         lines.append(f"- 検出ツール数: **{len(tools)}**")
-        lines.append(f"- 解決済みの論理操作: **{resolved_count} / {len(_LOGICAL_OPS)}**")
+        lines.append(
+            f"- 解決済みの論理操作: **{resolved_count} / {len(_LOGICAL_OPS)}**")
         lines.append("")
         if unresolved:
             lines.append("未解決の論理操作:")
@@ -1275,10 +1441,15 @@ class Action:
         # （socket/main.py:1040-1044）。先に空配列を replace:True で送って打ち消す。
         await self._embeds(emitter, [])
 
+        # この経路の embeds は return 後に actions.py が送るので _embeds では拾えない。
+        # ピン留めは 3 秒回り続けるため、先に撃っておけば後続の embeds に間に合う。
+        await _emit_scroll_bottom(emitter)
+
         # (HTMLResponse, result_context) タプルで返すと embeds 化と同時に
         # 戻り値も差し替えられる（utils/middleware.py:887-904, actions.py:130-148）。
         return (
-            HTMLResponse(content=html, headers={"Content-Disposition": "inline"}),
+            HTMLResponse(content=html, headers={
+                         "Content-Disposition": "inline"}),
             self._message(body, message),
         )
 
@@ -1289,12 +1460,14 @@ class Action:
     async def _collect_upload_input(
         self, *, event_call: Any, emitter: Any
     ) -> tuple[Optional[dict], Optional[dict]]:
-        mode = str(getattr(self.valves, "form_mode", "sequential") or "sequential").strip()
+        mode = str(getattr(self.valves, "form_mode", "sequential")
+                   or "sequential").strip()
 
         if mode == "modal":
             await self._debug(emitter, "form_mode=modal: execute でカスタムフォームを表示")
             ok, value, err = await self._ask(
-                event_call, {"type": "execute", "data": {"code": _UPLOAD_MODAL_JS}}
+                event_call, {"type": "execute",
+                             "data": {"code": _UPLOAD_MODAL_JS}}
             )
             if not ok:
                 return None, err
@@ -1414,13 +1587,15 @@ class Action:
         data = env.get("data") or {}
         project_url = data.get("project_url")
         media = data.get("media") or {}
-        media_name = _pick(media, "name", "filename", "title", default=collected.get("file_name") or "")
+        media_name = _pick(media, "name", "filename", "title",
+                           default=collected.get("file_name") or "")
 
         await self._status(emitter, "取り込みが完了しました", done=True)
         await self._notify(emitter, "success", f"「{project_name}」に動画を取り込みました。")
 
         lines = ["### 動画を取り込みました", ""]
-        lines.append(f"- プロジェクト: **{project_name}**" + ("（新規作成）" if created else "（既存を再利用）"))
+        lines.append(f"- プロジェクト: **{project_name}**" +
+                     ("（新規作成）" if created else "（既存を再利用）"))
         if media_name:
             lines.append(f"- メディア: {media_name}")
         if project_url:
@@ -1518,6 +1693,7 @@ class Action:
         awaiting = str(data.get("awaiting") or "")
         agent_response = str(data.get("agent_response") or "")
         share_url = data.get("share_url") or ""
+        project_url = str(data.get("project_url") or "")
 
         await self._status(emitter, "編集が完了しました", done=True)
 
@@ -1528,6 +1704,10 @@ class Action:
         if revision is not None:
             lines.append(f"- リビジョン: rev {revision}")
         lines.append(f"- 指示: {instruction}")
+        # embeds の中のリンクは sandbox を引き継いだタブで開かれて動かない（契約書 §6.0.2）。
+        # 本文側のリンクは本体が描画するので sandbox の影響を受けない。
+        if project_url:
+            lines.append(f"- [Descript で開く]({project_url})")
         if share_url:
             lines.append(f"- [共有リンク]({share_url})")
         lines.append("")
@@ -1579,7 +1759,8 @@ class Action:
         fmt = _export_format(chosen)
 
         state = await _load_state(body.get("chat_id"))
-        composition_id = state.get("composition_id") if state.get("project_id") == project_id else None
+        composition_id = state.get("composition_id") if state.get(
+            "project_id") == project_id else None
 
         if self._soft_expired(started):
             await self._status(emitter, "処理時間の上限に達しました", done=True)
@@ -1650,7 +1831,8 @@ class Action:
         share_url = str(data.get("share_url") or "")
         # download_url は署名付き・期限付き。表示のその場限りで使い、本文には残さない（契約書 §6.1 / §11）
         download_url = str(data.get("download_url") or "")
-        app_url = str(_pick(data, "app_url", "project_url", "editor_url", default="") or share_url)
+        app_url = str(_pick(data, "app_url", "project_url",
+                      "editor_url", default="") or share_url)
 
         await self._status(emitter, "書き出しが完了しました", done=True)
         await self._notify(emitter, "success", f"「{project_name}」を書き出しました。")
@@ -1661,8 +1843,6 @@ class Action:
                 self._player_html(
                     title=f"{project_name} の書き出し結果",
                     src=download_url or share_url,
-                    app_url=app_url,
-                    share_url=share_url,
                     revision=revision,
                     note=fmt["label"],
                 )
@@ -1696,7 +1876,8 @@ class Action:
         await self._status(emitter, f"「{project_name}」のタイムラインを書き出しています（{fmt['label']}）")
         env = await self._call_pipe(
             "export_timeline",
-            {"project_id": project_id, "composition_id": composition_id, "format": fmt["value"]},
+            {"project_id": project_id, "composition_id": composition_id,
+                "format": fmt["value"]},
             body=body,
             user=user,
             request=request,
@@ -1708,8 +1889,10 @@ class Action:
         data = env.get("data") or {}
         # download_url は期限付きの署名 URL。embeds にだけ載せ、本文には残さない（契約書 §5.9 / §11）
         download_url = str(data.get("download_url") or "")
-        expires_at = str(_pick(data, "expires_at", "download_url_expires_at", default="") or "")
-        app_url = str(_pick(data, "app_url", "project_url", "editor_url", default="") or "")
+        expires_at = str(
+            _pick(data, "expires_at", "download_url_expires_at", default="") or "")
+        app_url = str(_pick(data, "app_url", "project_url",
+                      "editor_url", default="") or "")
 
         if not download_url:
             return await self._fail(
@@ -1736,7 +1919,6 @@ class Action:
                     title=f"{project_name} のタイムライン書き出し",
                     format_label=fmt["label"],
                     download_url=download_url,
-                    app_url=app_url,
                     expires_at=expires_at,
                 )
             ],
@@ -1823,6 +2005,10 @@ class Action:
     ) -> dict:
         body = body or {}
         started = time.monotonic()
+        # ★ ログレベルの適用は __init__ ではなくここで行う。Open WebUI は呼び出しの
+        #    たびに function_module.valves をインスタンスごと差し替える
+        #    （utils/actions.py:87）ため、__init__ では常に既定値しか読めない。
+        _apply_log_level(self.valves.log_level)
         # __id__ は sub_action_id（無ければ action_id）が入る（utils/actions.py:100）
         sub = str(__id__ or "").split(".")[-1]
 
@@ -1838,6 +2024,12 @@ class Action:
                 )
 
             await self._debug(__event_emitter__, f"sub_action={sub}")
+            _log_info(
+                "action.start",
+                sub=sub or "(menu)",
+                chat_id=body.get("chat_id"),
+                message_id=body.get("id"),
+            )
 
             if sub == "probe":
                 return await self._act_probe(
@@ -1875,6 +2067,8 @@ class Action:
 
         except Exception as exc:
             # 想定外の例外も日本語メッセージに変換する（正常系は封筒で受ける）
+            _LOGGER.exception(
+                "descript action.crash sub=%s ms=%s", sub, _ms(started))
             await self._status(__event_emitter__, "処理を中断しました", done=True)
             await self._notify(__event_emitter__, "error", "内部エラーが発生しました。")
             return self._message(

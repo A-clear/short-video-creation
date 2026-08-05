@@ -346,16 +346,40 @@ Descript MCP は個々のツール名・引数スキーマを公開ドキュメ�
 
 編集内容は `descript_pipe` の **UserValves**（各ユーザが Settings から設定）で制御する。
 
-| UserValve               | 対応する業務要件                                                       |
-| ----------------------- | ---------------------------------------------------------------------- |
-| `enable_silence_cut`    | サイレンスカット（無音区間の自動削除）                                 |
-| `enable_filler_removal` | フィラーカット（言い淀みの自動削除）                                   |
-| `enable_studio_sound`   | ノイズリダクション / オーディオ・コンプレッサー                        |
-| `enable_auto_captions`  | 自動テロップ生成とタイムコード同期                                     |
-| `enable_pan_zoom`       | オート・パン＆ズーム                                                   |
-| `enable_broll`          | インサート・アセット配置                                               |
-| `caption_language`      | テロップの言語（`ja` / `en` / `auto`）                                 |
-| `editing_style`         | プリセット（`jet_cut` / `caption_focus` / `dynamic_effects` / `full`） |
+各トグルは **Descript Underlord の AI Tool** に対応する。編集プロンプトにはツール名が
+英語のまま書き込まれるので、ここで OFF にしたツールは指示文にも現れない。
+写像の詳細は `docs/DetailedDesign/functions_contract.md` §2.5。
+
+| UserValve                  | 対応する業務要件                        | Underlord AI Tool                               | 既定      |
+| -------------------------- | --------------------------------------- | ----------------------------------------------- | --------- |
+| `enable_silence_cut`       | サイレンスカット / カット繋ぎ目の最適化 | `Shorten word gaps`                             | ON        |
+| `enable_filler_removal`    | フィラーカット（言い淀みの削除）        | `Remove filler words`                           | ON        |
+| `enable_clarity_edit`      | 脱線・無駄話の削除                      | `Edit for clarity`                              | ON        |
+| `enable_highlight_packing` | タイムライン自動圧縮（重要度判定）      | `Find highlights`                               | ON        |
+| `enable_retake_removal`    | 言い直し（リテイク）の削除              | `Remove retakes`                                | OFF       |
+| `enable_studio_sound`      | ノイズリダクション / コンプレッサー     | `Studio Sound`                                  | ON        |
+| `enable_auto_captions`     | 自動テロップ生成とタイムコード同期      | （Descript 標準機能。ツール名なし）             | ON        |
+| `enable_pan_zoom`          | オート・パン＆ズーム                    | `Automatic multicam` ＋ `Center active speaker` | OFF       |
+| `enable_broll`             | インサート・アセット配置                | `Quick design` ＋ `Generate visuals`            | OFF       |
+| `caption_language`         | テロップの言語（`ja` / `en` / `auto`）  | `auto` 以外なら `Translate` を許可              | `ja`      |
+| `editing_style`            | プリセット                              | スタイルごとに上へ追加許可                      | `jet_cut` |
+
+`editing_style` が追加で許可するツール:
+
+| スタイル          | 追加されるツール                                                 |
+| ----------------- | ---------------------------------------------------------------- |
+| `jet_cut`         | `Edit for clarity` / `Remove filler words` / `Shorten word gaps` |
+| `caption_focus`   | （なし。字幕の強調を自由文で足すだけ）                           |
+| `dynamic_effects` | `Quick design` / `Automatic multicam`                            |
+| `full`            | `Edit for clarity` / `Find highlights` / `Quick design`          |
+
+> **`Create clips` / `Create highlight reel` は既定では使わせない。** これらは新しい
+> コンポジションを作るため、編集ループが追跡している `composition_id` と食い違い、
+> プレビューが編集結果と一致しなくなる。重要度判定には `Find highlights` を使う。
+
+ユーザが編集指示に自由文で「背景をぼかして」「美肌補正して」などと書いた場合は、
+上の表に無いツール（`Blur speaker background` / `Skin smoothing` など）も使われる。
+システムプロンプトに AI Tools のカタログ全文が入っているため、綴りは自動で合う。
 
 編集が終わるとプレビュープレイヤーが表示され、「この指示で再編集」「これで確定する」を選べる。**確定するまでこのループが回る。**
 

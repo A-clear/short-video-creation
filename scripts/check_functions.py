@@ -64,6 +64,7 @@ SHARED = [
     "_save_state",
     "_append_history",
     "_coerce_args",
+    "_json_from_text",
     "_unwrap_mcp",
     "_classify_mcp_error",
     "_mcp_call",
@@ -73,8 +74,27 @@ SHARED = [
     "_form_result",
     "_poll_job",
     "_redact_signed_urls",
+    # §6.0.1 embeds 直後の最下部ピン留め
+    "_emit_scroll_bottom",
+    # §5.10 ロギング
+    "_log",
+    "_log_debug",
+    "_log_info",
+    "_log_warn",
+    "_log_error",
+    "_apply_log_level",
+    "_ms",
 ]
-SHARED_CONSTS = ["_STATE_KEY", "_STATE_VERSION", "_HISTORY_MAX", "_SIGNED_URL_RE", "_SIGNED_URL_PLACEHOLDER"]
+SHARED_CONSTS = [
+    "_STATE_KEY",
+    "_STATE_VERSION",
+    "_HISTORY_MAX",
+    "_SIGNED_URL_RE",
+    "_SIGNED_URL_PLACEHOLDER",
+    "_LOG_VALUE_MAX",
+    "_LOGGER",
+    "_SCROLL_BOTTOM_JS",
+]
 
 problems: list[str] = []
 oks: list[str] = []

@@ -115,6 +115,32 @@ Filter の `stream` は `progress_marker_prefix`（既定 `U+2063 INVISIBLE SEPA
 
 **将来マーカーを使う場合の必須条件**: SSE チャンクは任意位置で分割されうるため、Filter はチャンクをまたぐマーカーを検出できない。**Pipe 側が「1 マーカー = 1 チャンク、前後を改行で囲む」形で送出すること**を前提とする。バッファリングは本文欠落のリスクが大きいため Filter 側では行わない。
 
+### 1.6 通常チャットのインテント振り分け（`descript_op` が無い経路）
+
+**なぜ Pipe 側で受けるのか。** Action はアシスタントメッセージのツールバーにしか描画されない（`utils/actions.py`）ため、**チャット開始時（まだ 1 通も無い状態）には出せない**。一方、新規チャット画面には Suggestion Prompts が並び（`src/lib/components/chat/Placeholder.svelte:257-261` が `info.meta.suggestion_prompts` → `default_prompt_suggestions` の順に採用）、**クリックすると即送信される**（`Chat.svelte:658-669`。ユーザ設定 `insertSuggestionPrompt` が on のときだけ挿入のみ）。送信先は選択中モデル＝Descript Pipe であり、**Pipe には `__event_call__` が渡る**（`functions.py:263-264`）ので、Action を介さずそのままフローに入れる。
+
+したがって導線は次のようにする:
+
+1. Workspace → Models → Descript Orchestrator → Prompt suggestions に短いコマンド句を登録する
+2. 既定モデルを Descript Orchestrator にする
+3. Pipe の `_dispatch` がその句を `descript_op` に振り分ける（本節）
+
+> ⚠️ **部分一致で振り分けてはいけない。** 「冒頭をカットして**書き出して**」のような本物の編集指示が `export_timeline` に奪われる。
+> **正規化後の文字列が「全体として」短いコマンド句に一致したときだけ**振り分け、それ以外は従来どおり `start_edit_loop`（自然文の編集指示）に落とす。
+> 正規化は「前後空白の除去 → 小文字化 → 空白（半角/全角）の除去 → 末尾の句読点・記号の除去」。長さが `_CHAT_INTENT_MAX_LEN`（24）を超える文字列は**一切振り分けない**。
+
+| 入力例（正規化後が全体一致）                              | 振り分け先 op     |
+| --------------------------------------------------------- | ----------------- |
+| 動画をアップロード / 取り込み / インポート / `upload`     | `import_media`    |
+| 動画を編集 / 編集する / `edit`                            | `start_edit_loop` |
+| タイムラインを書き出す / エクスポート / `export`          | `export_timeline` |
+| プロジェクト一覧 / プロジェクトのリスト / `list projects` | `list_projects`   |
+| 診断 / 接続確認 / `probe`                                 | `probe`           |
+
+- `start_edit_loop` に振り分けたときは **`instruction` を空にする**。コマンド句そのもの（「動画を編集」）を編集指示として LLM に渡しても意味がないため、Valve / UserValves のスタイル既定に委ねる
+- 引数が足りない場合は各 op が既存のエラーコードで返す（動画未添付なら `TOOL_ARGS_MISSING`、プロジェクト不在なら `NO_PROJECT`）。**振り分け側で先回りして検証しない**
+- Valve `enable_chat_intents`（既定 `true`）で機能ごと無効化できる。誤爆したときに即座に従来動作へ戻せるようにするため
+
 ---
 
 ## 2. 論理操作 ↔ MCP ツール名
@@ -174,6 +200,12 @@ tool_resolution_mode = valve_only
 - **既存プロジェクトには `add_compositions` を渡さない。** 既存の編集を壊す。追記したい場合は `update_compositions`（今回は未使用）
 - 直接アップロードのレスポンス `upload_urls` は `{メディアキー: {upload_url, asset_id, artifact_id}}`。`Content-Type: application/octet-stream` で PUT し、**宣言した `file_size` と実サイズが一致する必要がある**
 - アップロードに失敗した場合は `report_upload_status`（`job_id` / `media_id` / `status`）で通知しないと、import ジョブがそのファイルを待ち続ける
+
+> 🔴 **PUT のボディは「非同期」ジェネレータで渡すこと（実測 2026-08-03）。**
+> `httpx.AsyncClient` の `content=` に**同期**ジェネレータを渡すと、httpx が同期ストリーム（`IteratorByteStream`）として包み、`AsyncClient._send_single_request` が
+> `RuntimeError: Attempted to send an sync request with an AsyncClient instance.` を送出して**送信前に落ちる**（httpx 0.28.1 で確認）。
+> ファイル読み出しは blocking I/O なので `asyncio.to_thread` に逃がす。170 MB クラスの動画で同期 read を直接回すとイベントループが止まる。
+> 一方 **`Content-Length` を明示すれば `Transfer-Encoding: chunked` は付かない**（`Request._prepare` が「Content-Length があれば transfer-encoding を無視する」と実装済み。同 0.28.1 で確認）。署名付き URL への PUT はこれに依存しているので、ヘッダを外さないこと。
 
 **② `publish_project` — `media_type` は `Video` / `Audio`（先頭大文字）**
 
@@ -258,6 +290,66 @@ Valve `tool_arg_map`（JSON 文字列）で論理引数名 → 実引数名を�
 
 `_coerce_args()`（§5.4）が `spec["parameters"]` の `properties` / `required` と突き合わせ、
 ① Valve の写像を適用 → ② 大文字小文字・アンダースコア差を吸収して再探索 → ③ それでも該当しないキーは**落とす** → ④ `required` の不足を返す。
+
+### 2.5 `prompt_project_agent` に渡す編集プロンプト（Underlord AI Tools 写像）
+
+`prompt_project_agent` は Descript **Underlord** に自然言語を渡すツールで、Underlord 側は
+UI 上の **AI Tools** という名前付き機能の集合として能力を持っている。
+編集プロンプトに**この英語名を完全一致で書くと該当ツールが選ばれる**ため、
+BA 要件（`docs/RequirementDefinition/BA/business_process_architecture.mmd`）を
+散文ではなく **AI Tool 名**へ写像する。
+
+**実装は `descript_pipe.py` のみ**（Action / Filter は編集プロンプトを組み立てない）。
+カタログの正本は同ファイルの `_UNDERLORD_TOOLS`（`group` / `name` / `ja` / `desc_ja` / `hint`）。
+
+#### 要件 → AI Tool → UserValves
+
+| BA 要件                                | Underlord AI Tool                               | UserValves                 | 既定  |
+| -------------------------------------- | ----------------------------------------------- | -------------------------- | ----- |
+| サイレンスカット（無音区間の削除）     | `Shorten word gaps`                             | `enable_silence_cut`       | true  |
+| フィラーカット（言い淀みの削除）       | `Remove filler words`                           | `enable_filler_removal`    | true  |
+| タイムライン自動圧縮（重要度判定）     | `Find highlights`                               | `enable_highlight_packing` | true  |
+| 〃（脱線・無駄話の削除）               | `Edit for clarity`                              | `enable_clarity_edit`      | true  |
+| カット繋ぎ目の最適化（ディレイ）       | `Shorten word gaps` ＋ 自由文の「間」指示       | `enable_silence_cut`       | true  |
+| （言い直しの削除）                     | `Remove retakes`                                | `enable_retake_removal`    | false |
+| 自動テロップ生成 / タイムコード同期    | **AI Tool ではなく Descript 標準機能**。自由文  | `enable_auto_captions`     | true  |
+| 字幕言語が話者と異なる場合             | `Translate`                                     | `caption_language != auto` | —     |
+| オーディオ・コンプレッサー             | `Studio Sound`                                  | `enable_studio_sound`      | true  |
+| ノイズリダクション（環境音除去）       | `Studio Sound`                                  | `enable_studio_sound`      | true  |
+| オート・パン＆ズーム（マルチカメラ風） | `Automatic multicam` ＋ `Center active speaker` | `enable_pan_zoom`          | false |
+| インサート・アセット配置               | `Quick design` ＋ `Generate visuals`            | `enable_broll`             | false |
+
+編集スタイル（`editing_style`）は上に**追加で**ツールを許可する（`_STYLE_TOOLS`）。
+ツール名で表現できない強調点は `_STYLE_CLAUSES` に自由文で持つ。
+
+#### 二層のホワイトリスト
+
+LLM への入力は 2 か所に分かれる。目的が違うので混ぜない。
+
+1. **システムプロンプト**（`_DEFAULT_SYSTEM_PROMPT` / Valve `system_prompt_fallback`）
+   … AI Tools **カタログ全文**を載せる。ユーザが自由文で「背景をぼかして」と書いたときに
+   `Blur speaker background` を正しい綴りで引けるようにするための語彙。
+2. **ユーザメッセージの「使用を許可された AI Tools」**
+   … トグルとスタイルから決まる**そのターンだけの許可リスト**。
+   システムプロンプトは「許可リスト外は、ユーザ指示が明示的に求めた場合のみ」と縛る。
+
+> ⚠️ 許可リストと hints は必ず整合させること。hints に `use Translate ...` を出すなら
+> 許可リストにも `Translate` を入れる。片方だけだと LLM に矛盾した指示を渡すことになる。
+
+#### 🔴 新しいコンポジションを作らせない
+
+Repurpose の **`Create clips` / `Create highlight reel` は新規コンポジションを作る**。
+編集ループは `chat.chat["descript"].composition_id` を追跡して publish するため、
+Underlord が別コンポジションを作ると**プレビューが編集結果と食い違う**。
+
+- 既定のトグル・スタイルからは選ばない（重要度判定は `Find highlights` を使う）
+- システムプロンプトと `_fallback_prompt` の両方に「現在のコンポジションを編集する」制約を書く
+
+#### LLM が使えないときの縮退
+
+`_compose_edit_prompt` が失敗しても編集は止めない。`_fallback_prompt` が hints を
+`;` で連結して決定的に組み立てる。**hints は `_UNDERLORD_TOOLS` の `hint` なので
+この経路でもツール名は保たれる。**
 
 ---
 
@@ -354,13 +446,14 @@ Descript を一度有効化し、ブラウザに表示される同意画面を�
 
 ## 5. 共通ヘルパ正本
 
-以下を **3 ファイルすべてに同一内容でインライン展開**する。Filter は §5.1〜5.3 と 5.9 のみ使用する。
+以下を **3 ファイルすべてに同一内容でインライン展開**する。Filter は §5.1〜5.3 と 5.9・5.10 のみ使用する。
 
 ### 5.0 import 規約
 
 ```python
 import asyncio
 import json
+import logging
 import re
 import time
 from typing import Any, Optional
@@ -544,15 +637,66 @@ def _coerce_args(spec: dict, args: dict, arg_map: Optional[dict] = None) -> tupl
 
 ### 5.5 MCP 呼び出し
 
-```python
+> ⚠️ **`call_tool` は `structuredContent` を返さない。** `MCPClient.call_tool` は `CallToolResult.content` だけを返し、構造化出力は捨てる（`utils/mcp/client.py:117-123`。コード中にも `# TODO: handle outputSchema if needed` とある）。
+> したがって **text ブロックから JSON を取り出すのが唯一の経路**であり、ここが弱いと全操作が静かに壊れる。
+
+> 🔴 **実測（2026-08-03）— text ブロックは「JSON + 人間向けの案内文」で返ってくる。**
+> `import_media` の応答は `type=str size=1159`、中身は `{"job_id": …, "project_id": …, "project_url": …}` で始まるが、**JSON のあとに続きがあるため全体では `json.loads` が失敗**する。
+> 旧実装は失敗時に連結文字列をそのまま返していたため、`_pick(raw, "upload_urls")` が `{}` になり `JOB_FAILED`（アップロード先 URL が返らない）になっていた。**実体を PUT しないので Descript 側には中身が空のメディアだけが残る。**
+> これは `import_media` 固有ではなく**全操作に効く欠陥**で、`list_projects` も str のまま返るため「一覧が常に空 → 毎回新規プロジェクト扱い」も同じ原因。
+> よって「全体が JSON でなければ、**最初に現れる均衡した JSON 値を切り出す**」ところまでを正本とする。
+
+````python
+def _json_from_text(text: str) -> tuple:
+    """テキストから JSON 値を取り出す。戻り値は (値, 取り出し方)。
+
+    取り出せなければ (None, "")。取り出し方は "whole" / "fence" / "embedded"。
+    MCP サーバは JSON の前後に人間向けの説明文を付けることがあるため、
+    全体 parse だけに頼らない（§5.5 冒頭の実測）。
+    """
+    body = (text or "").strip()
+    if not body:
+        return None, ""
+    try:
+        return json.loads(body), "whole"
+    except Exception:
+        pass
+
+    # ```json … ``` で囲んで返す実装
+    fence = re.search(r"```(?:json)?\s*(.+?)```", body, re.S)
+    if fence:
+        try:
+            return json.loads(fence.group(1).strip()), "fence"
+        except Exception:
+            pass
+
+    # 前後に説明文が付いている実装。raw_decode は「値の直後で終わらない」ことを
+    # 許すので、最初の { または [ から均衡する位置までを 1 値として取り出せる。
+    decoder = json.JSONDecoder()
+    for index, char in enumerate(body):
+        if char not in "{[":
+            continue
+        try:
+            value, _end = decoder.raw_decode(body, index)
+        except Exception:
+            continue
+        return value, "embedded"
+    return None, ""
+
+
 def _unwrap_mcp(raw: Any) -> Any:
     """MCPClient.call_tool の戻り値を正規化する。
 
     call_tool は CallToolResult.content（コンテンツブロックの配列）を返す
-    （utils/mcp/client.py:117-123）。text ブロックを連結し、JSON なら parse する。
+    （utils/mcp/client.py:117-123）。structuredContent は捨てられるため、
+    text ブロックから JSON を取り出すのが唯一の経路になる。
     """
     if raw is None or isinstance(raw, dict):
         return raw
+    if isinstance(raw, str):
+        # 文字列で返す実装もありうる。JSON なら開いておく。
+        value, _mode = _json_from_text(raw)
+        return raw if value is None else value
     if not isinstance(raw, list):
         return raw
 
@@ -571,10 +715,15 @@ def _unwrap_mcp(raw: Any) -> Any:
     if not texts:
         return raw
     joined = "\n".join(texts).strip()
-    try:
-        return json.loads(joined)
-    except Exception:
+    value, mode = _json_from_text(joined)
+    if value is None:
+        # JSON がまったく無い＝本当に人間向けの文章だけ。文字列として返す。
+        _log_warn("mcp.unwrap_text_only", length=len(joined), head=joined[:200])
         return joined
+    if mode != "whole":
+        # サーバが JSON に説明文を混ぜている。動作はするが取りこぼしの温床なので残す。
+        _log_warn("mcp.unwrap_mixed", mode=mode, length=len(joined), head=joined[:200])
+    return value
 
 
 def _classify_mcp_error(exc: Exception, tool_name: str) -> DescriptError:
@@ -645,7 +794,7 @@ async def _mcp_call(client, specs_by_name: dict, tool_map: dict, op: str,
         raise _classify_mcp_error(exc, name) from exc
 
     return _unwrap_mcp(raw)
-```
+````
 
 ### 5.6 封筒の詰め／開け
 
@@ -832,6 +981,102 @@ def _redact_signed_urls(text: str, replacement: str = "") -> str:
 > E2E で `publish` を 1 回実行し、返ってきた `download_url` のクエリパラメータを確認すること。該当しなければパターンにその署名パラメータ名を追加する。
 > 誤爆側（過剰マッチ）より取りこぼし側（過小マッチ）のほうが被害が小さいため、意図的にこの方向に倒している。
 
+### 5.10 ロギング（3 ファイル共用）
+
+Functions は Open WebUI のプロセス内で `exec` されるため、**標準ライブラリの `logging` にそのまま乗る**。専用の初期化は不要で、してはいけない。
+
+> ⚠️ **`SRC_LOG_LEVELS` を参照しないこと。** v0.11.0 の `backend/open_webui/env.py:127` では `SRC_LOG_LEVELS = {}`（"Legacy variable, do not remove"）であり、旧来の記事にある `log.setLevel(SRC_LOG_LEVELS["MAIN"])` は **`KeyError` で Function のロードごと失敗する**。
+> 現行の作法はロガーを取るだけ。レベルは `GLOBAL_LOG_LEVEL` が `logging.basicConfig(..., force=True)` で一括設定する（`env.py:107-118`）。
+
+- ロガー名は `logging.getLogger(__name__)` で足りる。Function は `types.ModuleType(f"function_{function_id}")` として `exec` されるため（`backend/open_webui/utils/plugin.py:276`）、`__name__` は `function_descript_pipe` のように **Function ID がそのまま入る**。grep 対象として十分
+- **Uvicorn Workers で複数プロセス / 複数レプリカに分かれる**ため、`chat_id` と `op` が無い行はどのリクエストのものか追えない。イベント名 + `key=value` の 1 行 1 イベント形式に固定する
+- 秘匿情報は §11 の規律をログにも適用する。**Valve の値・アクセストークン・ファイル本体を載せない。** 署名 URL は `_redact_signed_urls`（§5.9）を通す
+- MCP の応答は**型とキーだけ**を DEBUG で出す。本文をそのまま流すとチャンクごとに肥大し、署名 URL の漏洩経路にもなる
+
+```python
+_LOG_VALUE_MAX = 300
+
+# Function は function_<function_id> という名前のモジュールとして exec される
+# （backend/open_webui/utils/plugin.py:276）ので、__name__ がそのまま識別子になる。
+_LOGGER = logging.getLogger(__name__)
+
+
+def _log(level: int, event: str, **fields: Any) -> None:
+    """1 行 1 イベントの構造化ログを出す。
+
+    Open WebUI は stdlib logging を GLOBAL_LOG_LEVEL で一括設定する
+    （backend/open_webui/env.py:107-118）。v0.11.0 の SRC_LOG_LEVELS は
+    空の互換用変数なので参照してはいけない（KeyError になる）。
+
+    Uvicorn Workers で複数プロセスに分かれるため、呼び出し側は chat_id と
+    op を必ず渡すこと。値は署名 URL を伏せ、長すぎるものは切り詰める。
+    ⚠️ Valve の値・アクセストークン・ファイル本体は載せない（§11）。
+    """
+    if not _LOGGER.isEnabledFor(level):
+        return
+    parts = []
+    for key, value in fields.items():
+        if value is None:
+            continue
+        text = _redact_signed_urls(str(value)).replace("\n", " ")
+        if len(text) > _LOG_VALUE_MAX:
+            text = text[:_LOG_VALUE_MAX] + "…"
+        parts.append(f"{key}={text}")
+    _LOGGER.log(level, "descript %s%s", event, (" " + " ".join(parts)) if parts else "")
+
+
+def _log_debug(event: str, **fields: Any) -> None:
+    _log(logging.DEBUG, event, **fields)
+
+
+def _log_info(event: str, **fields: Any) -> None:
+    _log(logging.INFO, event, **fields)
+
+
+def _log_warn(event: str, **fields: Any) -> None:
+    _log(logging.WARNING, event, **fields)
+
+
+def _log_error(event: str, **fields: Any) -> None:
+    _log(logging.ERROR, event, **fields)
+
+
+def _apply_log_level(level: Any) -> None:
+    """Valve のレベルをこの Function のロガーにだけ適用する。
+
+    GLOBAL_LOG_LEVEL を上げると Open WebUI 全体が饒舌になるため、
+    Function 単位で切り替えられるようにする。未知の値は無視する。
+    getLevelNamesMapping は Python 3.11+（本プロジェクトの下限）。
+    """
+    name = str(level or "").strip().upper()
+    if name in logging.getLevelNamesMapping():
+        _LOGGER.setLevel(name)
+
+
+def _ms(started: float) -> int:
+    """time.monotonic() の起点からの経過ミリ秒。"""
+    return int((time.monotonic() - started) * 1000)
+```
+
+**Valve**: 3 ファイルとも `log_level`（既定 `INFO`）を持つ。
+
+> ⚠️ **`_apply_log_level` を `__init__` で呼んではいけない（呼んでも効かない）。**
+> Open WebUI は**呼び出しのたびに `function_module.valves` をインスタンスごと差し替える**（Pipe: `functions.py:61-66` / Action: `utils/actions.py:87` / Filter: `utils/filter.py:113-119`）。
+> `__init__` が読めるのは常に既定値であり、UI で `log_level` を変えても反映されない。
+> **各エントリポイントの先頭**（`Pipe.pipe` / `Action.action` / `Filter.inlet` / `Filter.outlet`）で呼ぶこと。`Filter.stream` はチャンクごとに呼ばれるため対象外（同一リクエストでは先に `inlet` が通る）。
+> これは `self.valves` を読むすべての処理に当てはまる性質であって、ロギング固有の話ではない。
+
+**レベルの使い分け**:
+
+| レベル    | 出すもの                                                                         |
+| --------- | -------------------------------------------------------------------------------- |
+| `INFO`    | 進捗の節目（Action 起動 / RPC 開始・終了 / MCP ツール呼び出し / ジョブ状態遷移） |
+| `DEBUG`   | 引数キー一覧、MCP 応答の型とキー、フォームの往復                                 |
+| `WARNING` | 想定外だが処理を続けられる分岐（`upload_urls` 欠落、部分失敗、ツール未解決）     |
+| `ERROR`   | 封筒 `ok=False` として返す直前の 1 回だけ。同じ失敗を二重に出さない              |
+
+**イベント名は固定文字列**にする（`pipe.start` / `mcp.call` / `mcp.result` / `job.tick` / `import.upload_urls` / `action.start` / `rpc.done` / `filter.inlet` など）。可変文字列を混ぜると grep できなくなる。
+
 ---
 
 ## 6. HTML テンプレート正本
@@ -844,17 +1089,45 @@ def _redact_signed_urls(text: str, replacement: str = "") -> str:
 await __event_emitter__({"type": "embeds", "data": {"embeds": [html], "replace": True}})
 ```
 
+🔴 **embeds を送ったら、続けて最下部へのピン留めを送ること（§6.0.1）。** 送らないとチャットが最下部に戻らない。
+
 ### 6.0 共通フッタ（全テンプレートの末尾に入れる）
+
+🔴 **高さの測り方を変えてはいけない。iframe 自身の高さに依存する値で測ると無限に伸びる。**
+
+`document.documentElement.scrollHeight` は**ビューポート高（＝親が設定した iframe の高さ）を下回らない**。親はその値を iframe の高さに設定するので、報告値に定数を足すと
+
+```
+親が高さを H にする → 中の scrollHeight が H になる → H + 24 を報告 → 親が H + 24 にする → …
+```
+
+と 1 サイクルごとに +24px 増え続ける。ResizeObserver は毎フレーム発火するので **毎秒約 1,200px** で伸びる。実測（本番のチャットを Playwright で観測）: iframe の高さ 45,008px、増加率 1,196 px/秒、`scrollTop` は 189 のまま `scrollHeight` だけが伸び続ける。これが「チャットが最下部に行かず徐々に上へずれる」の正体で、**§6.0.1 のピン留めでは直せない**（最下部が毎秒 1,200px 逃げていくため）。
+
+守ること:
+
+1. **測るのは `document.body` の内容高**（`getBoundingClientRect().height`）。body の高さは iframe の高さに依存しないので閉じている。`documentElement.scrollHeight` は使わない。
+2. **報告値に定数を足さない。** 測定値へ入力が戻る系に定数を足すと必ず発散する。余白が要るなら CSS 側（`.wrap` の padding）で確保する。
+3. **前回と同じ値なら送らない**（2px 未満の差は無視）。残ったループを断ち切る保険。
+4. `ResizeObserver` は `document.body` を観測する。
+
+同じ理由で、**テンプレート内で `vh` 単位を使うときは注意**する。iframe の高さは自分で決めているので `70vh` のような指定は循環参照になる。係数が 1 未満なら収束するが、上記 2 を破ると一気に発散側へ倒れる。
 
 ```python
 _HEIGHT_JS = """
 <script>
 (function () {
-  function report() {
-    parent.postMessage(
-      { type: 'iframe:height', height: document.documentElement.scrollHeight + 24 }, '*');
+  var last = -1;
+  function measure() {
+    var b = document.body;
+    return b ? Math.ceil(b.getBoundingClientRect().height) : 0;
   }
-  try { new ResizeObserver(report).observe(document.documentElement); } catch (e) {}
+  function report() {
+    var h = measure();
+    if (h <= 0 || Math.abs(h - last) < 2) return;
+    last = h;
+    parent.postMessage({ type: 'iframe:height', height: h }, '*');
+  }
+  try { new ResizeObserver(report).observe(document.body); } catch (e) {}
   addEventListener('load', report);
   addEventListener('resize', report);
   setTimeout(report, 100);
@@ -906,6 +1179,82 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 1
 
 > `embeds` の要素が `http://` / `https://` / `//` で始まると **URL とみなされ iframe の src** になる（`FullHeightIframe.svelte:52`）。生 HTML を渡すときは必ず `<!doctype html>` で始めること。
 
+### 6.0.1 `_SCROLL_BOTTOM_JS` — embeds 直後の最下部ピン留め
+
+**症状**: Functions 終了後、チャットが最下部に行かず、時間とともに最下部から遠ざかる。
+
+**原因**: 上流は `embeds` 受信の **100 ms 後**に `scrollIntoView({behavior:'smooth', block:'center'})` を実行する（`Chat.svelte:1012-1017`）。ところがこの時点でレイアウトは確定していない。
+
+1. iframe は sandbox（`allow-same-origin` 既定 off）なので、`resizeSameOrigin()` は例外で抜け、**高さは §6.0 `_HEIGHT_JS` の `postMessage` でしか決まらない**（`FullHeightIframe.svelte:144-163`）。その報告は `load` / **100 ms** / **600 ms** / `ResizeObserver`（`<video>` のメタデータ読み込み等）と後から続く。
+2. さらにメッセージは `content-visibility: auto; contain-intrinsic-size: auto 150px`（`Message.svelte:155-156`）なので、画面外メッセージの高さは**推定値**であり、`scrollHeight` 自体が確定していない。上流の `scrollToBottom` が rAF を 3 段重ねているのはこの補正のため（`Chat.svelte:2110-2131`）。
+3. `block: 'center'` は元々最下部を指していない。embeds の下には操作ボタン列と `bottomPadding` がある。
+
+実測（上記構造を最小再現し Chrome headless で計測）: 現状は最下部から **839 px** 手前で停止。ピン留めを入れると **0 px**。
+
+**対処**: `execute` イベント（`Chat.svelte:1103-1116`）で親ウィンドウの JS を実行し、高さが確定するまで `#messages-container` を最下部へ寄せ直す。`__event_emitter__` と `__event_call__` は同じ `events` チャンネル → 同じ `chatEventHandler` に届く（`socket/main.py:986` / `:1112`）ため、**`execute` は emitter でも動く**。応答を待つ必要はないので必ず emitter を使う（`__event_call__` にすると 300 秒ハングの経路を増やすだけ）。
+
+**待ち方は時間ではなく状態で決める。** 高さ報告がいつ終わるかは `<video>` のメタデータ取得やネットワーク次第で、固定の待ち時間では足りたり足りなかったりする。`scrollHeight` が変化しなくなるまでピン留めし、上限だけ時間で切る。
+
+```python
+_SCROLL_BOTTOM_JS = """
+const TAG = '[descript:scroll]';
+const el = document.getElementById('messages-container');
+if (!el) {
+  console.warn(TAG, 'no #messages-container');
+} else {
+  let stop = false;
+  const abort = (e) => { stop = true; console.log(TAG, 'aborted by ' + e.type); };
+  el.addEventListener('wheel', abort, { passive: true, once: true });
+  el.addEventListener('touchstart', abort, { passive: true, once: true });
+  const gap = () => el.scrollHeight - el.scrollTop - el.clientHeight;
+  console.log(TAG, 'start gap=' + gap() + ' h=' + el.scrollHeight);
+  const t0 = Date.now();
+  let lastH = -1;
+  let stable = 0;
+  const iv = setInterval(() => {
+    if (stop) { clearInterval(iv); return; }
+    el.scrollTop = el.scrollHeight;
+    if (el.scrollHeight === lastH) { stable += 1; } else { stable = 0; lastH = el.scrollHeight; }
+    const over = Date.now() - t0 > 15000;
+    if (stable >= 12 || over) {
+      clearInterval(iv);
+      el.scrollTop = el.scrollHeight;
+      console.log(TAG, 'end gap=' + gap() + ' h=' + el.scrollHeight +
+                  ' ms=' + (Date.now() - t0) + (over ? ' (timeout)' : ''));
+    }
+  }, 80);
+}
+"""
+
+
+async def _emit_scroll_bottom(event_emitter) -> None:
+    """embeds 直後にチャットを最下部へ寄せ直す（契約書 §6.0.1）。"""
+    if event_emitter is None:
+        return
+    try:
+        await event_emitter({"type": "execute", "data": {"code": _SCROLL_BOTTOM_JS}})
+    except Exception:
+        pass
+```
+
+- 終了条件は「`scrollHeight` が **12 tick（約 1 秒）**変わらないこと」。上限 15 秒は保険であって設計値ではない。固定の待ち時間にしないのは、高さ報告がいつ終わるかが `<video>` のメタデータ取得とネットワーク次第だから。
+- **`console.log('[descript:scroll] …')` は残すこと。** 上流の `execute` は `catch` が空で、投げた JS が失敗しても**画面にもサーバログにも何も出ない**（配信バンドルで確認: `catch($e){}`）。効いているかを外から確かめる手段がこれしかない。
+- ユーザが `wheel` / `touchstart` で自分でスクロールしたら即座に降りる。ユーザ操作と綱引きしない。
+- **embeds が空配列のときは送らない。** 打ち消し用の `replace: True, embeds: []` でスクロールを動かす理由がない。
+- `execute` は `Chat.svelte:964` の `if (message)` の内側にあるため、`message_id` が history に存在しないと**無視される**。§1.1 のとおり Action の `body['id']` を再利用していることが前提。
+
+### 6.0.2 🔴 embeds 内のリンクで外部サイトを開かせない
+
+**症状**: 埋め込みカードの「Descript で開く」を押すと、タブは開くのにアプリが表示されない。ブラウザ拡張が `Failed to connect to MetaMask / extension not found` を投げることがある。
+
+**原因**: 埋め込み iframe の `sandbox` は `allow-scripts allow-forms allow-popups allow-downloads`（`allow-same-origin` は設定次第）で、**`allow-popups-to-escape-sandbox` が無い**（配信バンドルで確認）。HTML 仕様上、`allow-popups-to-escape-sandbox` が無い sandbox から開いた新規ウィンドウは**同じ sandbox フラグを引き継ぐ**。結果、`https://web.descript.com/...` は**オリジンが `null`（opaque）**の状態で読み込まれ、Cookie も `localStorage` も使えないので SPA が起動しない。拡張の `inpage.js` が「見つからない」と言うのも、opaque オリジンでは拡張のブリッジが張れないため。原因ではなく**症状**である。
+
+**対処**: 外部サイトへのリンクは **iframe の中に置かない**。トップドキュメント側、すなわち**アシスタントメッセージ本文の Markdown リンク**として出す。メッセージ本文は Open WebUI 本体が描画するので sandbox の影響を受けない。
+
+- **カード（embeds）内に外部サイトへの導線を置かない。** `project_url` も `share_url` も descript.com なので同じ理由で開けない。押しても動かないボタンを残さない。Pipe は結果 `data` に `project_url` を必ず載せ、Action はそれを `- [Descript で開く](...)` / `- [共有リンク](...)` として本文に書く。テンプレートに `app_url` / `app_link` / `share_url` を渡さないこと。
+- 例外は **`download_url`（署名付きの直リンク）** のみ。ファイルのダウンロードは `allow-downloads` で通り、SPA の起動を伴わないため sandbox の影響を受けない。かつ期限付きなので本文には載せられず、カード内に置くしかない。
+- ユーザ設定 `iframeSandboxAllowSameOrigin` を有効にすればカード内のボタンも通るが、これは **srcdoc の iframe が親オリジンを名乗れる**ようになる設定で、埋め込み HTML から `localStorage` のトークンに手が届く。既定 off のまま運用する。
+
 ### 6.1 `_PLAYER` — publish 結果のプレビュー
 
 ```python
@@ -915,15 +1264,13 @@ _PLAYER = """<!doctype html><html lang="ja"><head><meta charset="utf-8">
   <p class="h">{{title}}</p>
   <video src="{{src}}" controls playsinline preload="metadata"
          style="width:100%;max-height:70vh;border-radius:10px;background:#000;display:block"></video>
-  <div class="row">
-    <a class="btn primary" href="{{app_url}}" target="_blank" rel="noopener">Descript で開く</a>
-    <a class="btn" href="{{share_url}}" target="_blank" rel="noopener">共有リンク</a>
-  </div>
   <p class="muted" style="margin:10px 0 0">rev {{revision}} ・ {{note}}</p>
 </div></div>{{height_js}}</body></html>"""
 ```
 
-差し込み: `_render(_PLAYER, css=_BASE_CSS, height_js=_HEIGHT_JS, title=_esc(...), src=..., app_url=..., share_url=..., revision=..., note=_esc(...))`
+差し込み: `_render(_PLAYER, css=_BASE_CSS, height_js=_HEIGHT_JS, title=_esc(...), src=..., revision=..., note=_esc(...))`
+
+**カードは再生と情報表示だけを担う。** `app_url` も `share_url` もテンプレートに渡さない。どちらも descript.com への遷移で、sandbox を引き継いだタブでは開けない（§6.0.2）。外部サイトへの導線は**メッセージ本文の Markdown リンク**が正。
 
 `src` に `download_url` を使う場合、**期限切れになるため state には保存しない**（表示のその場限り）。`share_url` は恒久リンクなので保存してよい。
 
@@ -969,7 +1316,6 @@ _EDIT_LOOP_FORM = """<!doctype html><html lang="ja"><head><meta charset="utf-8">
   <div class="row">
     <button class="btn primary" type="button" data-act="revise">この指示で再編集</button>
     <button class="btn" type="button" data-act="confirm">これで確定する</button>
-    <a class="btn" href="{{app_url}}" target="_blank" rel="noopener">Descript で開く</a>
   </div>
   <p class="muted" style="margin:10px 0 0">rev {{revision}} / 残り {{remaining}} 回</p>
 </div></div>
@@ -999,12 +1345,12 @@ _EDIT_LOOP_FORM = """<!doctype html><html lang="ja"><head><meta charset="utf-8">
 
 ## 7. タイムアウトの規律
 
-| 制約             | 値                                                                               | 対処                                                                                                                                                                                   |
-| ---------------- | -------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `__event_call__` | `WEBSOCKET_EVENT_CALLER_TIMEOUT` 既定 300 秒                                     | フォームは短時間で閉じるものだけに使う。`confirm_timeout_sec`（既定 240）を上限とし、**`asyncio.wait_for` では包まない**（socket の ack を壊す）。戻り値の `{"error": ...}` で判定する |
-| Action の HTTP   | リバースプロキシ依存（nginx `proxy_read_timeout` 既定 60 秒、Vercel の関数上限） | `action_soft_timeout_sec`（既定 45）を超えそうな処理は Action を早期 return し、以降は Pipe ＋ embeds フォームで継続                                                                   |
-| MCP 初期化       | `MCP_INITIALIZE_TIMEOUT` 既定 10 秒                                              | `mcp_connect_retries` 回だけ指数バックオフで再試行                                                                                                                                     |
-| Descript ジョブ  | 不定                                                                             | `_poll_job` の `poll_timeout_sec`（既定 900）。超過しても**ジョブは中断せず** `job_id` を state に保存する                                                                             |
+| 制約             | 値                                                                                                                                                                                     | 対処                                                                                                                                                                                   |
+| ---------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `__event_call__` | `WEBSOCKET_EVENT_CALLER_TIMEOUT`。**未設定なら無期限**（`env.py:502-510` で `None` になり、`socket/main.py:1119` の `sio.call(timeout=None)` は待ち続ける）。値が不正なときだけ 300 秒 | フォームは短時間で閉じるものだけに使う。`confirm_timeout_sec`（既定 240）を上限とし、**`asyncio.wait_for` では包まない**（socket の ack を壊す）。戻り値の `{"error": ...}` で判定する |
+| Action の HTTP   | リバースプロキシ依存（nginx `proxy_read_timeout` 既定 60 秒、Vercel の関数上限）                                                                                                       | `action_soft_timeout_sec`（既定 45）を超えそうな処理は Action を早期 return し、以降は Pipe ＋ embeds フォームで継続                                                                   |
+| MCP 初期化       | `MCP_INITIALIZE_TIMEOUT` 既定 10 秒                                                                                                                                                    | `mcp_connect_retries` 回だけ指数バックオフで再試行                                                                                                                                     |
+| Descript ジョブ  | 不定                                                                                                                                                                                   | `_poll_job` の `poll_timeout_sec`（既定 900）。超過しても**ジョブは中断せず** `job_id` を state に保存する                                                                             |
 
 ### 順序の原則（この順を守る）
 
@@ -1149,10 +1495,10 @@ requirements:
 
 ### 12.1 未解決
 
-| 項目 | 状況 | 実装での扱い |
-| --- | --- | --- |
-| ローカルファイルの直接アップロード | `import_media` は `add_media` に `content_type` / `file_size` を渡すと `upload_urls` を返し、そこへ `Content-Type: application/octet-stream` で PUT する方式（§2.0.1 ①）。**Open WebUI に保存されたファイルの実体を Function から読む手段**が未確認（`STORAGE_PROVIDER=s3` 構成を含む） | 読めるなら `httpx.AsyncClient` で PUT する。読めないなら `file_id` 経路は明確なエラーにして URL 指定に誘導する。PUT 失敗時は `report_upload_status` で import ジョブを解放する |
-| `publish_project` の `resolution` | probe のツール説明に記載が無い。REST API 側（`descript_api.json`）には `480p`〜`4K` の enum が存在する | 渡さない方向に倒す。`_coerce_args` がスキーマに無いキーを落とすため実害は無い |
-| Descript の `download_url` の署名方式 | AWS SigV4 / GCS のどちらでもない独自方式の可能性がある | §5.9 の注記を参照。E2E で 1 回クエリパラメータを実見して確認する |
-| `WEBUI_URL` を HTTPS 公開 URL にする必要性 | Descript の IdP（Stytch）は confidential client に **HTTPS かつ非 loopback** の redirect URI を要求する。`http://localhost:8080` では動的クライアント登録（DCR）が 400 で失敗する | `WEBUI_URL` を公開 HTTPS URL にする（トンネル or 実ドメイン）。**PersistentConfig なので `.env` ではなく Admin Panel → Settings → General で変更する**（`models/config.py` の `seed_defaults` は既存の DB 値を優先する） |
-| `gpt-realtime-2.1` の接続方法 | Open WebUI v0.11.0 に該当する設定項目が存在しない | `.env.example` に注記のみ。使うなら別途 Pipe Function として実装が必要 |
+| 項目                                                              | 状況                                                                                                                                                                                                       | 実装での扱い                                                                                                                                                                                                             |
+| ----------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| ~~ローカルファイルの直接アップロード~~ **解決済み（2026-08-03）** | `Files.get_file_by_id` → `Storage.get_file` で実体パスを解決できることを実機で確認（`MinIO` 構成で 170MB の `.mov`、`content_type=video/quicktime`）。`import_media` が `upload_urls` を返すことも確認済み | `_resolve_stored_file` で解決し、`httpx.AsyncClient` に**非同期**ジェネレータで PUT する（§2.0.1 ① の 🔴 注記）。PUT 失敗時は `report_upload_status` で import ジョブを解放する                                          |
+| `publish_project` の `resolution`                                 | probe のツール説明に記載が無い。REST API 側（`descript_api.json`）には `480p`〜`4K` の enum が存在する                                                                                                     | 渡さない方向に倒す。`_coerce_args` がスキーマに無いキーを落とすため実害は無い                                                                                                                                            |
+| Descript の `download_url` の署名方式                             | AWS SigV4 / GCS のどちらでもない独自方式の可能性がある                                                                                                                                                     | §5.9 の注記を参照。E2E で 1 回クエリパラメータを実見して確認する                                                                                                                                                         |
+| `WEBUI_URL` を HTTPS 公開 URL にする必要性                        | Descript の IdP（Stytch）は confidential client に **HTTPS かつ非 loopback** の redirect URI を要求する。`http://localhost:8080` では動的クライアント登録（DCR）が 400 で失敗する                          | `WEBUI_URL` を公開 HTTPS URL にする（トンネル or 実ドメイン）。**PersistentConfig なので `.env` ではなく Admin Panel → Settings → General で変更する**（`models/config.py` の `seed_defaults` は既存の DB 値を優先する） |
+| `gpt-realtime-2.1` の接続方法                                     | Open WebUI v0.11.0 に該当する設定項目が存在しない                                                                                                                                                          | `.env.example` に注記のみ。使うなら別途 Pipe Function として実装が必要                                                                                                                                                   |
