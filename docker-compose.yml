@@ -6,6 +6,7 @@
 #   Redis                    … 共有状態ストア / WebSocket マネージャ
 #   MinIO                    … 共有ファイルストレージ（S3 互換）
 #   Open WebUI               … アプリ本体
+#   Open Terminal            … AI がコマンドを実行する作業環境（PWA 内のターミナル / ファイルブラウザ）
 #
 # 起動:
 #   cp .env.example .env  で値を埋めてから
@@ -136,6 +137,96 @@ services:
     networks: [svc-net]
 
   # ----------------------------------------------------------------------------
+  # Open Terminal（AI の実行環境）
+  # ----------------------------------------------------------------------------
+  # Open WebUI 本体に足りない「実際に手を動かす場所」を提供するコンポーネントです。
+  # 接続するとチャットのサイドバーにファイルブラウザとターミナルが現れ、
+  # モデルがコマンド実行・ファイル読み書きをツールとして呼べるようになります。
+  #
+  # ⚠️ Functions（Actions / Pipes / Filters）とは別レイヤです。
+  #    動画編集そのものを Descript に委譲する方針は変わりません。
+  #    ここは FCPXML の検査、ffprobe での尺・コーデック確認、中間ファイルの
+  #    加工といった「手元でファイルを触る」作業のための実行環境です。
+  #
+  # ⚠️ ホストにポートを公開していません。
+  #    ブラウザからのアクセスは常に Open WebUI のバックエンド経由
+  #    （/api/v1/terminals/{server_id}/...）でプロキシされるため、
+  #    API キーがブラウザに渡りません。これが admin 接続を使う理由です。
+  open-terminal:
+    # latest は約 4GB。Node.js / Python / コンパイラ / ffmpeg / Docker CLI 入りで、
+    # sudo による追加インストールとマルチユーザにも対応します。
+    # :slim（約 430MB）/ :alpine（約 230MB）は git・curl・jq のみで、
+    # ffmpeg も sudo も入りません。本プロジェクトの用途では latest を選びます。
+    image: ghcr.io/open-webui/open-terminal:latest
+    container_name: svc-open-terminal
+    restart: unless-stopped
+    environment:
+      # 認証キー。v0.11.30 以降は未設定だと起動を拒否します。
+      # ⚠️ 下の open-webui 側 TERMINAL_SERVER_CONNECTIONS の "key" と
+      #    必ず同じ値になるようにしてください（どちらも同じ .env 変数を参照）。
+      OPEN_TERMINAL_API_KEY: ${OPEN_TERMINAL_API_KEY:?OPEN_TERMINAL_API_KEY を .env に設定してください}
+
+      # 既定値の * は全オリジン許可で、起動時に警告が出ます。
+      # 実際の通信は Open WebUI のバックエンド経由なので、公開 URL だけで足ります。
+      OPEN_TERMINAL_CORS_ALLOWED_ORIGINS: ${WEBUI_URL:-http://localhost:8080}
+
+      # 同時ターミナルセッション数の上限（既定 16）。
+      OPEN_TERMINAL_MAX_SESSIONS: ${OPEN_TERMINAL_MAX_SESSIONS:-16}
+
+      # コマンド出力を待つ秒数。既定は「未設定 = 無期限に待つ」なので必ず入れます。
+      # ffmpeg のエンコードが走る想定で長めにしています。
+      OPEN_TERMINAL_EXECUTE_TIMEOUT: ${OPEN_TERMINAL_EXECUTE_TIMEOUT:-600}
+
+      # 「この環境に何が入っているか」をモデルに伝える説明文。
+      # ツールの description に載るので、責務の線引きもここで示しておきます。
+      OPEN_TERMINAL_EXECUTE_DESCRIPTION: >-
+        ショート動画作成ツールの作業用ターミナルです。ffmpeg / ffprobe / Python /
+        Node.js / git が利用できます。FCPXML の検査、動画の尺・コーデック確認、
+        中間ファイルの加工に使ってください。実際の動画編集は Descript 側が
+        担当するため、ここで編集そのものを行わないでください。
+
+      # ファイルブラウザのルート。home = /home/user（既定）。
+      # 明示パス（/workspace 等）や filesystem（ルート全体）も指定できますが、
+      # filesystem はコンテナ全体が見えるようになるため使いません。
+      OPEN_TERMINAL_FILE_BROWSER_ROOT: home
+
+      # 起動のたびに再インストールされる追加パッケージ（Docker イメージ限定）。
+      # 数が増えるならカスタムイメージを作ってください。
+      # OPEN_TERMINAL_PACKAGES: ""
+      # OPEN_TERMINAL_PIP_PACKAGES: ""
+      # OPEN_TERMINAL_NPM_PACKAGES: ""
+
+      # egress ファイアウォール。設定するとここに挙げたドメイン以外へ出られません。
+      # パッケージ導入だけ許して情報の持ち出しを塞ぎたい場合に有効です。
+      # OPEN_TERMINAL_ALLOWED_DOMAINS: "pypi.org,files.pythonhosted.org,github.com,*.npmjs.org"
+    volumes:
+      # 作業ファイルの永続化。このボリュームを消すと AI の作業結果も消えます。
+      - open-terminal-data:/home/user
+    # 暴走したスクリプトがホストを食い潰さないための上限。
+    # 超過すると CPU はスロットル、メモリは OOM kill されます。
+    deploy:
+      resources:
+        limits:
+          memory: ${OPEN_TERMINAL_MEMORY_LIMIT:-2G}
+          cpus: "${OPEN_TERMINAL_CPU_LIMIT:-2.0}"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8000/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    #
+    # 検証時に直接叩きたい場合のみ有効化してください（http://localhost:8000/docs）。
+    # 常用すると API キーを知っている誰でもコマンドを実行できる口になります。
+    # ports:
+    #   - "${OPEN_TERMINAL_PORT:-8000}:8000"
+    #
+    # ⚠️ svc-net には載せません。載せると、このコンテナから postgres / redis /
+    #    minio にホスト名で直接到達できてしまいます。open-webui とだけ
+    #    通じる専用ネットワークに閉じ込めます。
+    networks: [svc-terminal-net]
+
+  # ----------------------------------------------------------------------------
   # Open WebUI
   # ----------------------------------------------------------------------------
   open-webui:
@@ -158,6 +249,12 @@ services:
         condition: service_healthy
       minio:
         condition: service_healthy
+      # ⚠️ service_healthy にしていません。
+      #    open-terminal は約 4GB のイメージで初回 pull と起動に時間がかかります。
+      #    ターミナルが落ちていてもチャット本体は使えるべきなので、
+      #    起動を待たない service_started にしています。
+      open-terminal:
+        condition: service_started
     env_file:
       - .env
     environment:
@@ -179,6 +276,36 @@ services:
       #      (b) 別途 init コンテナ / ジョブでマイグレーションを実行する
       #    Kubernetes では initContainer か Job を使ってください。
       ENABLE_DB_MIGRATIONS: ${ENABLE_DB_MIGRATIONS:-true}
+      #
+      # Open Terminal の接続定義。管理画面（Admin Settings → Integrations →
+      # Open Terminal）で手作業登録する代わりに、起動時に流し込みます。
+      #
+      # ⚠️ 見落とすと沈黙して壊れる 3 点（v0.11.0 の実ソースで確認）:
+      #   ① config.py:386 の json.loads には try/except がありません。
+      #      TOOL_SERVER_CONNECTIONS（config.py:372）は例外を握り潰しますが、
+      #      こちらは JSON が壊れていると import 時に落ちて起動できません。
+      #   ② PersistentConfig 相当です。DEFAULT_CONFIG（config.py:2800）経由で
+      #      Config.seed_defaults() に渡されますが、この関数は
+      #      「DB に無いキーだけ INSERT」します（models/config.py:256）。
+      #      つまり取り込まれるのは初回起動時だけで、2 回目以降は
+      #      Admin Settings の値が正になります。ここを変えて反映したい場合は
+      #      管理画面で操作するか、DB の terminal_server.connections を消して再起動。
+      #   ③ access_grants が空 / 未指定だと「管理者のみ」になります
+      #      （utils/access_control/__init__.py:167）。公式ドキュメントの
+      #      direct connection の例は [] なので、そのまま写すと一般ユーザに
+      #      ターミナルが見えません。全員に開くには principal_id "*" の
+      #      read grant が要ります（utils/access_control/__init__.py:140）。
+      #      特定グループに絞る場合は
+      #        {"principal_type": "group", "principal_id": "<group_id>", "permission": "read"}
+      #
+      # ⚠️ 折り畳みブロック（>-）の中は必ず同じインデントに揃えてください。
+      #    深いインデントの行があると YAML が改行を保持してしまいます。
+      TERMINAL_SERVER_CONNECTIONS: >-
+        [{"id": "open-terminal", "name": "作業用ターミナル",
+        "url": "http://open-terminal:8000", "key": "${OPEN_TERMINAL_API_KEY}",
+        "auth_type": "bearer", "enabled": true,
+        "config": {"access_grants":
+        [{"principal_type": "user", "principal_id": "*", "permission": "read"}]}}]
     ports:
       - "${OPEN_WEBUI_PORT:-8080}:8080"
     volumes:
@@ -190,14 +317,27 @@ services:
       timeout: 10s
       retries: 5
       start_period: 60s
-    networks: [svc-net]
+    # svc-terminal-net にも参加します。open-terminal へ到達できるのは
+    # このサービスだけです（open-terminal は svc-net に載せていません）。
+    networks: [svc-net, svc-terminal-net]
 
 volumes:
   postgres-data:
   redis-data:
   minio-data:
   open-webui-data:
+  open-terminal-data:
 
 networks:
   svc-net:
     driver: bridge
+
+  # Open WebUI ↔ Open Terminal 専用。データ層（postgres / redis / minio）を
+  # ターミナルから見えなくするために分けています。
+  svc-terminal-net:
+    driver: bridge
+    # ⚠️ internal: true にすると open-terminal は外部へ一切出られなくなります。
+    #    最も安全ですが、pip install / npm install / git clone も不可になります。
+    #    「多少は外に出したい」場合は internal は使わず、open-terminal 側の
+    #    OPEN_TERMINAL_ALLOWED_DOMAINS でドメインを絞ってください。
+    # internal: true

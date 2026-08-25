@@ -30,6 +30,7 @@ flowchart LR
         direction LR
         subgraph Vercel Compute
             open-webui@{ img: "https://work-kameya-public.s3.ap-northeast-1.amazonaws.com/open-web-ui.png", label: "Open WebUI", w: 60, h: 60, constraint: "on" }
+            open-terminal@{ img: "https://api.iconify.design/mdi:console.svg", label: "Open Terminal", w: 60, h: 60, constraint: "on" }
         end
 
     end
@@ -56,6 +57,7 @@ flowchart LR
     open-webui <--> |ベクトル検索| pgvector
     open-webui <--> |WebSocket セッション共有| redis
     open-webui <--> |アップロード動画の共有ストレージ| minio
+    open-webui <--> |コマンド実行 / ファイル操作（バックエンドがプロキシ）| open-terminal
     
     
     
