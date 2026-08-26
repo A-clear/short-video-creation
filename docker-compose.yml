@@ -7,6 +7,7 @@
 #   MinIO                    … 共有ファイルストレージ（S3 互換）
 #   Open WebUI               … アプリ本体
 #   Open Terminal            … AI がコマンドを実行する作業環境（PWA 内のターミナル / ファイルブラウザ）
+#   Open WebUI Computer      … 実マシン相当のエージェントワークスペース（独立 PWA + gateway）
 #
 # 起動:
 #   cp .env.example .env  で値を埋めてから
@@ -227,6 +228,103 @@ services:
     networks: [svc-terminal-net]
 
   # ----------------------------------------------------------------------------
+  # Open WebUI Computer（cptr）
+  # ----------------------------------------------------------------------------
+  # 「実マシンをブラウザに出す」コンポーネントです。ファイル・エディタ・ターミナル・
+  # git に加えて、独自のエージェントランタイム（承認モード / サブエージェント /
+  # スキル / スケジュール実行）を持ちます。
+  #
+  # ⚠️ Open Terminal とは別物です。役割の線引き:
+  #    - Open Terminal … Open WebUI の中の「手」。バックエンドがプロキシする部品で、
+  #                      チャットのサイドバーに出る。使い捨ての作業環境。
+  #    - Computer      … 独立した 1 つのアプリ。自前のログイン・自前の PWA を持ち、
+  #                      作業が継続する常設ワークスペース。Open WebUI からは
+  #                      gateway 経由で `cptr/<workspace>` というモデルとして見える。
+  #
+  # ⚠️ Open Terminal と違い、ホストへのポート公開が必須です。
+  #    Computer は Open WebUI のバックエンドを経由せず、ブラウザが直接 Socket.IO で
+  #    つなぎに行くためです。「隠す」ことはできないので、代わりに
+  #    ①ネットワークをデータ層から切り離す ②公開先を絞る、で守ります。
+  #
+  # ⚠️ セキュリティモデルは「サインインしたユーザ = SSH 相当の全権」。
+  #    ユーザ間の分離はありません。境界はマウントしたディレクトリだけです。
+  #    生の公開インターネットには出さないでください（Tailscale / 認証付き
+  #    リバースプロキシの内側に置く）。
+  open-webui-computer:
+    # :latest が安定版、:dev が main 追従。ここは :latest を選びます。
+    # イメージは全オプション機能群を同梱しているため extras の指定は不要です。
+    image: ghcr.io/open-webui/computer:latest
+    container_name: svc-open-webui-computer
+    restart: unless-stopped
+    environment:
+      # イメージ側で既に /data に設定済みですが、下の volume と対応させるため明示します。
+      # DB（SQLite）・config.toml・アップロード・ログが全部ここに入ります。
+      CPTR_DATA_DIR: /data
+
+      CPTR_LOG_LEVEL: ${OPEN_WEBUI_COMPUTER_LOG_LEVEL:-INFO}
+      # 収集基盤に流す前提で JSON にしておきます（text も可）。
+      CPTR_LOG_FORMAT: json
+
+      # 既定は NONE（監査ログ無し）。SSH 相当の権限を持つ面なので METADATA 以上を推奨。
+      # METADATA = 変更系リクエストの記録 / REQUEST = リクエストボディ（マスク済み）も記録。
+      # ⚠️ 端末の全操作ログではありません。あくまで API レベルの記録です。
+      CPTR_AUDIT_LOG_LEVEL: ${OPEN_WEBUI_COMPUTER_AUDIT_LOG_LEVEL:-METADATA}
+
+      # 既定の * は全オリジン許可。Computer 自身の公開 URL と Open WebUI の URL に絞ります。
+      # ⚠️ カンマ区切りです（Open Terminal はセミコロン区切りではない点も含めて別仕様）。
+      CPTR_CORS_ALLOWED_ORIGINS: ${OPEN_WEBUI_COMPUTER_URL:-http://localhost:8001},${WEBUI_URL:-http://localhost:8080}
+
+      # run_command が「返る」までの秒数。既定は未設定 = コマンドは走り続けたまま即返る。
+      # ffmpeg のエンコードを待たせたいので明示します。
+      CPTR_EXECUTE_TIMEOUT: ${OPEN_WEBUI_COMPUTER_EXECUTE_TIMEOUT:-600}
+
+      # Web 検索。キー未設定だと DuckDuckGo にフォールバックします。
+      # 優先順は Exa → Perplexity → Tavily → Brave → Firecrawl → SearXNG → DuckDuckGo。
+      # EXA_API_KEY / PERPLEXITY_API_KEY を入れると Tavily より先に使われるので入れないこと。
+      TAVILY_API_KEY: ${TAVILY_API_KEY:-}
+
+      # ⚠️ LLM プロバイダ（OpenAI / Anthropic）は環境変数で設定できません。
+      #    Computer 側の Settings → Admin → Connections で登録します。
+      #    本プロジェクトの選定モデルは .env.example の「Open WebUI Computer」節を参照。
+    volumes:
+      # アプリ状態。named volume にしています。
+      # ⚠️ ホストディレクトリを /data に bind mount すると、SQLite が app.db を
+      #    作れずに起動失敗します（ホスト側の所有者がイメージの設定を上書きするため）。
+      - open-webui-computer-data:/data
+      # 作業領域。UI から「ワークスペース」として追加するのはこのパスです。
+      - open-webui-computer-workspace:/workspace
+      #
+      # ホストの実プロジェクトを触らせたい場合はここに足します（マウントした分だけが境界）。
+      # ⚠️ gateway 経由の実行は全ツール自動承認なので、書き込み可でマウントする範囲は
+      #    「エージェントに勝手に触られてよい」ものだけにしてください。
+      # - ./docs:/workspace/docs
+      # - ./functions:/workspace/functions
+    ports:
+      # ⚠️ Open Terminal と違い、これはコメントアウトできません。
+      #    ブラウザが直接この口に来ます。ホスト側の既定は 8001（8080=Open WebUI、
+      #    8000=Open Terminal の検証用ポートと衝突させないため）。
+      - "${OPEN_WEBUI_COMPUTER_PORT:-8001}:8000"
+    deploy:
+      resources:
+        limits:
+          memory: ${OPEN_WEBUI_COMPUTER_MEMORY_LIMIT:-4G}
+          cpus: "${OPEN_WEBUI_COMPUTER_CPU_LIMIT:-4.0}"
+    healthcheck:
+      # curl の同梱は保証されていないため、確実に存在する python で叩きます。
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/api/health', timeout=5).status == 200 else 1)"
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+    # ⚠️ svc-net には載せません（postgres / redis / minio に到達させないため）。
+    #    open-terminal とも別ネットワークにして、両者を相互に見えなくしています。
+    networks: [svc-computer-net]
+
+  # ----------------------------------------------------------------------------
   # Open WebUI
   # ----------------------------------------------------------------------------
   open-webui:
@@ -254,6 +352,10 @@ services:
       #    ターミナルが落ちていてもチャット本体は使えるべきなので、
       #    起動を待たない service_started にしています。
       open-terminal:
+        condition: service_started
+      # 同じく service_started。起動時に Open WebUI は有効な OpenAI 互換接続の
+      # /v1/models を引きに行くため、先に上がっていた方がログが汚れません。
+      open-webui-computer:
         condition: service_started
     env_file:
       - .env
@@ -306,6 +408,52 @@ services:
         "auth_type": "bearer", "enabled": true,
         "config": {"access_grants":
         [{"principal_type": "user", "principal_id": "*", "permission": "read"}]}}]
+      #
+      # Open WebUI → Open WebUI Computer の接続（OpenAI 互換 gateway）。
+      # Computer の各ワークスペースが `cptr/<workspace>` としてモデルピッカーに出ます。
+      #
+      # 添字 0 = 本物の OpenAI（.env の OPENAI_API_BASE_URL / OPENAI_API_KEY をそのまま使用）
+      # 添字 1 = Computer の gateway
+      # OPENAI_API_CONFIGS のキーは「この配列の添字を文字列にしたもの」です
+      #（routers/openai.py:544 の api_configs.get(str(idx), ...)）。
+      #
+      # ⚠️ 手順が前後すると反映されません。以下の順でしか初期投入できません:
+      #   ① docker compose up -d open-webui-computer
+      #   ② docker compose logs open-webui-computer で初回セットアップ URL
+      #      （/?token=...）を拾い、admin アカウントを作る
+      #   ③ Computer の Settings → Admin → Gateway で API キーを発行
+      #      （sk-cptr-... は 1 回しか表示されず、以降はハッシュ保存）
+      #   ④ .env の OPEN_WEBUI_COMPUTER_GATEWAY_KEY に貼り、
+      #      OPEN_WEBUI_COMPUTER_ENABLED=true にする
+      #   ⑤ そのうえで Open WebUI を初回起動する
+      #
+      # ⚠️ ※PersistentConfig です。TERMINAL_SERVER_CONNECTIONS と同じで
+      #    seed_defaults() は「DB に無いキーだけ INSERT」します
+      #    （models/config.py:256）。既に一度起動した環境ではここを変えても
+      #    無視されるので、Admin Settings → Connections で直してください。
+      OPENAI_API_BASE_URLS: ${OPENAI_API_BASE_URL:-https://api.openai.com/v1};http://open-webui-computer:8000/v1
+      OPENAI_API_KEYS: ${OPENAI_API_KEY};${OPEN_WEBUI_COMPUTER_GATEWAY_KEY:-}
+      #
+      # headers は接続ごとのカスタムヘッダで、値は utils/headers.py:114-131 の
+      # プレースホルダに置換されます。この 5 つを渡すことで
+      #   - 会話の継続（follow-up が Computer 側の同じチャットに入る）
+      #   - 分岐の同期（Open WebUI での編集 / 再生成が Computer 側でも枝になる）
+      #   - 裏方タスクの除外（タイトル / タグ / 追従候補の生成でエージェントを起動しない）
+      # が効きます。1 つでも欠けると素のチャットしか成立しません。
+      #
+      # ⚠️ enable は true / false のみ（JSON の真偽値）。壊れた JSON は
+      #    config.py:349 で警告のうえ握り潰され、接続が「無かったこと」になります。
+      # ⚠️ gateway 経由の実行に個別承認はありません。Computer 側のエージェントが
+      #    ファイル編集・コマンド実行・ツール呼び出しを全自動で行います。
+      OPENAI_API_CONFIGS: >-
+        {"0": {"enable": true},
+        "1": {"enable": ${OPEN_WEBUI_COMPUTER_ENABLED:-false},
+        "connection_type": "external",
+        "headers": {"X-OpenWebUI-Chat-Id": "{{CHAT_ID}}",
+        "X-OpenWebUI-Message-Id": "{{MESSAGE_ID}}",
+        "X-OpenWebUI-User-Message-Id": "{{USER_MESSAGE_ID}}",
+        "X-OpenWebUI-User-Message-Parent-Id": "{{USER_MESSAGE_PARENT_ID}}",
+        "X-OpenWebUI-Task": "{{TASK}}"}}}
     ports:
       - "${OPEN_WEBUI_PORT:-8080}:8080"
     volumes:
@@ -317,9 +465,10 @@ services:
       timeout: 10s
       retries: 5
       start_period: 60s
-    # svc-terminal-net にも参加します。open-terminal へ到達できるのは
-    # このサービスだけです（open-terminal は svc-net に載せていません）。
-    networks: [svc-net, svc-terminal-net]
+    # svc-terminal-net / svc-computer-net にも参加します。open-terminal と
+    # open-webui-computer へ到達できるのはこのサービスだけで、両者は
+    # svc-net に載っていないためデータ層にも互いにも到達できません。
+    networks: [svc-net, svc-terminal-net, svc-computer-net]
 
 volumes:
   postgres-data:
@@ -327,6 +476,8 @@ volumes:
   minio-data:
   open-webui-data:
   open-terminal-data:
+  open-webui-computer-data:
+  open-webui-computer-workspace:
 
 networks:
   svc-net:
@@ -341,3 +492,13 @@ networks:
     #    「多少は外に出したい」場合は internal は使わず、open-terminal 側の
     #    OPEN_TERMINAL_ALLOWED_DOMAINS でドメインを絞ってください。
     # internal: true
+
+  # Open WebUI ↔ Open WebUI Computer 専用。
+  # svc-terminal-net と分けているのは、open-terminal と open-webui-computer を
+  # 相互に到達不能にするためです（どちらもコマンド実行ができる面なので、
+  # 片方が落ちたときの横移動を塞ぎます）。
+  #
+  # ⚠️ internal: true にはできません。Computer は OpenAI / Anthropic API と
+  #    Tavily に出る必要があり、また ports 公開でホストからも入ってきます。
+  svc-computer-net:
+    driver: bridge
