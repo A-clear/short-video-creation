@@ -8,9 +8,12 @@
 #   Open WebUI               … アプリ本体
 #   Open Terminal            … AI がコマンドを実行する作業環境（PWA 内のターミナル / ファイルブラウザ）
 #   Open WebUI Computer      … 実マシン相当のエージェントワークスペース（独立 PWA + gateway）
+#                               ＋ Python / TypeScript 開発ツールチェーンと codex CLI
+#                               （docker/computer/Dockerfile でビルド）
 #
 # 起動:
 #   cp .env.example .env  で値を埋めてから
+#   docker compose build open-webui-computer   ← 初回とツール更新時に必要
 #   docker compose up -d
 #
 # 水平スケール:
@@ -251,9 +254,30 @@ services:
   #    生の公開インターネットには出さないでください（Tailscale / 認証付き
   #    リバースプロキシの内側に置く）。
   open-webui-computer:
-    # :latest が安定版、:dev が main 追従。ここは :latest を選びます。
-    # イメージは全オプション機能群を同梱しているため extras の指定は不要です。
-    image: ghcr.io/open-webui/computer:latest
+    # ⚠️ このサービスだけ公式イメージをそのまま使わず、ビルドします。
+    #    公式イメージ（:latest が安定版、:dev が main 追従）は意図的に最小構成で、
+    #    node も npm も curl も gcc も入っていません。エージェントに Python /
+    #    TypeScript の開発をさせる面なので、docker/computer/Dockerfile で
+    #    開発ツールチェーンと codex CLI を足しています。
+    #
+    #    apt パッケージは実行中のコンテナには足せません（cptr は非 root で
+    #    sudo も無い）。だから起動時インストールではなくビルドになります。
+    #
+    #    ⚠️ 変更を反映するには明示的なビルドが要ります:
+    #         docker compose build open-webui-computer
+    #       `docker compose up -d` だけでは既存イメージが再利用されます。
+    build:
+      context: ./docker/computer
+      args:
+        COMPUTER_IMAGE: ${OPEN_WEBUI_COMPUTER_IMAGE:-ghcr.io/open-webui/computer:latest}
+        NODE_VERSION: ${NODE_VERSION:-22}
+        PNPM_VERSION: ${PNPM_VERSION:-11.24.0}
+        TYPESCRIPT_VERSION: ${TYPESCRIPT_VERSION:-7.0.2}
+        TSX_VERSION: ${TSX_VERSION:-4.23.12}
+        CODEX_CLI_VERSION: ${CODEX_CLI_VERSION:-rust-v0.149.1}
+        CODEX_CLI_TARGET: ${CODEX_CLI_TARGET:-x86_64-unknown-linux-musl}
+    # ビルド結果に付ける名前。docker images で見分けるためだけのものです。
+    image: svc/open-webui-computer:local
     container_name: svc-open-webui-computer
     restart: unless-stopped
     environment:
@@ -291,8 +315,28 @@ services:
       # ⚠️ ホストディレクトリを /data に bind mount すると、SQLite が app.db を
       #    作れずに起動失敗します（ホスト側の所有者がイメージの設定を上書きするため）。
       - open-webui-computer-data:/data
-      # 作業領域。UI から「ワークスペース」として追加するのはこのパスです。
+      # 作業領域。UI のワークスペースピッカーから追加するのはこのパスです。
+      # ⚠️ /workspace はベースイメージに存在しないため、Dockerfile 側で
+      #    cptr 所有として作っています。これが無いと Docker が root 所有で
+      #    ディレクトリを作り、ピッカーからフォルダを作れなくなります
+      #    （UI の操作もコンテナ内では cptr として実行されるため）。
       - open-webui-computer-workspace:/workspace
+      #
+      # codex のログイン情報（auth.json）。CODEX_HOME の既定値がそのまま
+      # $HOME/.codex なので、環境変数を足さずにこのパスへ被せています。
+      # ⚠️ ここを永続化しないと、コンテナを作り直すたびに再ログインになります。
+      #    /data とは別ボリュームにして、cptr の設定と混ざらないようにしています。
+      - codex-home:/home/cptr/.codex
+      #
+      # パッケージキャッシュ。$HOME はボリュームではないので、これが無いと
+      # コンテナを作り直すたびに pnpm install / uv sync が全部落とし直しになります。
+      #   .cache … uv / pip / npm
+      #   .local … pnpm のストアとグローバル bin
+      # ⚠️ 3 つとも Dockerfile 側で cptr 所有のディレクトリを作ってあります。
+      #    イメージに無いパスへボリュームを張ると Docker が root 所有で作り、
+      #    書き込めずに静かに壊れるためです。
+      - open-webui-computer-cache:/home/cptr/.cache
+      - open-webui-computer-local:/home/cptr/.local
       #
       # ホストの実プロジェクトを触らせたい場合はここに足します（マウントした分だけが境界）。
       # ⚠️ gateway 経由の実行は全ツール自動承認なので、書き込み可でマウントする範囲は
@@ -445,10 +489,26 @@ services:
       #    config.py:349 で警告のうえ握り潰され、接続が「無かったこと」になります。
       # ⚠️ gateway 経由の実行に個別承認はありません。Computer 側のエージェントが
       #    ファイル編集・コマンド実行・ツール呼び出しを全自動で行います。
+      #
+      # ⚠️ api_type は接続ごとの設定で、Computer の gateway では必ず
+      #    Chat Completions（= "responses" 以外）にすること。
+      #    gateway が実装しているのは GET /v1/models と
+      #    POST /v1/chat/completions の 2 つだけで、Responses API は
+      #    持っていません。"responses" にすると Open WebUI が
+      #    POST /v1/responses を叩き、`Method Not Allowed`（405）になります
+      #    （判定は routers/openai.py:1284 の
+      #      `api_config.get('api_type') == 'responses'`）。
+      #    添字 0（本物の OpenAI）は Responses API を使えるので、
+      #    ここを揃える必要はありません。
+      #
+      # ⚠️ ※PC なので、既に起動済みの環境ではこの値を変えても効きません。
+      #    Admin Settings → Connections で該当接続を開き、
+      #    「API Type」を Chat Completions に切り替えてください。
       OPENAI_API_CONFIGS: >-
         {"0": {"enable": true},
         "1": {"enable": ${OPEN_WEBUI_COMPUTER_ENABLED:-false},
         "connection_type": "external",
+        "api_type": "",
         "headers": {"X-OpenWebUI-Chat-Id": "{{CHAT_ID}}",
         "X-OpenWebUI-Message-Id": "{{MESSAGE_ID}}",
         "X-OpenWebUI-User-Message-Id": "{{USER_MESSAGE_ID}}",
@@ -478,6 +538,11 @@ volumes:
   open-terminal-data:
   open-webui-computer-data:
   open-webui-computer-workspace:
+  # codex のログイン情報。⚠️ これを消すと再ログインが必要になります。
+  codex-home:
+  # パッケージキャッシュ。消しても再取得されるだけで、失うものはありません。
+  open-webui-computer-cache:
+  open-webui-computer-local:
 
 networks:
   svc-net:
