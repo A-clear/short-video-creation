@@ -46,6 +46,9 @@ ARG CODEX_CLI_TARGET=x86_64-unknown-linux-musl
 ARG PNPM_VERSION=11.24.0
 ARG TYPESCRIPT_VERSION=7.0.2
 ARG TSX_VERSION=4.23.12
+# stdio ↔ Streamable HTTP を変換する薄いブリッジ。Playwright MCP を
+# Computer から使うために必要です（理由は npm install -g のコメント参照）。
+ARG MCP_REMOTE_VERSION=0.6.0
 
 # ⚠️ ENV ではなく ARG にしています。ENV にすると実行時のコンテナにも
 #    DEBIAN_FRONTEND=noninteractive が残り、後から誰かが apt を叩いたときの
@@ -84,7 +87,7 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 # ------------------------------------------------------------------------------
-# 2. Node.js / npm / pnpm / TypeScript
+# 2. Node.js / npm / pnpm / TypeScript / mcp-remote
 # ------------------------------------------------------------------------------
 # ⚠️ Node は 22 系で固定しています。open-webui submodule の engines が
 #    `>=18.13.0 <=22.x.x` なので、24 以上にすると submodule のフロントエンドが
@@ -99,6 +102,13 @@ COPY --from=node /usr/local/lib/node_modules /usr/local/lib/node_modules
 #    イメージの中で完結します。
 #    packageManager フィールドを持つプロジェクトでは corepack も使えます
 #    （corepack のシムも下で用意しています）。
+# ⚠️ mcp-remote も同じ理由でイメージに焼き込みます。Playwright MCP は
+#    別コンテナで Streamable HTTP を喋りますが、cptr の `type: mcp` 経路は
+#    ツール呼び出しのたびに接続し直すため（utils/tools.py:2931-2940）、
+#    browser_navigate の次の browser_snapshot が about:blank になります。
+#    セッションを保つには長寿命プロセスを使う `mcp_stdio` 経路が要り、
+#    その stdio ↔ HTTP 変換が mcp-remote です。npx 実行にすると初回の
+#    ツール呼び出しでネットワーク取得が走るため、ここで入れておきます。
 RUN ln -sf ../lib/node_modules/npm/bin/npm-cli.js /usr/local/bin/npm \
     && ln -sf ../lib/node_modules/npm/bin/npx-cli.js /usr/local/bin/npx \
     && ln -sf ../lib/node_modules/corepack/dist/corepack.js /usr/local/bin/corepack \
@@ -106,6 +116,7 @@ RUN ln -sf ../lib/node_modules/npm/bin/npm-cli.js /usr/local/bin/npm \
         "pnpm@${PNPM_VERSION}" \
         "typescript@${TYPESCRIPT_VERSION}" \
         "tsx@${TSX_VERSION}" \
+        "mcp-remote@${MCP_REMOTE_VERSION}" \
     && npm cache clean --force
 
 # ------------------------------------------------------------------------------
@@ -174,6 +185,85 @@ RUN CODEX_PY="$(python3 -c 'import cptr, os; print(os.path.join(os.path.dirname(
     && echo "patched: $CODEX_PY"
 
 # ------------------------------------------------------------------------------
+# 4b. cptr のパッチ — Browser タブ（proxy）で実行時 root-relative URL を直す
+# ------------------------------------------------------------------------------
+# ⚠️ これも upstream（cptr）の穴に対する回避策です。
+#
+# 何が起きるか:
+#   cptr のプロキシが URL を書き換えるのは 3 か所だけです
+#   （utils/browser/proxy.py）: 初期 HTML の属性 / CSS の url() /
+#   **JS の import 文だけ**。実行時に JS が組み立てた URL は素通しになります。
+#   Vite の dev サーバはアセットを必ず root-relative で返すため
+#   （実測: `GET /src/assets/hero.png?import` →
+#    `export default "/src/assets/hero.png"` という**裸の文字列**）、
+#   rewrite_javascript の正規表現（from / import が前置される場合のみ）に
+#   当たらず、そのまま React が <img src> に入れます。
+#   ブラウザは iframe のオリジン（= cptr 自身）に対して解決し、cptr は
+#   SPA フォールバックで **200 / text/html**（自分の index.html）を返すため、
+#   404 にすらならず画像が黙って壊れます。<use href="/icons.svg#id"> も同様。
+#
+# なぜアプリ側で直せないか:
+#   Vite 8 の dev は base: './' を無視し、
+#   new URL('./x.png', import.meta.url) も `new URL("/src/assets/x.png", ...)`
+#   に変換します（どちらも実測）。dev サーバは設計として root-relative しか
+#   出さないので、「こう書けば見える」という運用ルールにはできません。
+#
+# なぜ chrome モードに逃げないか:
+#   実 Chromium なら書き換えを通らないので直りますが、cptr は
+#   `auth.role != "admin"` で弾きます（routers/browser.py:253
+#   "Personal Chrome is available to administrators only"）。
+#   マルチユーザ前提の本構成では**非管理者が Browser タブを使えなくなる**ため、
+#   全員が使える proxy 側を直します。
+#
+# 何をするか:
+#   rewrite_html が注入する runtime の直後にシムを 1 本足します。シムは
+#   DOM に現れた root-relative な src / href / poster / srcset を
+#   プロキシのフレームパスへ書き換え、MutationObserver で React の
+#   再レンダリングにも追従します。中身は browser-root-relative-shim.js を参照。
+#
+# ⚠️ シムは**冪等**でなければなりません。書き換え不要な入力に対して
+#    1 文字でも違う値を返すと、setAttribute → MutationObserver →
+#    setAttribute … と無限に再発火し、ページが描画を終えません
+#    （実測で Chromium がハングしました）。詳細は JS 側のコメント。
+#
+# ⚠️ upstream が該当行を変えたら、このビルドは**その場で失敗**します
+#    （出現回数を 1 で検証しているため）。黙って無効化されることはありません。
+COPY browser-root-relative-shim.js /opt/cptr-patch/browser-root-relative-shim.js
+
+RUN python3 <<'PATCH'
+import ast
+import pathlib
+
+import cptr
+
+path = pathlib.Path(cptr.__file__).parent / "utils" / "browser" / "proxy.py"
+source = path.read_text(encoding="utf-8")
+
+anchor = "        '<script src=\"/api/browser/runtime.js\"></script>'\n"
+assert source.count(anchor) == 1, f"anchor not found exactly once in {path}"
+
+source = source.replace(anchor, anchor.rstrip("\n") + " + _ROOT_RELATIVE_SHIM\n")
+source += '''
+
+# --- パッチ: 実行時 root-relative URL のシム（docker/computer/Dockerfile 4b）---
+# ⚠️ ファイルが無ければ import 時に落とします。黙ってシム無しで動くと
+#    「画像だけ壊れる」という診断しづらい状態に戻るためです。
+def _load_root_relative_shim() -> str:
+    from pathlib import Path as _Path
+
+    js = _Path("/opt/cptr-patch/browser-root-relative-shim.js").read_text(encoding="utf-8")
+    return "<script>" + js + "</script>"
+
+
+_ROOT_RELATIVE_SHIM = _load_root_relative_shim()
+'''
+
+ast.parse(source)
+path.write_text(source, encoding="utf-8")
+print("patched:", path)
+PATCH
+
+# ------------------------------------------------------------------------------
 # 5. ボリュームで被せるディレクトリを先に作っておく
 # ------------------------------------------------------------------------------
 # ⚠️ ここが最も踏みやすい落とし穴です。
@@ -213,6 +303,7 @@ RUN set -eux; \
     pnpm -v; \
     tsc -v; \
     tsx --version; \
+    mcp-remote --help >/dev/null 2>&1 || test -x /usr/local/bin/mcp-remote; \
     gcc --version | head -1; \
     make --version | head -1; \
     rg --version | head -1; \
@@ -221,7 +312,9 @@ RUN set -eux; \
     git --version; \
     codex --version; \
     test -w /home/cptr/.codex; \
-    test -w /workspace
+    test -w /workspace; \
+    test -r /opt/cptr-patch/browser-root-relative-shim.js; \
+    python3 -c "from cptr.utils.browser.proxy import _ROOT_RELATIVE_SHIM as s; assert 'MutationObserver' in s, 'shim not injected'; print('shim ok:', len(s), 'bytes')"
 
 # ⚠️ ENTRYPOINT / CMD / ENV / EXPOSE はベースイメージから継承しています。
 #    （tini -- cptr run --host 0.0.0.0 --port 8000 --headless / CPTR_DATA_DIR=/data）

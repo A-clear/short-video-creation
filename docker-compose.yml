@@ -5,17 +5,23 @@
 #   PostgreSQL (+ pgvector)  … 本体 DB 兼ベクトル DB
 #   Redis                    … 共有状態ストア / WebSocket マネージャ
 #   MinIO                    … 共有ファイルストレージ（S3 互換）
+#   Docling                  … Basic RAG のコンテンツ抽出エンジン
+#                               （PDF / Office / HTML → Markdown）
 #   Open WebUI               … アプリ本体
 #   Open Terminal            … AI がコマンドを実行する作業環境（PWA 内のターミナル / ファイルブラウザ）
 #   Open WebUI Computer      … 実マシン相当のエージェントワークスペース（独立 PWA + gateway）
 #                               ＋ Python / TypeScript 開発ツールチェーンと codex CLI
 #                               （docker/computer/Dockerfile でビルド）。チーム別
 #                               （team-a / team-b / team-c）に 3 コンテナ用意する
+#   Playwright MCP           … Computer 内の dev サーバをエージェントが操作するための
+#                               ヘッドレスブラウザ。Computer のイメージには Chromium の
+#                               共有ライブラリが無いため別コンテナに置く。同じくチーム別に 3 台
 #
 # 起動:
 #   cp .env.example .env  で値を埋めてから
-#   docker compose build   ← 初回とツール更新時に必要。Computer 3 台は同じ image:
-#                             タグを指すため実質 1 回のビルドになる
+#   docker compose build   ← 初回とツール更新時に必要。ビルドするのは
+#                             Computer（3 台とも同じ image: タグなので実質 1 回）
+#                             と Docling（日本語 OCR の言語パック追加）の 2 つ
 #   docker compose up -d
 #
 # 水平スケール:
@@ -77,7 +83,8 @@ x-computer-base: &computer-base
       limits:
         # ⚠️ 3 台に増えたため 4G/4.0 から下げています。limits はピーク保護で
         #    あって常時消費ではありませんが、3 台合計 9G / 6 CPU がホストに
-        #    要求されます。
+        #    要求されます。Playwright MCP を使う場合はさらに 3 台分
+        #    （既定 1G / 1.0 CPU ずつ）が乗り、合計 12G / 9 CPU になります。
         memory: ${OPEN_WEBUI_COMPUTER_MEMORY_LIMIT:-3G}
         cpus: "${OPEN_WEBUI_COMPUTER_CPU_LIMIT:-2.0}"
       reservations:
@@ -94,6 +101,85 @@ x-computer-base: &computer-base
     retries: 5
     start_period: 60s
 
+# ==============================================================================
+# Playwright MCP の共通定義（チーム別 3 台で共有する）
+# ==============================================================================
+#
+# Computer の中で立てた dev サーバを「エージェントに操作させる」ための
+# ヘッドレスブラウザです。人間が目で見るだけなら Computer の Browser タブ
+# （プロキシ）で足りるので、こちらは不要です。
+#
+# ⚠️ なぜ別コンテナなのか — Computer のイメージには Chromium が要求する
+#    共有ライブラリが 1 つも入っていません（libnss3 / libatk-1.0 / libgbm /
+#    libxkbcommon / libasound / libcups / libpango / libdrm / libxcomposite が
+#    すべて ldconfig -p で 0 件）。cptr は非 root で sudo も apt も使えないため、
+#    コンテナ内で `npx playwright install` してもブラウザ起動時に落ちます。
+#    ブラウザ本体は必ず外に置きます。
+#
+# ⚠️ なぜチームごとに 3 台なのか — 1 台を 3 つのネットワークに参加させると、
+#    そのブラウザが 3 チームすべての Computer と dev サーバに到達できます。
+#    チームを分けている理由（下の open-webui-computer-* のコメント参照）が
+#    その 1 コンテナで無効化されるため、ネットワークと同じ粒度で分けます。
+#
+# ⚠️ 載せるのは svc-computer-net-* ではなく専用の svc-playwright-net-* です。
+#    前者には open-webui 本体も参加しているため、相乗りさせると
+#    「エージェントが指示した URL を開くブラウザ」が Open WebUI 本体に
+#    到達できてしまいます。両者の間に必要な通信は 1 本もありません。
+#
+# ⚠️ ポートは公開しません。この API は「認証なしでブラウザを遠隔操作できる口」
+#    です。同じチームの Computer からサービス名で引ければ足ります。
+x-playwright-mcp: &playwright-mcp
+  # ⚠️ ENTRYPOINT に `node /app/cli.js --headless --browser chromium
+  #    --no-sandbox` が焼かれているイメージです。上書きせず、設定は下の
+  #    PLAYWRIGHT_MCP_* 環境変数で渡します（CLI フラグと 1:1 対応）。
+  image: mcr.microsoft.com/playwright/mcp:${PLAYWRIGHT_MCP_VERSION:-latest}
+  restart: unless-stopped
+  # Chromium は子プロセスを大量に作るため、PID 1 にゾンビを回収する役が要ります。
+  init: true
+  # ⚠️ Docker の既定 /dev/shm は 64MB で、Chromium がタブを開いた瞬間に
+  #    クラッシュすることが知られています。ここは節約しないでください。
+  shm_size: ${PLAYWRIGHT_MCP_SHM_SIZE:-1gb}
+  deploy:
+    resources:
+      limits:
+        memory: ${PLAYWRIGHT_MCP_MEMORY_LIMIT:-1G}
+        cpus: "${PLAYWRIGHT_MCP_CPU_LIMIT:-1.0}"
+  # ⚠️ このイメージに curl も wget もありません（実測）。node で叩きます。
+  #    Host: localhost:8931 が通るよう allowed-hosts に localhost:8931 を
+  #    含めてあります。正常時は 406（Accept ヘッダ不足）が返り、これは
+  #    「MCP ハンドラが生きている」ことの証明になります。
+  healthcheck:
+    test:
+      - CMD
+      - node
+      - -e
+      - "fetch('http://localhost:8931/mcp',{method:'POST'}).then(r=>process.exit(r.status<500?0:1)).catch(()=>process.exit(1))"
+    interval: 30s
+    timeout: 10s
+    retries: 3
+    start_period: 20s
+
+x-playwright-mcp-env: &playwright-mcp-env
+  PLAYWRIGHT_MCP_PORT: "8931"
+  # ⚠️ 既定は localhost bind で、別コンテナから一切繋がりません。
+  #    起動ログは 0.0.0.0 でも "Listening on http://localhost:8931" と出ます
+  #    （表示だけの問題で、実際の bind はこの変数に従います）。
+  PLAYWRIGHT_MCP_HOST: "0.0.0.0"
+  # プロファイルをディスクに残さない。複数クライアントが同時に繋いでも
+  # プロファイルロックで衝突しません。
+  PLAYWRIGHT_MCP_ISOLATED: "true"
+  # ⚠️ これを omit にしないと browser_take_screenshot が base64 の image ブロックを
+  #    返し、cptr の _extract_mcp_result が非 text ブロックを json.dumps して
+  #    テキストに混ぜます（utils/tools.py:2906-2915）。モデルには画像として
+  #    渡らないうえ、実測で小さなページでも 12KB のゴミが文脈に入りました。
+  #    スクリーンショットはファイルに保存され、パスだけが返ります。
+  PLAYWRIGHT_MCP_IMAGE_RESPONSES: omit
+  PLAYWRIGHT_MCP_VIEWPORT_SIZE: ${PLAYWRIGHT_MCP_VIEWPORT_SIZE:-1280x720}
+  # 返すコンソールログの下限。dev サーバの検証が目的なので既定は warning。
+  PLAYWRIGHT_MCP_CONSOLE_LEVEL: ${PLAYWRIGHT_MCP_CONSOLE_LEVEL:-warning}
+  # ⚠️ Service Worker はブロックしません。本プロジェクトの成果物は PWA で、
+  #    ブロックすると検証したい挙動そのものが消えます。
+
 services:
   # ----------------------------------------------------------------------------
   # PostgreSQL + pgvector
@@ -109,8 +195,12 @@ services:
       POSTGRES_USER: ${POSTGRES_USER:-openwebui}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD を .env に設定してください}
       POSTGRES_DB: ${POSTGRES_DB:-openwebui}
-      # 総接続数 = (DATABASE_POOL_SIZE + DATABASE_POOL_MAX_OVERFLOW) × レプリカ数
-      # .env の既定値（15 + 20）でレプリカ 3 台なら 105。余裕を持たせています。
+      # 総接続数 = (DATABASE_POOL_SIZE + DATABASE_POOL_MAX_OVERFLOW)
+      #            × UVICORN_WORKERS × レプリカ数
+      # .env の既定値（15 + 20）× ワーカー 4 × レプリカ 1 で 140。
+      # ⚠️ ワーカーとレプリカは掛け算になります。この構成のまま
+      #    --scale open-webui=2 にすると 280 で max_connections を超えます。
+      #    先に下の max_connections を引き上げてください。
       POSTGRES_INITDB_ARGS: "--encoding=UTF8"
     command:
       - postgres
@@ -209,6 +299,98 @@ services:
       "
     restart: "no"
     networks: [svc-net]
+
+  # ----------------------------------------------------------------------------
+  # Docling（Basic RAG のコンテンツ抽出エンジン）
+  # ----------------------------------------------------------------------------
+  # PDF / Word / スプレッドシート / HTML / 画像を Markdown に変換して
+  # Open WebUI に返します。既定の pypdf は継続的な取り込みでメモリリークする
+  # ため、Basic RAG の抽出エンジンとしてこちらを使います。
+  #
+  # 呼び出しは Open WebUI → POST /v1/convert/file の 1 経路だけです
+  # （retrieval/loaders/main.py:197-216）。
+  #
+  # ⚠️ Open WebUI 側の requests.post にタイムアウト指定がありません。
+  #    ぶら下がりの上限は下の DOCLING_SERVE_MAX_SYNC_WAIT だけで決まります。
+  #    ここを無効に大きくすると、変換 1 件が Open WebUI のスレッドを
+  #    その秒数だけ占有します。
+  #
+  # ⚠️ ボリュームを付けていないのは意図的です。変換モデル（layout /
+  #    tableformer / picture_classifier / rapidocr / easyocr）はイメージの
+  #    /opt/app-root/src/.cache/docling/models に焼き込まれています。
+  #    空の名前付きボリュームで覆うと docling-serve はモデルを自動取得せず
+  #    実行時エラーにします。
+  #
+  # ⚠️ **ビルドが必要なサービスです**（Computer と合わせて 2 つ目）。
+  #    公式イメージの tesseract には英語の言語パックしか入っていないため、
+  #    docker/docling/Dockerfile で日本語（jpn / jpn_vert）を足しています。
+  #    docker compose up -d だけでは反映されません。
+  docling-serve:
+    build:
+      context: ./docker/docling
+      args:
+        DOCLING_SERVE_IMAGE: quay.io/docling-project/docling-serve:${DOCLING_SERVE_VERSION:-latest}
+    image: svc/docling-serve:local
+    container_name: svc-docling-serve
+    restart: unless-stopped
+    environment:
+      # 認証キー。Open WebUI は X-Api-Key ヘッダで送ります。
+      # ⚠️ .env の DOCLING_API_KEY と同じ値を参照しています。片方だけ
+      #    変えると変換が 401 になります。
+      DOCLING_SERVE_API_KEY: ${DOCLING_API_KEY:?DOCLING_API_KEY を .env に設定してください}
+
+      # デモ UI（/ui）。認証が掛からないため既定では出しません。
+      DOCLING_SERVE_ENABLE_UI: "false"
+
+      # 画像説明を外部 LLM に投げる機能。使わないので閉じたままにします。
+      # ⚠️ true にする場合は下の svc-docling-net の internal を外す必要があります。
+      DOCLING_SERVE_ENABLE_REMOTE_SERVICES: "false"
+
+      # 同期変換の待ち時間上限（秒）。既定 120 は大きな PDF に足りません。
+      DOCLING_SERVE_MAX_SYNC_WAIT: ${DOCLING_SERVE_MAX_SYNC_WAIT:-600}
+
+      # 変換ワーカー数。
+      DOCLING_SERVE_ENG_LOC_NUM_WORKERS: ${DOCLING_SERVE_ENG_LOC_NUM_WORKERS:-2}
+
+      DOCLING_SERVE_LOG_FORMAT: json
+
+      # ⚠️ **1 から動かさないでください。** 既定の LocalOrchestrator は
+      #    タスクをプロセス内のメモリに持つため、2 以上にすると
+      #    「あるワーカーが作ったタスクを別のワーカーが知らない」状態になり
+      #    Task Not Found (404) が出ます。
+      # ⚠️ Open WebUI 側の UVICORN_WORKERS（.env 6 節）とは名前が同じだけの
+      #    別物です。このサービスは env_file を読み込まないため混ざりません。
+      UVICORN_WORKERS: "1"
+
+      OMP_NUM_THREADS: ${DOCLING_OMP_NUM_THREADS:-4}
+      MKL_NUM_THREADS: ${DOCLING_OMP_NUM_THREADS:-4}
+    deploy:
+      resources:
+        limits:
+          memory: ${DOCLING_SERVE_MEMORY_LIMIT:-4G}
+          cpus: "${DOCLING_SERVE_CPU_LIMIT:-4.0}"
+    # /health は認証不要（app.py の health ルートに require_auth が無い。
+    # 変換系の 5 ルートだけが Depends(require_auth) を持ちます）。
+    #
+    # curl の同梱が保証されないため python で叩きます。パスはイメージの
+    # ENV UV_PROJECT_ENVIRONMENT=/opt/app-root（registry の config blob で確認）
+    # から導いた venv の bin です。
+    # ⚠️ ここだけは実イメージを pull して確認していません。unhealthy のまま
+    #    直らない場合は `docker compose exec docling-serve sh -c 'command -v python python3 curl'`
+    #    で実在するものに差し替えてください（depends_on は service_started
+    #    なので、unhealthy でも Open WebUI の起動は止まりません）。
+    healthcheck:
+      test:
+        - CMD
+        - /opt/app-root/bin/python
+        - -c
+        - "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:5001/health', timeout=5).status == 200 else 1)"
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    # ⚠️ ポートは公開しません。Open WebUI からサービス名で引ければ足ります。
+    networks: [svc-docling-net]
 
   # ----------------------------------------------------------------------------
   # Open Terminal（AI の実行環境）
@@ -369,7 +551,7 @@ services:
       - computer-a-local:/home/cptr/.local
     ports:
       - "${OPEN_WEBUI_COMPUTER_PORT_A:-8001}:8000"
-    networks: [svc-computer-net-a]
+    networks: [svc-computer-net-a, svc-playwright-net-a]
 
   open-webui-computer-b:
     <<: *computer-base
@@ -385,7 +567,7 @@ services:
       - computer-b-local:/home/cptr/.local
     ports:
       - "${OPEN_WEBUI_COMPUTER_PORT_B:-8002}:8000"
-    networks: [svc-computer-net-b]
+    networks: [svc-computer-net-b, svc-playwright-net-b]
 
   open-webui-computer-c:
     <<: *computer-base
@@ -401,7 +583,58 @@ services:
       - computer-c-local:/home/cptr/.local
     ports:
       - "${OPEN_WEBUI_COMPUTER_PORT_C:-8003}:8000"
-    networks: [svc-computer-net-c]
+    networks: [svc-computer-net-c, svc-playwright-net-c]
+
+  # ----------------------------------------------------------------------------
+  # Playwright MCP（チーム別 3 コンテナ）
+  # ----------------------------------------------------------------------------
+  # Computer のエージェントに「ブラウザで dev サーバを触らせる」ための面です。
+  # 共通の注意は上の x-playwright-mcp を参照。
+  #
+  # ⚠️ Computer 側の登録は `type: mcp`（Streamable HTTP を直接指す）では
+  #    動きません。cptr は type: mcp のときツール呼び出しのたびに接続し直して
+  #    切断するため（utils/tools.py:2931-2940）、MCP セッションが毎回作り直され、
+  #    browser_navigate の次に browser_snapshot を呼ぶと about:blank が返ります
+  #    （--shared-browser-context でも解決しないことを実測済み）。
+  #    長寿命プロセスを保つ `mcp_stdio` 経路に、stdio ↔ HTTP を変換する
+  #    mcp-remote を挟んで登録してください。手順は
+  #    docs/Setup/playwright_mcp_setup.md。
+  #
+  # ⚠️ 到達先の指定に localhost は使えません。ブラウザは別コンテナに居ます。
+  #    dev サーバを --host 0.0.0.0 で立て、http://open-webui-computer-a:5173 の
+  #    ようにチーム別のサービス名で指してください。
+  playwright-mcp-a:
+    <<: *playwright-mcp
+    container_name: svc-playwright-mcp-a
+    environment:
+      <<: *playwright-mcp-env
+      # ⚠️ これが無いと DNS リバインディング対策に弾かれ、接続が 403 になります
+      #    （実測。ログには何も出ないので原因が分かりません）。
+      #    localhost:8931 は上の healthcheck 用です。
+      PLAYWRIGHT_MCP_ALLOWED_HOSTS: playwright-mcp-a:8931,localhost:8931
+      # ブラウザが「出て行ける先」の制限。空 = 制限なし。
+      # ⚠️ 絞ると CDN や Google Fonts も落ちるため、実ページの描画が崩れます。
+      #    既定では設定せず、境界はネットワーク分離に任せています。
+      PLAYWRIGHT_MCP_ALLOWED_ORIGINS: ${PLAYWRIGHT_MCP_ALLOWED_ORIGINS_A:-}
+    networks: [svc-playwright-net-a]
+
+  playwright-mcp-b:
+    <<: *playwright-mcp
+    container_name: svc-playwright-mcp-b
+    environment:
+      <<: *playwright-mcp-env
+      PLAYWRIGHT_MCP_ALLOWED_HOSTS: playwright-mcp-b:8931,localhost:8931
+      PLAYWRIGHT_MCP_ALLOWED_ORIGINS: ${PLAYWRIGHT_MCP_ALLOWED_ORIGINS_B:-}
+    networks: [svc-playwright-net-b]
+
+  playwright-mcp-c:
+    <<: *playwright-mcp
+    container_name: svc-playwright-mcp-c
+    environment:
+      <<: *playwright-mcp-env
+      PLAYWRIGHT_MCP_ALLOWED_HOSTS: playwright-mcp-c:8931,localhost:8931
+      PLAYWRIGHT_MCP_ALLOWED_ORIGINS: ${PLAYWRIGHT_MCP_ALLOWED_ORIGINS_C:-}
+    networks: [svc-playwright-net-c]
 
   # ----------------------------------------------------------------------------
   # Open WebUI
@@ -426,6 +659,10 @@ services:
         condition: service_healthy
       minio:
         condition: service_healthy
+      # 抽出エンジン。落ちていてもチャット本体は使えるべきなので待ちません
+      # （影響は「文書をアップロードすると変換に失敗する」だけ）。
+      docling-serve:
+        condition: service_started
       # ⚠️ service_healthy にしていません。
       #    open-terminal は約 4GB のイメージで初回 pull と起動に時間がかかります。
       #    ターミナルが落ちていてもチャット本体は使えるべきなので、
@@ -451,6 +688,11 @@ services:
       S3_ENDPOINT_URL: http://minio:9000
       S3_ACCESS_KEY_ID: ${MINIO_ROOT_USER}
       S3_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD}
+      # Basic RAG の抽出エンジン。.env の 13 節と同じ値ですが、コンテナ名で
+      # 解決させるためここでも明示します（上流の既定は http://docling:5001）。
+      # ⚠️ ※PersistentConfig です。既に一度起動した環境ではここを変えても
+      #    無視されるので、Admin Settings → Tools → Documents で直してください。
+      DOCLING_SERVER_URL: http://docling-serve:5001
       #
       # ⚠️ --scale open-webui=N で水平スケールする場合:
       #    マイグレーションを 1 台だけに任せる必要があります。
@@ -578,6 +820,7 @@ services:
       [
         svc-net,
         svc-terminal-net,
+        svc-docling-net,
         svc-computer-net-a,
         svc-computer-net-b,
         svc-computer-net-c,
@@ -624,6 +867,18 @@ networks:
     #    OPEN_TERMINAL_ALLOWED_DOMAINS でドメインを絞ってください。
     # internal: true
 
+  # Open WebUI ↔ docling-serve 専用。
+  #
+  # ⚠️ internal: true にしています。変換モデルはイメージに焼き込み済みで、
+  #    DOCLING_SERVE_ENABLE_REMOTE_SERVICES=false のため、このコンテナが
+  #    外部へ出る必要は 1 つもありません。
+  #    外す必要があるのは次の 2 ケースだけです。
+  #      ・画像説明（picture description）を外部 LLM API で行う
+  #      ・easyocr の日本語モデルを実行時に取得させる（.env 13 節の (b)）
+  svc-docling-net:
+    driver: bridge
+    internal: true
+
   # Open WebUI ↔ 各チームの Computer 専用。チームごとに分けることで
   # Computer コンテナ同士を相互に到達不能にしています。
   #
@@ -634,4 +889,26 @@ networks:
   svc-computer-net-b:
     driver: bridge
   svc-computer-net-c:
+    driver: bridge
+
+  # Computer ↔ Playwright MCP 専用。svc-computer-net-* と分けているのは、
+  # そちらには open-webui 本体も参加しているためです。相乗りさせると
+  # 「エージェントが指示した URL を開くブラウザ」が Open WebUI 本体に
+  # 到達できてしまいます。両者の間に必要な通信は 1 本もありません。
+  #
+  # 参加するのは open-webui-computer-<team> と playwright-mcp-<team> の 2 つだけ。
+  # 通信は双方向に使われます:
+  #   Computer   → Playwright : mcp-remote が :8931/mcp を叩く
+  #   Playwright → Computer   : ブラウザが dev サーバ（:5173 等）を開く
+  #
+  # ⚠️ internal: true にするとブラウザが外部へ一切出られなくなります。
+  #    エージェントが開く先をチームの dev サーバだけに閉じ込められる反面、
+  #    CDN / Google Fonts / 外部 API を読むページは描画が崩れます。
+  #    本プロジェクトの成果物は PWA なので既定では有効にしていません。
+  # internal: true
+  svc-playwright-net-a:
+    driver: bridge
+  svc-playwright-net-b:
+    driver: bridge
+  svc-playwright-net-c:
     driver: bridge

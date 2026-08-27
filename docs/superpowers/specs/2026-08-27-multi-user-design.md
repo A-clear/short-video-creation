@@ -28,14 +28,14 @@
 
 ## 2. 決定事項
 
-| 項目 | 決定 |
-|---|---|
-| 利用者像 | 少人数の社内チーム（〜10 名）、相互に信頼関係あり |
-| 構成案 | 案 B: Open Terminal は共有 1 コンテナ、Computer はチーム別に分割 |
-| チーム分割 | 3 チームの雛形（`team-a` / `team-b` / `team-c`）。名称は後で差し替える |
-| 新規ユーザ | `DEFAULT_USER_ROLE=pending`（管理者承認を挟む） |
-| Computer の開発サーバポート公開 | 全廃（Browser タブ / Port Preview で代替） |
-| Functions の所有者検証 | 今回のスコープに含める |
+| 項目                            | 決定                                                                   |
+| ------------------------------- | ---------------------------------------------------------------------- |
+| 利用者像                        | 少人数の社内チーム（〜10 名）、相互に信頼関係あり                      |
+| 構成案                          | 案 B: Open Terminal は共有 1 コンテナ、Computer はチーム別に分割       |
+| チーム分割                      | 3 チームの雛形（`team-a` / `team-b` / `team-c`）。名称は後で差し替える |
+| 新規ユーザ                      | `DEFAULT_USER_ROLE=pending`（管理者承認を挟む）                        |
+| Computer の開発サーバポート公開 | 全廃（Browser タブ / Port Preview で代替）                             |
+| Functions の所有者検証          | 今回のスコープに含める                                                 |
 
 ## 3. 調査で確定した事実
 
@@ -45,12 +45,12 @@
 
 ライセンス処理の実体は `backend/open_webui/utils/auth.py:85-159` の `get_license_data()` のみ。その `data_handler()` が行うのは 4 つだけ。
 
-| キー | 効果 | 行 |
-|---|---|---|
+| キー        | 効果                                   | 行       |
+| ----------- | -------------------------------------- | -------- |
 | `resources` | 静的アセット差し替え（ブランディング） | `:88-90` |
-| `count` | `app.state.USER_COUNT` にセット | `:92` |
-| `name` | `app.state.WEBUI_NAME` を上書き | `:94` |
-| `metadata` | `app.state.LICENSE_METADATA` にセット | `:96` |
+| `count`     | `app.state.USER_COUNT` にセット        | `:92`    |
+| `name`      | `app.state.WEBUI_NAME` を上書き        | `:94`    |
+| `metadata`  | `app.state.LICENSE_METADATA` にセット  | `:96`    |
 
 `if license:` のような機能分岐はバックエンドに存在しない。SCIM 2.0（`env.py:851-859`）・LDAP（`config.py:2751-2786`）・グループ RBAC・監査ログ（`env.py:1144-1182`）はすべて OSS のまま動作する。
 
@@ -84,7 +84,7 @@ calendar / channel / folder / knowledge / model / note / prompt / shared_chat / 
 
 Pipe を特定グループに見せる唯一の経路は次のとおり。
 
-1. Function を有効化すると `pipe.<id>` 形式のモデルが生える
+1. Function を有効化するとモデルが生える（ID は Function の ID そのもの。`pipe.` 接頭辞は付かない — `functions.py:129-133`。`<function_id>.<sub_id>` になるのは `pipes` を持つマニフォールドだけ）
 2. `model` テーブルに行が無いため、`utils/models.py:517-523` の `elif user.role == 'admin'` に落ちて **管理者にしか見えない**
 3. Workspace → Models で Model エントリを作る
 4. その Model に `access_grants`（`resource_type='model'`）を付ける
@@ -95,11 +95,11 @@ Filter / Action はモデルの `filterIds` / `actionIds` に紐づく（`utils/
 
 `models/access_grants.py:14-17`, `25-44`。
 
-| 形 | 意味 |
-|---|---|
-| `principal_type='user'`, `principal_id='*'`, `permission='read'` | ログイン済みの全員に read |
-| `principal_type='user'`, `principal_id='*'`, `permission='write'` | ログイン済みの全員に write |
-| `principal_type='anyone'`, `principal_id='*'`, `permission='read'` | 未認証でも read |
+| 形                                                                 | 意味                       |
+| ------------------------------------------------------------------ | -------------------------- |
+| `principal_type='user'`, `principal_id='*'`, `permission='read'`   | ログイン済みの全員に read  |
+| `principal_type='user'`, `principal_id='*'`, `permission='write'`  | ログイン済みの全員に write |
+| `principal_type='anyone'`, `principal_id='*'`, `permission='read'` | 未認証でも read            |
 
 `principal_type='group'` にワイルドカードは効かない。grant が空 / None なら private（オーナーと管理者のみ）で、これは `utils/access_control/__init__.py:126-127` および `:171` で明示されている。
 
@@ -123,14 +123,14 @@ Filter / Action はモデルの `filterIds` / `actionIds` に紐づく（`utils/
 
 **分離される / されないの境界**
 
-| 対象 | 分離 | 根拠 |
-|---|---|---|
-| home / ファイル I/O | される | カーネルのパーミッション + `utils/fs.py` の `is_path_allowed()` |
-| コマンド実行ユーザ | される | `utils/runner.py:64` の `sudo -u` |
-| PTY セッション一覧・接続・削除 | **されない** | `list_terminals()` が全件を返し、`ws_terminal()` が `X-User-Id` を引数に取らない |
-| プロセス一覧・コマンド文字列・出力・kill | **されない** | `list_processes()` / `get_status()` / `kill_process()` にユーザ検査なし |
-| ポート / ネットワーク名前空間 | されない | 公式ドキュメントに明記 |
-| CPU / メモリ / 導入パッケージ | されない | 同上 |
+| 対象                                     | 分離         | 根拠                                                                             |
+| ---------------------------------------- | ------------ | -------------------------------------------------------------------------------- |
+| home / ファイル I/O                      | される       | カーネルのパーミッション + `utils/fs.py` の `is_path_allowed()`                  |
+| コマンド実行ユーザ                       | される       | `utils/runner.py:64` の `sudo -u`                                                |
+| PTY セッション一覧・接続・削除           | **されない** | `list_terminals()` が全件を返し、`ws_terminal()` が `X-User-Id` を引数に取らない |
+| プロセス一覧・コマンド文字列・出力・kill | **されない** | `list_processes()` / `get_status()` / `kill_process()` にユーザ検査なし          |
+| ポート / ネットワーク名前空間            | されない     | 公式ドキュメントに明記                                                           |
+| CPU / メモリ / 導入パッケージ            | されない     | 同上                                                                             |
 
 Open WebUI 側のプロキシ（`routers/terminals.py:89`）は任意パスを素通しするため、この経路は塞がれていない。
 
@@ -225,17 +225,20 @@ Descript の API キー・エンドポイント URL・プロジェクト名は F
 
 いずれも「Open WebUI にスコープ付き API があるのにスコープ無し版を呼んでいる」同一パターン。
 
-| # | 箇所 | 内容 |
-|---|---|---|
-| A | `descript_pipe.py:3168` | `Files.get_file_by_id` に所有者検証が無い。`models/files.py:168` に `get_file_by_id_and_user_id`、`:215` に `check_access_by_user_id` があるのに `:153` を使用 |
-| B | `descript_pipe.py:209` / `descript_studio.py:202` / `descript_guard.py:226` | `_load_state` が `Chats.get_chat_by_id` を使用。`models/chats.py:1540` に `get_chat_by_id_and_user_id` がある |
-| C | `descript_pipe.py:227-245` / `descript_guard.py:244-262` | `_save_state` が無検証の `chat_id` で `Chats.update_chat_by_id` を呼ぶ。`models/chats.py:606` が `chat_item.chat` を丸ごと差し替える |
+| #   | 箇所                                                                        | 内容                                                                                                                                                           |
+| --- | --------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| A   | `descript_pipe.py:3168`                                                     | `Files.get_file_by_id` に所有者検証が無い。`models/files.py:168` に `get_file_by_id_and_user_id`、`:215` に `check_access_by_user_id` があるのに `:153` を使用 |
+| B   | `descript_pipe.py:209` / `descript_studio.py:202` / `descript_guard.py:226` | `_load_state` が `Chats.get_chat_by_id` を使用。`models/chats.py:1540` に `get_chat_by_id_and_user_id` がある                                                  |
+| C   | `descript_pipe.py:227-245` / `descript_guard.py:244-262`                    | `_save_state` が無検証の `chat_id` で `Chats.update_chat_by_id` を呼ぶ。`models/chats.py:606` が `chat_item.chat` を丸ごと差し替える                           |
 
 **A の到達経路**（成立を確認済み）: `metadata` 以外の任意キーは Pipe の `body` に素通しされる（`routers/functions.py:206`）。一般ユーザが `/api/chat/completions` へ次を投げるだけでよい。
 
 ```json
-{"model": "descript_pipe", "descript_op": "import_media",
- "descript_args": {"file_id": "<他ユーザのファイル id>"}}
+{
+  "model": "descript_pipe",
+  "descript_op": "import_media",
+  "descript_args": { "file_id": "<他ユーザのファイル id>" }
+}
 ```
 
 `_dispatch`（`:1917-1921`）→ `_op_import_media`（`:2417-2422`）→ `:3115` → `_resolve_stored_file` → `_upload_media`（`:3210-`）で、他人の動画が攻撃者自身の Descript プロジェクトへ PUT される。もう 1 つの入口として `body["descript_media"]`（`_as_media_list`, `:1974-1995`）もある。
@@ -305,11 +308,18 @@ USER_PERMISSIONS_FEATURES_AUTOMATIONS=false
 ```
 ENABLE_ADMIN_CHAT_ACCESS=false
 ENABLE_ADMIN_EXPORT=false
-BYPASS_ADMIN_ACCESS_CONTROL=false
+BYPASS_ADMIN_ACCESS_CONTROL=true   # ← 2026-08-28 改訂。理由は下記
 BYPASS_MODEL_ACCESS_CONTROL=false
 ```
 
 これらは製品 UI 経路を塞ぐだけであり、DB やインフラへの直接アクセスは別問題である点を手順書に明記する。
+
+> **改訂（2026-08-28）— `BYPASS_ADMIN_ACCESS_CONTROL` は `false` にできない。**
+> 当初この節は 4 つとも `false` にすることで「管理者の越境」を塞ぐ設計だった。しかし `false` にすると `main.py:1077` の条件が管理者でも真になり、管理者も `check_model_access` を通る。同関数は `model` テーブルに行が無いモデルを問答無用で拒否する（`utils/models.py:447`）ため、**Workspace → Models に登録していないモデルが全員にとって使用不能**になる。
+>
+> しかも可視性を決める `get_filtered_models` は未登録モデルを管理者に見せる（`utils/models.py:521-523`）ので、**モデルピッカーには並ぶのに選ぶと 400 `Model not found`** という食い違いになる。実測では MODELS プール 122 件に対し Model エントリが 2 件しか無く、`POST /api/chat/completions` が全件 400 になっていた。
+>
+> upstream 既定も `true`（`config.py:2062` が `ENABLE_ADMIN_WORKSPACE_CONTENT_ACCESS` を継承）。一般ユーザ側の制限は `BYPASS_MODEL_ACCESS_CONTROL=false` が担うため、管理者側を `true` に戻しても一般ユーザの分離は損なわれない。失うのは「管理者が Model ACL を素通しできない」という上乗せ分だけで、`ENABLE_ADMIN_CHAT_ACCESS=false` / `ENABLE_ADMIN_EXPORT=false` は引き続き有効。
 
 ### 4.4 監査
 
@@ -336,18 +346,67 @@ JWT_EXPIRES_IN=4h                # 既存の値を維持
 
 Functions を配布するための Model エントリを作る。
 
-| Model エントリ | base | 紐づけ | grant |
-|---|---|---|---|
-| Descript 編集 | `pipe.descript_pipe` | `filterIds: [descript_guard]`, `actionIds: [descript_studio]` | `group: team-a` / `team-b` / `team-c` の read を 3 つ |
-| `cptr/<workspace>`（team-a） | Computer A の gateway モデル | — | `group: team-a`, read |
-| `cptr/<workspace>`（team-b） | Computer B の gateway モデル | — | `group: team-b`, read |
-| `cptr/<workspace>`（team-c） | Computer C の gateway モデル | — | `group: team-c`, read |
+| Model エントリ               | base                         | 紐づけ                                                        | grant                                                 |
+| ---------------------------- | ---------------------------- | ------------------------------------------------------------- | ----------------------------------------------------- |
+| Descript 編集                | `descript_pipe`              | `filterIds: [descript_guard]`, `actionIds: [descript_studio]` | `group: team-a` / `team-b` / `team-c` の read を 3 つ |
+| `cptr/<workspace>`（team-a） | Computer A の gateway モデル | —                                                             | `group: team-a`, read                                 |
+| `cptr/<workspace>`（team-b） | Computer B の gateway モデル | —                                                             | `group: team-b`, read                                 |
+| `cptr/<workspace>`（team-c） | Computer C の gateway モデル | —                                                             | `group: team-c`, read                                 |
 
 Descript の Pipe は 3 チームで同一の機能を使うため、**Model エントリは 1 つとし、そこに 3 つの group grant を付ける**。チームごとに UserValves の既定や説明文を変えたくなった時点でエントリを分割する。
 
 Computer は接続 URL がチームごとに異なるため、gateway モデルは最初から 3 エントリに分かれる。
 
 `is_global` は 3 つの Function すべてでオフにする。オンにすると全モデル・全ユーザに適用され、モデル単位の制御が意味を失う。
+
+### 4.7 Basic RAG とナレッジベース（2026-08-28 追記）
+
+本節はマルチユーザ設計の当初スコープ外だったが、Basic RAG の設定が §4.2 の権限方針と直接干渉するため、決定を記録する。
+
+**構成**
+
+| 項目               | 選択     | 理由                                                                                       |
+| ------------------ | -------- | ------------------------------------------------------------------------------------------ |
+| Embedding engine   | OpenAI   | 既定の SentenceTransformers は**ワーカーあたり約 500MB**。`UVICORN_WORKERS=4` では非現実的 |
+| Content extraction | Docling（独自イメージ） | 既定の pypdf は継続的な取り込みでメモリリークする。公式イメージは英語の tesseract 言語パックしか持たないため、`docker/docling/Dockerfile` で `tesseract-langpack-jpn` / `-jpn_vert` を足す（CentOS Stream 9 の AppStream にあり EPEL 不要） |
+| Vector database    | PGVector | 既定の ChromaDB は SQLite ベースで fork-safe ではない（複数ワーカー / 複数レプリカで破綻） |
+
+3 点とも「マルチユーザだから必要になる」選択であり、独立した好みではない。
+
+**ナレッジベースの運用: 管理者が作り、チームに read grant を配る**
+
+`USER_PERMISSIONS_WORKSPACE_KNOWLEDGE_ACCESS` は upstream 既定の `false` を維持する（`config.py:1716-1717`）。根拠は次の 3 点。
+
+1. 一般ユーザの作成は 401 になる（`routers/knowledge.py:286-292`）が、**利用は塞がれない**。`GET /api/v1/knowledge/` は `get_verified_user` のみ（同 `:130`）なので、read grant を貰ったナレッジベースはチャットの `#` から使える。「作成 = 管理者 / 利用 = 全員」という分割が権限 1 つで成立する
+2. §4.2 で `USER_PERMISSIONS_WORKSPACE_KNOWLEDGE_ALLOW_SHARING=false` としたため、仮に作成を開けても一般ユーザは共有できない（`filter_allowed_access_grants()` が保存時に grant を黙って削る）。作成だけ許しても、チームで使えるナレッジベースは作れない
+3. 管理者は `filter_allowed_access_grants()` の対象外である（`utils/access_control/__init__.py:249` で早期 return）。したがって管理者が付けたグループ grant は削られず、この運用が成立する
+
+**検索経路の認可（調査結果）**
+
+RAG の検索経路は upstream 側で二重に守られている。層①の設計と矛盾しない。
+
+```
+アイテム単位の検査        retrieval/utils.py:1468 / 1499 / 1514
+                          （admin / 所有者 / access_grants / フォルダ）
+    ↓ 通過したコレクション名だけ
+コレクション名単位の再検査 filter_accessible_collections (:1258)
+                          file-* → has_access_to_file
+                          user-memory-* → 自分の ID と一致必須
+                          knowledge-bases → 非管理者は常に拒否
+                          その他 → 実在する KB かつ check_access_by_user_id
+```
+
+ただし次の 2 つの環境変数はこの認可を丸ごと無効化する。いずれも PersistentConfig ではないため `.env` で再起動のたびに効く。**明示的に `false` を書いて固定する**。
+
+- `BYPASS_RETRIEVAL_ACCESS_CONTROL`（`env.py:787`）— `retrieval/utils.py:1489 / 1565 / 1590 / 1598` の 4 箇所が検査を飛ばし、クライアントが送った `collection_name` をそのままベクトル DB へ投げる
+- `ENABLE_RETRIEVAL_UNSCOPED_COLLECTIONS`（`env.py:793`）— KB に紐付かないコレクション名を既定拒否せず通す
+
+**落とし穴（設定では直せないもの）**
+
+- **モデルに紐付けたナレッジは、モデルの grant とは別にナレッジ自身の read grant が要る**（`retrieval/utils.py:1514-1521`）。付け忘れると「モデルは選べるのに検索結果だけ 0 件」になる。§4.6 の Model エントリ表と対になる作業であり、手順書ではステップ 14 に置いた
+- 本構成は `function_calling=native` のため、モデル紐付けナレッジは `utils/middleware.py:2466` の legacy RAG 注入経路を通らず、`kb_exec` / `query_knowledge_files` というビルトインツールとしてモデルに渡る（`utils/tools.py:602-609`）。`ENABLE_KB_EXEC=true` はこの構成でこそ意味を持つ
+- **日本語 OCR は設定ではなくイメージの問題である。** 公式イメージの tesseract は英語の言語パックしか持たない（docling-serve の `os-packages.txt` に `tesseract-langpack-eng` のみ）。設定で `do_ocr: true` にしても、日本語のスキャン PDF は文字化けした本文としてベクトル DB に入り検索結果を汚染する。主に日本語文書を扱う本プロジェクトでは独自イメージを作る方を選んだ（`docker/docling/Dockerfile`）。easyocr へ切り替える案は、日本語モデルがイメージに焼かれておらず実行時の外部通信が必要になるため採らない（`svc-docling-net` の `internal: true` を外すことになる）
+- 管理者は `filter_accessible_collections()` を無条件で通過する（`:1289`）。§7 の限界 12 として記録する
 
 ## 5. 設計: 層② 実行環境
 
@@ -356,12 +415,12 @@ Computer は接続 URL がチームごとに異なるため、gateway モデル�
 `docker-compose.yml` の変更点。
 
 ```yaml
-  open-terminal:
-    environment:
-      OPEN_TERMINAL_MULTI_USER: "true"
-      OPEN_TERMINAL_MAX_SESSIONS: ${OPEN_TERMINAL_MAX_SESSIONS:-32}
-    volumes:
-      - open-terminal-home:/home        # 名前・マウント先とも変更
+open-terminal:
+  environment:
+    OPEN_TERMINAL_MULTI_USER: "true"
+    OPEN_TERMINAL_MAX_SESSIONS: ${OPEN_TERMINAL_MAX_SESSIONS:-32}
+  volumes:
+    - open-terminal-home:/home # 名前・マウント先とも変更
 ```
 
 `volumes:` 宣言の `open-terminal-data:` を `open-terminal-home:` に置き換える。既存ボリュームは削除する（§3.7）。
@@ -377,9 +436,9 @@ Computer は接続 URL がチームごとに異なるため、gateway モデル�
 **TERMINAL_PROXY_HEADERS**: Open WebUI 側に sandbox CSP を追加する。
 
 ```yaml
-      TERMINAL_PROXY_HEADERS: >-
-        {"Content-Security-Policy": "sandbox allow-scripts; default-src 'none'; img-src 'self' data:; style-src 'unsafe-inline'",
-        "X-Content-Type-Options": "nosniff", "Referrer-Policy": "no-referrer", "X-Frame-Options": "DENY"}
+TERMINAL_PROXY_HEADERS: >-
+  {"Content-Security-Policy": "sandbox allow-scripts; default-src 'none'; img-src 'self' data:; style-src 'unsafe-inline'",
+  "X-Content-Type-Options": "nosniff", "Referrer-Policy": "no-referrer", "X-Frame-Options": "DENY"}
 ```
 
 こちらは `config.py:391-393` に try/except があるため、壊れた JSON でも `{}` にフォールバックして起動する。
@@ -417,14 +476,14 @@ x-computer-base: &computer-base
 
 **チームごとの差分**
 
-| 項目 | team-a | team-b | team-c |
-|---|---|---|---|
-| サービス名 | `open-webui-computer-a` | `-b` | `-c` |
-| コンテナ名 | `svc-open-webui-computer-a` | `-b` | `-c` |
-| ホストポート | 8001 | 8002 | 8003 |
-| ネットワーク | `svc-computer-net-a` | `-b` | `-c` |
-| ボリューム | `computer-a-{data,workspace,cache,local}` + `codex-home-a` | `-b` | `-c` |
-| gateway キー | `OPEN_WEBUI_COMPUTER_GATEWAY_KEY_A` | `_B` | `_C` |
+| 項目         | team-a                                                     | team-b | team-c |
+| ------------ | ---------------------------------------------------------- | ------ | ------ |
+| サービス名   | `open-webui-computer-a`                                    | `-b`   | `-c`   |
+| コンテナ名   | `svc-open-webui-computer-a`                                | `-b`   | `-c`   |
+| ホストポート | 8001                                                       | 8002   | 8003   |
+| ネットワーク | `svc-computer-net-a`                                       | `-b`   | `-c`   |
+| ボリューム   | `computer-a-{data,workspace,cache,local}` + `codex-home-a` | `-b`   | `-c`   |
+| gateway キー | `OPEN_WEBUI_COMPUTER_GATEWAY_KEY_A`                        | `_B`   | `_C`   |
 
 3 台とも `build:` を持ち、同じ `image:` タグを指す。BuildKit のキャッシュにより実質 1 回のビルドになる。
 
@@ -437,15 +496,22 @@ x-computer-base: &computer-base
 **ネットワーク**: `svc-computer-net` を `svc-computer-net-a/b/c` の 3 本に分割し、Open WebUI が 3 本すべてに参加する。これによりチーム間の Computer コンテナが相互に到達不能になる。
 
 ```yaml
-  open-webui:
-    networks: [svc-net, svc-terminal-net, svc-computer-net-a, svc-computer-net-b, svc-computer-net-c]
+open-webui:
+  networks:
+    [
+      svc-net,
+      svc-terminal-net,
+      svc-computer-net-a,
+      svc-computer-net-b,
+      svc-computer-net-c,
+    ]
 ```
 
 **Open WebUI 側の接続**
 
 ```yaml
-      OPENAI_API_BASE_URLS: ${OPENAI_API_BASE_URL:-https://api.openai.com/v1};http://open-webui-computer-a:8000/v1;http://open-webui-computer-b:8000/v1;http://open-webui-computer-c:8000/v1
-      OPENAI_API_KEYS: ${OPENAI_API_KEY};${OPEN_WEBUI_COMPUTER_GATEWAY_KEY_A:-};${OPEN_WEBUI_COMPUTER_GATEWAY_KEY_B:-};${OPEN_WEBUI_COMPUTER_GATEWAY_KEY_C:-}
+OPENAI_API_BASE_URLS: ${OPENAI_API_BASE_URL:-https://api.openai.com/v1};http://open-webui-computer-a:8000/v1;http://open-webui-computer-b:8000/v1;http://open-webui-computer-c:8000/v1
+OPENAI_API_KEYS: ${OPENAI_API_KEY};${OPEN_WEBUI_COMPUTER_GATEWAY_KEY_A:-};${OPEN_WEBUI_COMPUTER_GATEWAY_KEY_B:-};${OPEN_WEBUI_COMPUTER_GATEWAY_KEY_C:-}
 ```
 
 `OPENAI_API_CONFIGS` は添字 `"0"` に本物の OpenAI、`"1"` `"2"` `"3"` に各 Computer を置く。`"1"`〜`"3"` はいずれも既存と同じヘッダ 5 種と `api_type: ""`（Chat Completions）を持つ。
@@ -460,11 +526,11 @@ x-computer-base: &computer-base
 
 ### 6.1 変更するヘルパ
 
-| ヘルパ | 現在 | 変更後 |
-|---|---|---|
-| `_load_state` | `Chats.get_chat_by_id(chat_id)` | `Chats.get_chat_by_id_and_user_id(chat_id, user_id)` |
-| `_save_state` | 同上 + `Chats.update_chat_by_id` | 取得をスコープ付きに変更。取得できなければ書き込まない |
-| `_resolve_stored_file` | `Files.get_file_by_id(file_id)` | `Files.get_file_by_id_and_user_id(file_id, user_id)` |
+| ヘルパ                 | 現在                             | 変更後                                                 |
+| ---------------------- | -------------------------------- | ------------------------------------------------------ |
+| `_load_state`          | `Chats.get_chat_by_id(chat_id)`  | `Chats.get_chat_by_id_and_user_id(chat_id, user_id)`   |
+| `_save_state`          | 同上 + `Chats.update_chat_by_id` | 取得をスコープ付きに変更。取得できなければ書き込まない |
+| `_resolve_stored_file` | `Files.get_file_by_id(file_id)`  | `Files.get_file_by_id_and_user_id(file_id, user_id)`   |
 
 `_load_state` と `_save_state` は 3 ファイル共通ヘルパであるため、**`docs/DetailedDesign/functions_contract.md` §5.3 を正本として先に改訂し、そこから 3 ファイルへ同一展開する**。`_resolve_stored_file` は `descript_pipe.py` のみ。
 
@@ -472,10 +538,10 @@ x-computer-base: &computer-base
 
 いずれも fail-closed とし、他ユーザのリソースの存在自体を推測させない。
 
-| ヘルパ | 拒否時 |
-|---|---|
-| `_load_state` | `{}` を返す（state が無い場合と同じ） |
-| `_save_state` | 書き込まずに戻る。`_log_debug` で記録する |
+| ヘルパ                 | 拒否時                                     |
+| ---------------------- | ------------------------------------------ |
+| `_load_state`          | `{}` を返す（state が無い場合と同じ）      |
+| `_save_state`          | 書き込まずに戻る。`_log_debug` で記録する  |
 | `_resolve_stored_file` | 既存のファイル未検出エラー経路に合流させる |
 
 エラーコードは既存のものを流用し、新規に増やさない。`scripts/check_functions.py` がエラーコードのファイル間整合を検査するため、追加する場合は 3 ファイルすべてに展開が必要になる。
@@ -502,33 +568,43 @@ frontmatter、クラス属性の位置、`stream` の引数名、`replace_import
 
 本設計が守るのは事故であって悪意ではない。以下は Enterprise License 無しでは解決できない。
 
-| # | 限界 | 影響 |
-|---|---|---|
-| 1 | Open Terminal のセッション横取り | 同一 Terminal を使う全ユーザが、他人の PTY セッションを一覧・アタッチ・削除でき、実行中コマンドの文字列と出力を読める |
-| 2 | Open Terminal のポート共有 | ユーザがバインドしたポートに他ユーザの proxy URL から到達できる |
-| 3 | Open Terminal のリソース共有 | CPU / メモリ / `MAX_SESSIONS` は全ユーザで分け合う |
-| 4 | Open Terminal のユーザ名衝突 | ユーザ ID の先頭 8 文字が一致する 2 人は同じ OS アカウントに合流する（10 名規模では実質無視できる） |
-| 5 | Computer のチーム内無分離 | 同一チームのメンバーは互いのファイル・端末セッション・gateway キーに到達できる |
-| 6 | Computer のロール降格が最大 30 日効かない | 即時失効には `[server] secret` のローテートが必要で、全員ログアウトとプロバイダキー復号不能を伴う |
-| 7 | Computer の gateway キー一覧・削除が無フィルタ | `GET /v1/keys` / `DELETE /v1/keys/{id}` に所有者検査が無い（コンテナ境界で緩和される） |
-| 8 | Functions の read-modify-write レース | §6.5 |
-| 9 | 監査の粒度 | Computer の `CPTR_AUDIT_LOG_LEVEL` は API レベルの記録であり、端末操作の全トランスクリプトではない |
+| #   | 限界                                              | 影響                                                                                                                                                                                                                                                                                                 |
+| --- | ------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 1   | Open Terminal のセッション横取り                  | 同一 Terminal を使う全ユーザが、他人の PTY セッションを一覧・アタッチ・削除でき、実行中コマンドの文字列と出力を読める                                                                                                                                                                                |
+| 2   | Open Terminal のポート共有                        | ユーザがバインドしたポートに他ユーザの proxy URL から到達できる                                                                                                                                                                                                                                      |
+| 3   | Open Terminal のリソース共有                      | CPU / メモリ / `MAX_SESSIONS` は全ユーザで分け合う                                                                                                                                                                                                                                                   |
+| 4   | Open Terminal のユーザ名衝突                      | ユーザ ID の先頭 8 文字が一致する 2 人は同じ OS アカウントに合流する（10 名規模では実質無視できる）                                                                                                                                                                                                  |
+| 5   | Computer のチーム内無分離                         | 同一チームのメンバーは互いのファイル・端末セッション・gateway キーに到達できる                                                                                                                                                                                                                       |
+| 6   | Computer のロール降格が最大 30 日効かない         | 即時失効には `[server] secret` のローテートが必要で、全員ログアウトとプロバイダキー復号不能を伴う                                                                                                                                                                                                    |
+| 7   | Computer の gateway キー一覧・削除が無フィルタ    | `GET /v1/keys` / `DELETE /v1/keys/{id}` に所有者検査が無い（コンテナ境界で緩和される）                                                                                                                                                                                                               |
+| 8   | Functions の read-modify-write レース             | §6.5                                                                                                                                                                                                                                                                                                 |
+| 9   | 監査の粒度                                        | Computer の `CPTR_AUDIT_LOG_LEVEL` は API レベルの記録であり、端末操作の全トランスクリプトではない                                                                                                                                                                                                   |
+| 10  | 管理者は RAG 経由で全ファイル・全ナレッジを読める | `filter_accessible_collections()` が `user.role == 'admin'` で無条件に通す（`retrieval/utils.py:1289`）。`BYPASS_ADMIN_ACCESS_CONTROL` とは別系統で、設定では閉じられない（§4.7）。**手順書 `docs/Setup/multi_user_setup.md` では限界 12**（Playwright MCP の 2 件が先に入っているため番号がずれる） |
 
 1〜3 を解決するには Terminals オーケストレータ（Enterprise License）が必要である。5 を解決するにはユーザごとの Computer コンテナが必要で、10 名なら 10 コンテナになる。
 
 ## 8. 変更するファイル
 
-| ファイル | 変更内容 |
-|---|---|
-| `docker-compose.yml` | Open Terminal のマルチユーザ化とボリューム変更、Computer の 3 台化、ネットワーク分割、開発サーバポートの削除、Open WebUI の接続 4 本化と `TERMINAL_PROXY_HEADERS` 追加 |
-| `.env.example` | 新節「マルチユーザ」、Computer 3 台分の変数、権限系変数の追加、開発サーバポート変数の削除 |
-| `docs/Setup/multi_user_setup.md` | 新規。セットアップの順序と既知の限界 |
-| `docs/DetailedDesign/functions_contract.md` | §5.3 の共通ヘルパ改訂、既知の制約の追記 |
-| `scripts/check_functions.py` | `SHARED` リストに `_user_id` を追加（新しい共通ヘルパをドリフト検査の対象にする） |
-| `functions/descript_pipe.py` | `_load_state` / `_save_state` / `_resolve_stored_file` |
-| `functions/descript_studio.py` | `_load_state` / `_save_state` |
-| `functions/descript_guard.py` | `_load_state` / `_save_state` |
-| `.claude/CLAUDE.md` | マルチユーザ前提の追記 |
+| ファイル                                    | 変更内容                                                                                                                                                               |
+| ------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `docker-compose.yml`                        | Open Terminal のマルチユーザ化とボリューム変更、Computer の 3 台化、ネットワーク分割、開発サーバポートの削除、Open WebUI の接続 4 本化と `TERMINAL_PROXY_HEADERS` 追加 |
+| `.env.example`                              | 新節「マルチユーザ」、Computer 3 台分の変数、権限系変数の追加、開発サーバポート変数の削除                                                                              |
+| `docs/Setup/multi_user_setup.md`            | 新規。セットアップの順序と既知の限界                                                                                                                                   |
+| `docs/DetailedDesign/functions_contract.md` | §5.3 の共通ヘルパ改訂、既知の制約の追記                                                                                                                                |
+| `scripts/check_functions.py`                | `SHARED` リストに `_user_id` を追加（新しい共通ヘルパをドリフト検査の対象にする）                                                                                      |
+| `functions/descript_pipe.py`                | `_load_state` / `_save_state` / `_resolve_stored_file`                                                                                                                 |
+| `functions/descript_studio.py`              | `_load_state` / `_save_state`                                                                                                                                          |
+| `functions/descript_guard.py`               | `_load_state` / `_save_state`                                                                                                                                          |
+| `.claude/CLAUDE.md`                         | マルチユーザ前提の追記                                                                                                                                                 |
+
+§4.7（2026-08-28 追記）に伴う追加分:
+
+| ファイル                         | 変更内容                                                                                                           |
+| -------------------------------- | ------------------------------------------------------------------------------------------------------------------ |
+| `docker-compose.yml`             | `docling-serve` サービスと `svc-docling-net`（`internal: true`）の追加、`UVICORN_WORKERS` 増加に伴う接続数の見直し |
+| `docker/docling/Dockerfile`      | 新規。公式 docling-serve イメージに日本語の tesseract 言語パックを追加（ビルド時に `test -f` で実在を検証）        |
+| `.env.example`                   | 13 節を「Basic RAG」として全面改訂、6 節 `UVICORN_WORKERS` を 4 へ、18 節にナレッジ権限と認可バイパス 2 件を追加   |
+| `docs/Setup/multi_user_setup.md` | ステップ 14「Basic RAG とナレッジベース」を追加（以降を繰り下げ）、既知の限界 12 を追加                            |
 
 ## 9. セットアップの順序
 
@@ -552,14 +628,14 @@ frontmatter、クラス属性の位置、`stream` の引数名、`replace_import
 
 ## 10. 検証
 
-| 対象 | 方法 |
-|---|---|
-| Functions | `python3 scripts/check_functions.py` が 0 を返す |
-| compose | `docker compose config -q` が通る |
-| Terminal の分離 | 2 アカウントでログインし、それぞれのファイルブラウザに相手のファイルが出ないことを確認する |
-| Terminal の永続化 | コンテナを再作成しても各ユーザの home が残ることを確認する |
-| Computer の出し分け | team-a のユーザに `cptr/<team-b のワークスペース>` が見えないことを確認する |
-| 権限 | グループ未所属ユーザにターミナルと Descript モデルが見えないことを確認する |
+| 対象                   | 方法                                                                                              |
+| ---------------------- | ------------------------------------------------------------------------------------------------- |
+| Functions              | `python3 scripts/check_functions.py` が 0 を返す                                                  |
+| compose                | `docker compose config -q` が通る                                                                 |
+| Terminal の分離        | 2 アカウントでログインし、それぞれのファイルブラウザに相手のファイルが出ないことを確認する        |
+| Terminal の永続化      | コンテナを再作成しても各ユーザの home が残ることを確認する                                        |
+| Computer の出し分け    | team-a のユーザに `cptr/<team-b のワークスペース>` が見えないことを確認する                       |
+| 権限                   | グループ未所属ユーザにターミナルと Descript モデルが見えないことを確認する                        |
 | Functions の所有者検証 | ユーザ A のチャットで得た `chat_id` をユーザ B のリクエストに載せ、state が返らないことを確認する |
 
 ビルド・起動系のコマンドはリポジトリのルールにより自動実行しない。手順書に記載し、利用者が実行する。

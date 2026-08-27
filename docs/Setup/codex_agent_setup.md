@@ -60,6 +60,8 @@ docker compose build
 
 `open-webui-computer-a` / `-b` / `-c` は公式イメージをそのまま使わず、`docker/computer/Dockerfile` でビルドする。3 台とも同じ `image: svc/open-webui-computer:local` タグを指すため、サービス名を指定しない `docker compose build` だけでよい（実質 1 回のビルドで 3 台分に反映される）。codex CLI はここでイメージへ焼き込まれる。
 
+> Computer だけをビルドしたい場合は `docker compose build open-webui-computer-a` と指定する。サービス名を省くと Docling（`docker/docling/Dockerfile`。日本語 OCR の言語パック追加）も一緒にビルドされる。どちらも冪等なので、まとめて流して問題ない。
+
 > **なぜビルドが必要なのか**
 >
 > 公式イメージ `ghcr.io/open-webui/computer:latest` は意図的に最小構成で、入っているのは git / openssl / tar / Python 3.12（+ pip, uv）だけ。node も npm も curl も gcc も無い。そして非 root ユーザ `cptr`（uid 1000）で動き、`sudo` も無い。

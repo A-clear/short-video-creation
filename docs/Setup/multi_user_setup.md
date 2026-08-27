@@ -23,12 +23,13 @@
 
 構成は 3 層に分かれる。層ごとに分離の単位と強さが異なる点が本設計の核心。
 
-| 層                               | コンポーネント                                                                                      | 分離の単位                                               | 分離の強さ                                                                                                                      |
-| -------------------------------- | --------------------------------------------------------------------------------------------------- | -------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------- |
-| ① 認証・認可                     | Open WebUI（グループ / access_grants / USER_PERMISSIONS_*）                                         | ユーザ・グループ                                         | アプリ UI 経路の ACL。DB・インフラへの直接アクセスは別問題（`ENABLE_ADMIN_CHAT_ACCESS` 等は UI 経路のみを塞ぐ）                 |
-| ② 実行環境 — Open Terminal       | 共有 1 コンテナ（`open-terminal` サービス、`OPEN_TERMINAL_MULTI_USER=true` の組み込みマルチユーザ） | **ファイルのみ**（ユーザごとの Linux アカウントと home） | 弱い。PTY セッション・プロセス出力・ポート・CPU/メモリは全ユーザ共有                                                            |
-| ② 実行環境 — Open WebUI Computer | チーム別 3 コンテナ（`open-webui-computer-a` / `-b` / `-c`）                                        | **コンテナ境界**（チーム単位）                           | チーム間は強い（ネットワーク分割済み）。**チーム内は分離なし**（ファイル・端末セッション・gateway キーすべて共有）              |
-| ③ アプリ — Descript Functions    | `functions/descript_pipe.py` 等の `chat_id` / `file_id` スコープ検証                                | ユーザ単位（`user_id`）                                  | Descript 自体の OAuth トークンは元々ユーザ単位で分離済み。Functions 側の state 読み書きにも所有者検証を追加（本設計のスコープ） |
+| 層                               | コンポーネント                                                                                      | 分離の単位                                               | 分離の強さ                                                                                                                                                                                        |
+| -------------------------------- | --------------------------------------------------------------------------------------------------- | -------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| ① 認証・認可                     | Open WebUI（グループ / access_grants / USER_PERMISSIONS_*）                                         | ユーザ・グループ                                         | アプリ UI 経路の ACL。DB・インフラへの直接アクセスは別問題（`ENABLE_ADMIN_CHAT_ACCESS` 等は UI 経路のみを塞ぐ）                                                                                   |
+| ② 実行環境 — Open Terminal       | 共有 1 コンテナ（`open-terminal` サービス、`OPEN_TERMINAL_MULTI_USER=true` の組み込みマルチユーザ） | **ファイルのみ**（ユーザごとの Linux アカウントと home） | 弱い。PTY セッション・プロセス出力・ポート・CPU/メモリは全ユーザ共有                                                                                                                              |
+| ② 実行環境 — Open WebUI Computer | チーム別 3 コンテナ（`open-webui-computer-a` / `-b` / `-c`）                                        | **コンテナ境界**（チーム単位）                           | チーム間は強い（ネットワーク分割済み）。**チーム内は分離なし**（ファイル・端末セッション・gateway キーすべて共有）                                                                                |
+| ② 実行環境 — Playwright MCP      | チーム別 3 コンテナ（`playwright-mcp-a` / `-b` / `-c`）                                             | **コンテナ境界**（チーム単位）                           | チーム間は強い（`svc-playwright-net-*` で Computer と 1:1。`open-webui` 本体にも到達できない）。**チーム内はブラウザセッションを共有**（既知の限界 10）。任意なので使わない場合は起動しなくてよい |
+| ③ アプリ — Descript Functions    | `functions/descript_pipe.py` 等の `chat_id` / `file_id` スコープ検証                                | ユーザ単位（`user_id`）                                  | Descript 自体の OAuth トークンは元々ユーザ単位で分離済み。Functions 側の state 読み書きにも所有者検証を追加（本設計のスコープ）                                                                   |
 
 3 層は独立して機能する。①だけでも Open WebUI 単体の可視性は制御できるが、②・③を設定しないとチャット経由で他人の実行環境やファイルに触れてしまう。
 
@@ -82,7 +83,7 @@ docker volume rm short-video-creation_open-terminal-data
 
 ## セットアップの順序
 
-順序を誤ると反映されない設定があるため、この順で行う（`docs/superpowers/specs/2026-08-27-multi-user-design.md` §9 の 13 ステップに、既存環境（移行）向けの手順を 1 つ追加した 14 ステップ）。
+順序を誤ると反映されない設定があるため、この順で行う（`docs/superpowers/specs/2026-08-27-multi-user-design.md` §9 の 13 ステップに、既存環境（移行）向けの手順・Basic RAG・Playwright MCP（任意）を追加した 16 ステップ）。
 
 1. **既存の Open Terminal コンテナとボリュームを削除する**（移行の場合のみ。前節「移行手順」参照。新規構築では不要）
 
@@ -92,9 +93,11 @@ docker volume rm short-video-creation_open-terminal-data
    diff .env.example .env   # 差分を確認しながら手で反映する（自動マージしない）
    ```
 
-   最低限、次の節を埋める: 10 節（`OAUTH_ALLOWED_DOMAINS` / `DEFAULT_USER_ROLE`）、14 節（`OPEN_TERMINAL_API_KEY` / `OPEN_TERMINAL_MAX_SESSIONS`）、15 節（`OPEN_WEBUI_COMPUTER_PORT_A/B/C` 等。ゲートウェイキーはステップ 6 まで空欄でよい）、17 節（`USER_PERMISSIONS_*` / `AUDIT_LOG_LEVEL` 等）。
+   最低限、次の節を埋める: 10 節（`OAUTH_ALLOWED_DOMAINS` / `DEFAULT_USER_ROLE`）、13 節（`DOCLING_API_KEY`。`openssl rand -hex 32`）、14 節（`OPEN_TERMINAL_API_KEY` / `OPEN_TERMINAL_MAX_SESSIONS`）、15 節（`OPEN_WEBUI_COMPUTER_PORT_A/B/C` 等。ゲートウェイキーはステップ 6 まで空欄でよい）、18 節（`USER_PERMISSIONS_*` / `AUDIT_LOG_LEVEL` 等）。
 
-3. **ビルドする**（3 台とも同じ `image: svc/open-webui-computer:local` タグを指すため実質 1 回のビルドになる）
+   > ⚠️ 6 節の `UVICORN_WORKERS` は 1 → 4 に変わった。**Open WebUI のバージョンを上げた直後の初回起動だけは 1 に戻すこと。** マイグレーションは `config.py:78` のモジュール読み込み時に走るため、`--workers 4` では 4 プロセスが同時に `alembic upgrade` を実行する。しかも `config.py:73-75` が例外を握り潰す（`log.exception` のみで再送出しない）ので、**スキーマが壊れても起動は成功してしまう**。
+
+3. **ビルドする**（対象は 2 サービス。Computer は 3 台とも同じ `image: svc/open-webui-computer:local` タグを指すため実質 1 回、加えて Docling の日本語 OCR イメージ `svc/docling-serve:local`）
 
    ```bash
    docker compose build
@@ -161,10 +164,12 @@ docker volume rm short-video-creation_open-terminal-data
 
     | 設定                                                                                                                                                                                                      | 反映方法                                                                                                                        |
     | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------- |
-    | `USER_PERMISSIONS_*`（21 件）/ `DEFAULT_USER_ROLE` / `AUDIT_LOG_LEVEL` / `TERMINAL_SERVER_CONNECTIONS` / `OPENAI_API_CONFIGS` / `OPENAI_API_BASE_URLS`                                                    | **PersistentConfig。既存 DB では `.env` は無視される。** 新規構築時のみ `.env` が効く。既存環境では Admin Settings で手入力する |
+    | `USER_PERMISSIONS_*`（22 件）/ `DEFAULT_USER_ROLE` / `AUDIT_LOG_LEVEL` / `TERMINAL_SERVER_CONNECTIONS` / `OPENAI_API_CONFIGS` / `OPENAI_API_BASE_URLS`                                                    | **PersistentConfig。既存 DB では `.env` は無視される。** 新規構築時のみ `.env` が効く。既存環境では Admin Settings で手入力する |
+    | Basic RAG（`.env` 13 節）: `CONTENT_EXTRACTION_ENGINE` / `DOCLING_SERVER_URL` / `DOCLING_API_KEY` / `DOCLING_PARAMS` / `RAG_TEXT_SPLITTER` / `CHUNK_SIZE` / `CHUNK_OVERLAP` / `RAG_TOP_K`                 | **PersistentConfig**（`config.py:2828-2894`）。既存環境では Admin Settings → Tools → Documents で手入力する（ステップ 14）      |
+    | `ENABLE_KB_EXEC` / `BYPASS_RETRIEVAL_ACCESS_CONTROL` / `ENABLE_RETRIEVAL_UNSCOPED_COLLECTIONS`                                                                                                            | 非 PersistentConfig（`env.py:787-906`）。`.env` の更新 + 再起動で効く                                                           |
     | `ENABLE_ADMIN_CHAT_ACCESS` / `ENABLE_ADMIN_EXPORT` / `BYPASS_ADMIN_ACCESS_CONTROL` / `BYPASS_MODEL_ACCESS_CONTROL` / `WEBUI_AUTH_COOKIE_SECURE` / `WEBUI_AUTH_COOKIE_SAME_SITE` / `OAUTH_ALLOWED_DOMAINS` | 非 PersistentConfig。`.env` の更新 + 再起動で効く                                                                               |
 
-    既存環境（前節「移行手順」を経た環境）では、Admin Settings → Users → Groups → Default Permissions で `.env.example` §17 の `USER_PERMISSIONS_*` の値を手で入れる。`DEFAULT_USER_ROLE` は Admin Settings → Users → Default User Role、`AUDIT_LOG_LEVEL` は Admin Settings → Audit Log で同様に設定する。`TERMINAL_SERVER_CONNECTIONS`（ステップ 11）と `OPENAI_API_CONFIGS` / `OPENAI_API_BASE_URLS`（ステップ 12）も同じ理由で `.env` だけでは反映されない点は、各ステップ側にも記載する。
+    既存環境（前節「移行手順」を経た環境）では、Admin Settings → Users → Groups → Default Permissions で `.env.example` §18 の `USER_PERMISSIONS_*` の値を手で入れる。`DEFAULT_USER_ROLE` は Admin Settings → Users → Default User Role、`AUDIT_LOG_LEVEL` は Admin Settings → Audit Log で同様に設定する。`TERMINAL_SERVER_CONNECTIONS`（ステップ 11）と `OPENAI_API_CONFIGS` / `OPENAI_API_BASE_URLS`（ステップ 12）も同じ理由で `.env` だけでは反映されない点は、各ステップ側にも記載する。
 
 11. **Admin Settings → Integrations で Open Terminal 接続に 3 グループの read grant を付ける**
 
@@ -191,9 +196,60 @@ docker volume rm short-video-creation_open-terminal-data
 
     詳細は次節「Functions の配布」を参照。
 
-14. **ユーザを招待し、承認してグループへ追加する**
+14. **Basic RAG を設定し、ナレッジベースを作ってチームに read grant を付ける**
+
+    Basic RAG の構成は Embedding = OpenAI（`text-embedding-3-large`）/ 抽出 = Docling / ベクトル DB = PGVector。**ナレッジベースは管理者が作り、チームに read grant を配る**運用とする。
+
+    **(a) 抽出エンジンと分割・検索の設定**
+
+    新規構築では `.env` 13 節が初回起動時に取り込まれるため、`Admin Settings → Tools → Documents` で次を確認するだけでよい。既存環境では PersistentConfig のため `.env` が無視される。同じ画面で手入力する。
+
+    | 項目                      | 値                                                                             |
+    | ------------------------- | ------------------------------------------------------------------------------ |
+    | Content Extraction Engine | Docling / `http://docling-serve:5001` / API キーは `.env` の `DOCLING_API_KEY` |
+    | Docling Parameters        | `{"do_ocr":true,"ocr_engine":"tesseract","ocr_lang":["jpn","eng"],"pdf_backend":"dlparse_v4","table_mode":"accurate"}` |
+    | Text Splitter             | Token（`cl100k_base`）                                                         |
+    | Markdown Header Splitting | On                                                                             |
+    | Chunk Size / Overlap      | 2000 / 200                                                                     |
+    | Top K                     | 15                                                                             |
+    | Embedding Model           | `text-embedding-3-large`（OpenAI）                                             |
+
+    疎通は文書を 1 件アップロードして確認する。`docker compose logs docling-serve` に `POST /v1/convert/file` が出れば通っている。
+
+    > ⚠️ **`do_ocr: true` は独自イメージが前提。** 公開イメージの tesseract は英語の言語パックしか持たない（docling-serve の `os-packages.txt` に `tesseract-langpack-eng` のみ）。`docker/docling/Dockerfile` で `tesseract-langpack-jpn` / `-jpn_vert` を足しているため成立する。**ステップ 3 の `docker compose build` を飛ばすと、日本語のスキャン PDF が文字化けした本文としてベクトル DB に入り検索結果を汚染する。** 疎通確認は `docker compose exec docling-serve tesseract --list-langs` に `jpn` が出るかで行う。
+
+    > ⚠️ **縦書きは `ocr_lang` に `jpn_vert` を明示的に足す必要がある。** tesseract は自動で切り替えない。言語パックはイメージに入っているので、縦組みの文書を扱うときだけ `["jpn","jpn_vert","eng"]` にする（横組みの精度が落ちるため既定では入れていない）。`force_ocr` は true にしないこと（デジタル PDF にも強制的に OCR がかかり、遅くなるうえ精度も落ちる）。
+
+    > ⚠️ **`RAG_EMBEDDING_MODEL` を後から変えてはいけない。** 次元が変わると既存コレクションと合わなくなり、再インデックスするまで検索が黙って空を返す。
+
+    **(b) ナレッジベースの作成と grant**
+
+    `USER_PERMISSIONS_WORKSPACE_KNOWLEDGE_ACCESS` は `false`（既定のまま）。一般ユーザは `POST /api/v1/knowledge/create` が 401 になる（`routers/knowledge.py:286-292`）ため、**作成できるのは管理者だけ**である。管理者が Workspace → Knowledge で作成し、ステップ 9 で作ったグループに read grant を付ける。
+
+    ```json
+    {
+      "principal_type": "group",
+      "principal_id": "<team-a の group_id>",
+      "permission": "read"
+    }
+    ```
+
+    管理者は `filter_allowed_access_grants()` の対象外なので（`utils/access_control/__init__.py:249` で早期 return）、`USER_PERMISSIONS_WORKSPACE_KNOWLEDGE_ALLOW_SHARING=false` があっても管理者が付けたグループ grant は削られない。この運用が成立するのはこの分岐があるため。
+
+    > ⚠️ **モデルにナレッジを紐づける場合、モデルの grant とは別にナレッジ自身の read grant が要る。** `retrieval/utils.py:1514-1521` の collection 分岐が `admin` / 所有者 / `AccessGrants.has_access(resource_type='knowledge')` / フォルダのいずれかを要求する。付け忘れると **モデルは選べるのに検索結果だけ 0 件**という、エラーの出ない壊れ方をする（ステップ 12 の「モデルピッカーには並ぶのに 400」と同じ形の食い違い）。
+
+    > ⚠️ 一般ユーザの**利用**は塞がっていない。`GET /api/v1/knowledge/` は `get_verified_user` のみ（`routers/knowledge.py:130`）なので、read grant を貰ったナレッジベースはチャット入力欄の `#` から使える。チャットへの一回限りのファイル添付（`USER_PERMISSIONS_CHAT_FILE_UPLOAD`、既定 `true`）も全ユーザが使える。
+
+15. **ユーザを招待し、承認してグループへ追加する**
 
     詳細は「ユーザの追加手順」を参照。
+
+16. **（任意）Playwright MCP を起動して各 Computer に登録する**
+
+    エージェントにブラウザで dev サーバを操作させたい場合のみ。人間が目で見るだけなら
+    Computer の Browser タブで足りるため不要。手順は `docs/Setup/playwright_mcp_setup.md`。
+    チーム間の分離は `svc-playwright-net-a` / `-b` / `-c` で保たれるが、
+    **チーム内ではブラウザセッションを共有する**（既知の限界 10）。
 
 ---
 
@@ -204,18 +260,39 @@ Functions（Actions / Pipes / Filters）そのものには **アクセス制御�
 - `is_active` — 有効 / 無効
 - `is_global` — 全モデル・全ユーザへの強制適用。**本プロジェクトでは 3 つの Function すべてでオフにする。** オンにするとモデル単位の出し分けが意味を失う
 
-Function を有効化すると `pipe.<id>` 形式のモデルが生えるが、`model` テーブルに対応する行が無いため一般ユーザには見えない（`utils/models.py:517-523` の `elif user.role == 'admin'` に落ちる）。可視性を出すには **Workspace → Models で Model エントリを作る** 必要がある。
+Function を有効化するとモデルが 1 つ生えるが、`model` テーブルに対応する行が無いため一般ユーザには見えない（`utils/models.py:517-523` の `elif user.role == 'admin'` に落ちる）。可視性を出すには **Workspace → Models で Model エントリを作る** 必要がある。
 
-| Model エントリ     | base                                               | 紐づけ                                                        | grant                                                 |
-| ------------------ | -------------------------------------------------- | ------------------------------------------------------------- | ----------------------------------------------------- |
-| Descript 編集      | `pipe.descript_pipe`                               | `filterIds: [descript_guard]`, `actionIds: [descript_studio]` | `group: team-a` / `team-b` / `team-c` の read を 3 つ |
-| Computer（team-a） | `cptr/<workspace>`（Computer A の gateway モデル） | —                                                             | `group: team-a` の read                               |
-| Computer（team-b） | `cptr/<workspace>`（Computer B の gateway モデル） | —                                                             | `group: team-b` の read                               |
-| Computer（team-c） | `cptr/<workspace>`（Computer C の gateway モデル） | —                                                             | `group: team-c` の read                               |
+> ⚠️ **生えるモデルの ID に `pipe.` という接頭辞は付かない。** `functions.py:129-133` は単一 Pipe（`pipes` 属性を持たない Function）に対して **Function の ID をそのままモデル ID にする**。`descript_pipe.py` から生えるモデルは `descript_pipe` であって `pipe.descript_pipe` ではない。`<function_id>.<sub_id>` 形式になるのは `pipes` を持つマニフォールドの場合だけ（`functions.py:104`）。
 
-Descript の Pipe は 3 チームで同一機能を使うため、Model エントリは 1 つに 3 グループの read grant を付ける形でよい。Computer は接続 URL がチームごとに異なる（`open-webui-computer-a` / `-b` / `-c` の 3 接続）ため、gateway モデルは最初から 3 エントリに分かれる。
+| Model エントリ     | base            | 紐づけ                                                        | grant                                                 |
+| ------------------ | --------------- | ------------------------------------------------------------- | ----------------------------------------------------- |
+| Descript 編集      | `descript_pipe` | `filterIds: [descript_guard]`, `actionIds: [descript_studio]` | `group: team-a` / `team-b` / `team-c` の read を 3 つ |
+| Computer（team-a） | `cptr/codex-a`  | —                                                             | `group: team-a` の read                               |
+| Computer（team-b） | `cptr/codex-b`  | —                                                             | `group: team-b` の read                               |
+| Computer（team-c） | `cptr/codex-c`  | —                                                             | `group: team-c` の read                               |
+
+Descript の Pipe は 3 チームで同一機能を使うため、Model エントリは 1 つに 3 グループの read grant を付ける形でよい。Computer は接続 URL がチームごとに異なる（`open-webui-computer-a` / `-b` / `-c` の 3 接続）ため、gateway モデルは最初から 3 エントリに分かれる。gateway モデルの実 ID は各 Computer のワークスペース名で決まるので、`GET /api/models` かモデルピッカーで実際の値を確認してから登録すること。
 
 未登録のモデルは管理者にしか見えない。Model エントリを作るまで、一般ユーザからは Descript の Pipe も Computer のワークスペースも不可視のままになる。
+
+### ⚠️ `BYPASS_ADMIN_ACCESS_CONTROL=false` にすると管理者も未登録モデルを使えない
+
+「未登録モデルは管理者にしか**見えない**」は可視性の話で、**使える**こととは別である。`BYPASS_ADMIN_ACCESS_CONTROL=false` にすると `main.py:1077` の条件が管理者でも真になり、管理者も `check_model_access` を通る。同関数は `model` テーブルに行が無いモデルを問答無用で拒否する（`utils/models.py:447`）。
+
+結果として **「モデルピッカーには並ぶのに、選んで送信すると 400 `Model not found`」** という状態になる。可視性を決める `get_filtered_models` は未登録モデルを管理者に見せ（`utils/models.py:521-523`）、実行可否を決める `check_model_access` は同じモデルを拒否するため、両者が食い違う。
+
+実測（2026-08-28、この構成）:
+
+| モデル                                           | `main.py:1070-1115` の結果 |
+| ------------------------------------------------ | -------------------------- |
+| Model エントリのあるモデル                       | OK                         |
+| `descript_pipe`（素の Pipe モデル）              | `Model not found`          |
+| `gpt-5.4` / `gpt-4o-mini` など素の OpenAI モデル | `Model not found`          |
+| `cptr/codex-a`（Model エントリ未作成）           | `Model not found`          |
+
+MODELS プール 122 件に対し Model エントリが 2 件しか無かったため、`POST /api/chat/completions` は全件 400 になっていた。**そのため本プロジェクトでは `BYPASS_ADMIN_ACCESS_CONTROL=true`（upstream 既定）を採る。** 一般ユーザ側の制限は `BYPASS_MODEL_ACCESS_CONTROL=false` が担うため、管理者側を true にしても一般ユーザが未登録モデルを使えるようにはならない。
+
+なお **Action → Pipe の RPC はこの影響を受けない。** `descript_studio.py` が `generate_chat_completion(..., bypass_filter=True)` で呼ぶため `chat.py:198` の検査を飛ばし、`descript_pipe` に Model エントリが無くても到達できる。壊れるのは「チャット UI でモデルを選ぶ」経路だけである。
 
 ---
 
@@ -240,16 +317,20 @@ Descript の Pipe は 3 チームで同一機能を使うため、Model エン�
 
 本設計が守るのは事故であって悪意ではない。以下は Enterprise License（Terminals オーケストレータ）無しでは解決できない。
 
-| #   | 限界                                                                                                                               | 影響                                                                                                                                                                                                              |
-| --- | ---------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| 1   | **Open Terminal は他人の PTY セッションにアタッチできる。** ファイル分離は本物だが、セッション・プロセス出力・ポートは全ユーザ共有 | 同一 Terminal を使う全ユーザが、他人の PTY セッションを一覧・アタッチ・削除でき、実行中コマンドの文字列と出力を読める                                                                                             |
-| 2   | Open Terminal のポート共有                                                                                                         | ユーザがバインドしたポートに他ユーザの proxy URL から到達できる                                                                                                                                                   |
-| 3   | Open Terminal のリソース共有                                                                                                       | CPU / メモリ / `OPEN_TERMINAL_MAX_SESSIONS` は全ユーザで分け合う（コンテナ全体の合計上限で、ユーザ単位ではない）                                                                                                  |
-| 4   | Open Terminal のユーザ名衝突                                                                                                       | ユーザ ID の先頭 8 文字が一致する 2 人は同じ OS アカウントに合流する（10 名規模では実質無視できる）                                                                                                               |
-| 5   | **同一チーム内の Computer には分離が無い。** 境界はチームのコンテナだけ                                                            | 同一チームのメンバーは互いのファイル・端末セッション・gateway キーに到達できる                                                                                                                                    |
-| 6   | **Computer のロール降格は最大 30 日効かない。** JWT が DB を読まないため                                                           | 管理者がユーザを降格しても、既存の JWT クッキー（有効期限 30 日）はフルアクセスのまま生き続ける。即時失効には `config.toml` の `[server] secret` ローテートが必要で、全員ログアウトとプロバイダキー復号不能を伴う |
-| 7   | Computer の gateway キー一覧・削除が無フィルタ                                                                                     | `GET /v1/keys` / `DELETE /v1/keys/{id}` に所有者検査が無い（コンテナ境界（チーム別 3 台化）で緩和されるが、チーム内では有効ではない）                                                                             |
-| 8   | Functions の read-modify-write レース                                                                                              | `Chats.update_chat_by_id` がチャット JSON を丸ごと置換するため、同一チャットの同時操作で state が後勝ちで失われうる。所有者検証（本手順書の対象）とは別の課題で、今回のスコープには含めない                       |
-| 9   | 監査の粒度                                                                                                                         | Computer の `OPEN_WEBUI_COMPUTER_AUDIT_LOG_LEVEL` は API レベルの記録であり、端末操作の全トランスクリプトではない                                                                                                 |
+| #   | 限界                                                                                                                               | 影響                                                                                                                                                                                                                                                                                                              |
+| --- | ---------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 1   | **Open Terminal は他人の PTY セッションにアタッチできる。** ファイル分離は本物だが、セッション・プロセス出力・ポートは全ユーザ共有 | 同一 Terminal を使う全ユーザが、他人の PTY セッションを一覧・アタッチ・削除でき、実行中コマンドの文字列と出力を読める                                                                                                                                                                                             |
+| 2   | Open Terminal のポート共有                                                                                                         | ユーザがバインドしたポートに他ユーザの proxy URL から到達できる                                                                                                                                                                                                                                                   |
+| 3   | Open Terminal のリソース共有                                                                                                       | CPU / メモリ / `OPEN_TERMINAL_MAX_SESSIONS` は全ユーザで分け合う（コンテナ全体の合計上限で、ユーザ単位ではない）                                                                                                                                                                                                  |
+| 4   | Open Terminal のユーザ名衝突                                                                                                       | ユーザ ID の先頭 8 文字が一致する 2 人は同じ OS アカウントに合流する（10 名規模では実質無視できる）                                                                                                                                                                                                               |
+| 5   | **同一チーム内の Computer には分離が無い。** 境界はチームのコンテナだけ                                                            | 同一チームのメンバーは互いのファイル・端末セッション・gateway キーに到達できる                                                                                                                                                                                                                                    |
+| 6   | **Computer のロール降格は最大 30 日効かない。** JWT が DB を読まないため                                                           | 管理者がユーザを降格しても、既存の JWT クッキー（有効期限 30 日）はフルアクセスのまま生き続ける。即時失効には `config.toml` の `[server] secret` ローテートが必要で、全員ログアウトとプロバイダキー復号不能を伴う                                                                                                 |
+| 7   | Computer の gateway キー一覧・削除が無フィルタ                                                                                     | `GET /v1/keys` / `DELETE /v1/keys/{id}` に所有者検査が無い（コンテナ境界（チーム別 3 台化）で緩和されるが、チーム内では有効ではない）                                                                                                                                                                             |
+| 8   | Functions の read-modify-write レース                                                                                              | `Chats.update_chat_by_id` がチャット JSON を丸ごと置換するため、同一チャットの同時操作で state が後勝ちで失われうる。所有者検証（本手順書の対象）とは別の課題で、今回のスコープには含めない                                                                                                                       |
+| 9   | 監査の粒度                                                                                                                         | Computer の `OPEN_WEBUI_COMPUTER_AUDIT_LOG_LEVEL` は API レベルの記録であり、端末操作の全トランスクリプトではない                                                                                                                                                                                                 |
+| 10  | **Playwright MCP のブラウザセッションはチーム内で 1 本。**                                                                         | `stdio_manager` が `server_id` だけでクライアントを使い回すため（`self._instances: dict[str, MCPClient]`）、Computer コンテナにつきブラウザは 1 つ。同一チームの別ユーザ・別チャットとタブを共有し、同時に触ると互いの画面が飛ぶ。ログイン済みの状態も共有される（限界 5 と同じ境界であり、新しい越境先ではない） |
+| 11  | **ブラウザ操作は監査に残らない。**                                                                                                 | cptr の監査は ASGI ミドルウェア（`utils/audit.py`）で**受信 HTTP のみ**を記録する。MCP ツール呼び出しは cptr からの送信なので対象外。Playwright MCP 側も既定でリクエストログを出さない。限界 9 の延長で、「どのページを開いたか」は残らない                                                                       |
 
-1〜3 を解決するには Terminals オーケストレータ（Enterprise License）が必要である。5 を解決するにはユーザごとの Computer コンテナが必要で、10 名なら 10 コンテナになる。
+| 12 | **管理者は RAG 経由で全ユーザの添付ファイルとナレッジを読める。** | `filter_accessible_collections()` は `user.role == 'admin'` で無条件に全コレクションを通す（`retrieval/utils.py:1289`）。`BYPASS_ADMIN_ACCESS_CONTROL` とは別系統の管理者バイパスで、設定では閉じられない。層①の他の管理者権限（`ENABLE_ADMIN_CHAT_ACCESS` 等）と同じ位置づけ |
+
+1〜3 を解決するには Terminals オーケストレータ（Enterprise License）が必要である。5 を解決するにはユーザごとの Computer コンテナが必要で、10 名なら 10 コンテナになる（10 と 11 も 5 と同じ根で、Computer を分ければ同時に解消する）。
