@@ -93,7 +93,7 @@ docker volume rm short-video-creation_open-terminal-data
    diff .env.example .env   # 差分を確認しながら手で反映する（自動マージしない）
    ```
 
-   最低限、次の節を埋める: 10 節（`OAUTH_ALLOWED_DOMAINS` / `DEFAULT_USER_ROLE`）、13 節（`DOCLING_API_KEY`。`openssl rand -hex 32`）、14 節（`OPEN_TERMINAL_API_KEY` / `OPEN_TERMINAL_MAX_SESSIONS`）、15 節（`OPEN_WEBUI_COMPUTER_PORT_A/B/C` 等。ゲートウェイキーはステップ 6 まで空欄でよい）、18 節（`USER_PERMISSIONS_*` / `AUDIT_LOG_LEVEL` 等）。
+   最低限、次の節を埋める: 10 節（`OAUTH_ALLOWED_DOMAINS` / `DEFAULT_USER_ROLE`）、13 節（`DOCLING_API_KEY`。`openssl rand -hex 32`。加えてリランクとチャンク分割の設定一式）、14 節（`OPEN_TERMINAL_API_KEY` / `OPEN_TERMINAL_MAX_SESSIONS`）、15 節（`OPEN_WEBUI_COMPUTER_PORT_A/B/C` 等。ゲートウェイキーはステップ 6 まで空欄でよい）、18 節（`USER_PERMISSIONS_*` / `AUDIT_LOG_LEVEL` 等）、19 節（`RERANKER_MODEL_ID` / `OPEN_WEBUI_OMP_NUM_THREADS`）。
 
    > ⚠️ 6 節の `UVICORN_WORKERS` は 1 → 4 に変わった。**Open WebUI のバージョンを上げた直後の初回起動だけは 1 に戻すこと。** マイグレーションは `config.py:78` のモジュール読み込み時に走るため、`--workers 4` では 4 プロセスが同時に `alembic upgrade` を実行する。しかも `config.py:73-75` が例外を握り潰す（`log.exception` のみで再送出しない）ので、**スキーマが壊れても起動は成功してしまう**。
 
@@ -102,6 +102,10 @@ docker volume rm short-video-creation_open-terminal-data
    ```bash
    docker compose build
    ```
+
+   > ⚠️ **ビルド対象は 2 つのままである。** リランクモデルはイメージに焼き込まず、
+   > `reranker-model-init` サービスが実行時に取得する。このサービスは
+   > `ghcr.io/open-webui/open-webui:main` をそのまま使うため追加のビルドは要らない。
 
 4. **Computer を 3 台起動し、初回セットアップ URL を拾って管理者アカウントを作る**
 
@@ -156,6 +160,12 @@ docker volume rm short-video-creation_open-terminal-data
 
    Open WebUI は起動時に有効な OpenAI 互換接続の `/v1/models` を引きに行くため、ステップ 6 のキー投入前に起動するとログが汚れる（致命的ではないが、キー未投入で先に起動した場合は `docker compose restart open-webui` で読み直させる）。
 
+   > ⚠️ **初回は `reranker-model-init` が先に走り、モデルの取得（約 280MB）が終わるまで Open WebUI は起動しない。** 数分かかる。取得に失敗すると `dependency failed to start` になり Open WebUI は上がらない（`docker-compose.yml` の `open-webui` の `depends_on` が `condition: service_completed_successfully` のため）。ログは `docker compose logs reranker-model-init` で確認する。
+   >
+   > オフラインで起動したい場合は、`docker-compose.yml` の `open-webui` から `reranker-model-init` の 2 行（`depends_on` の項目）を消し、`.env` の `RAG_RERANKING_MODEL_AUTO_UPDATE` を `true` に戻す。この 2 つは対になっており、片方だけ変えると 4 つのワーカーが起動時に同時ダウンロードを始める。
+   >
+   > 2 回目以降はキャッシュを見るだけなので待たされない（`scripts/init_reranker_model.py` が `local_files_only=True` を先に試すため）。
+
 9. **Admin Settings → Users → Groups で `team-a` / `team-b` / `team-c` を作る**
 
 10. **既存環境では、層①の PersistentConfig 値を Admin Settings で手入力する**（新規構築では `.env` がそのまま初回起動時に取り込まれるため、このステップは不要）
@@ -204,15 +214,23 @@ docker volume rm short-video-creation_open-terminal-data
 
     新規構築では `.env` 13 節が初回起動時に取り込まれるため、`Admin Settings → Tools → Documents` で次を確認するだけでよい。既存環境では PersistentConfig のため `.env` が無視される。同じ画面で手入力する。
 
-    | 項目                      | 値                                                                             |
-    | ------------------------- | ------------------------------------------------------------------------------ |
-    | Content Extraction Engine | Docling / `http://docling-serve:5001` / API キーは `.env` の `DOCLING_API_KEY` |
+    | 項目                      | 値                                                                                                                     |
+    | ------------------------- | ---------------------------------------------------------------------------------------------------------------------- |
+    | Content Extraction Engine | Docling / `http://docling-serve:5001` / API キーは `.env` の `DOCLING_API_KEY`                                         |
     | Docling Parameters        | `{"do_ocr":true,"ocr_engine":"tesseract","ocr_lang":["jpn","eng"],"pdf_backend":"dlparse_v4","table_mode":"accurate"}` |
-    | Text Splitter             | Token（`cl100k_base`）                                                         |
-    | Markdown Header Splitting | On                                                                             |
-    | Chunk Size / Overlap      | 2000 / 200                                                                     |
-    | Top K                     | 15                                                                             |
-    | Embedding Model           | `text-embedding-3-large`（OpenAI）                                             |
+    | Text Splitter             | **トークン（Transformers）**                                                                                           |
+    | Tokenizer Model           | **`hotchpotch/japanese-reranker-small-v2`**                                                                            |
+    | Markdown Header Splitting | On                                                                                                                     |
+    | Chunk Size / Overlap      | **440 / 64**                                                                                                           |
+    | Hybrid Search             | **On**                                                                                                                 |
+    | BM25 Weight               | **0**                                                                                                                  |
+    | Reranking Engine          | **Default (SentenceTransformers)**                                                                                     |
+    | Reranking Model           | **`hotchpotch/japanese-reranker-small-v2`**（Tokenizer Model と同じ値）                                                |
+    | Reranking Batch Size      | **16**                                                                                                                 |
+    | Top K                     | **40**                                                                                                                 |
+    | Top K Reranker            | **20**                                                                                                                 |
+    | Relevance Threshold       | **0.0**                                                                                                                |
+    | Embedding Model           | `text-embedding-3-large`（OpenAI）                                                                                     |
 
     疎通は文書を 1 件アップロードして確認する。`docker compose logs docling-serve` に `POST /v1/convert/file` が出れば通っている。
 
@@ -221,6 +239,32 @@ docker volume rm short-video-creation_open-terminal-data
     > ⚠️ **縦書きは `ocr_lang` に `jpn_vert` を明示的に足す必要がある。** tesseract は自動で切り替えない。言語パックはイメージに入っているので、縦組みの文書を扱うときだけ `["jpn","jpn_vert","eng"]` にする（横組みの精度が落ちるため既定では入れていない）。`force_ocr` は true にしないこと（デジタル PDF にも強制的に OCR がかかり、遅くなるうえ精度も落ちる）。
 
     > ⚠️ **`RAG_EMBEDDING_MODEL` を後から変えてはいけない。** 次元が変わると既存コレクションと合わなくなり、再インデックスするまで検索が黙って空を返す。
+
+    > ⚠️ **保存後に Hybrid Search が off に戻っていないか必ず確認する。** Open WebUI は
+    > リランクモデルのロードに失敗しても HTTP エラーを返さず、`ENABLE_RAG_HYBRID_SEARCH`
+    > を false へ戻すだけである（`routers/retrieval.py:1185-1187`）。原因は
+    > `docker compose logs open-webui | grep 'Error loading reranking model'` にしか出ない。
+    > `reranker-model-init` サービスは、この失敗を `docker compose up` の時点で
+    > 起こすために存在する。init が成功していればここで戻ることは無い。
+
+    > ⚠️ **Reranking Model を空にしてはいけない。** `get_rf` は `if reranking_model:` で
+    > 早期に None を返し（`routers/retrieval.py:173 / 176 / 240`）、`RerankCompressor` は
+    > 埋め込みベースの再スコアへ静かにフォールバックする（`retrieval/utils.py:1743-1758`）。
+    > 全候補に対して毎クエリ OpenAI の embeddings が追加で叩かれ、
+    > **精度は上がらないのに課金だけ増える。** エラーもログの警告も出ない。
+
+    > ⚠️ **Reranking Model と Tokenizer Model は必ず同じ値にする。** 前者はチャンクを
+    > 読む側、後者はチャンクを切る側で、食い違うとチャンクがリランカーの 512 トークン窓に
+    > 収まらなくなる。リランカーは各チャンクの先頭しか読まなくなるが、エラーは出ない。
+    > `.env` では `RERANKER_MODEL_ID` 1 つから両方を導いてこれを防いでいる。
+
+    > ⚠️ **BM25 Weight を 0 より大きくしない。** PGVector の native hybrid search は
+    > `to_tsvector('simple', ...)` を使うが（`retrieval/vector/dbs/pgvector.py:566-578`）、
+    > `simple` は空白と記号で区切って小文字化するだけで、日本語の文は丸ごと 1 トークンに
+    > なる。フォールバック経路の BM25Retriever も `preprocess_func` を渡していないため
+    > 同じく空白区切りである。**日本語では語彙検索が機能しないので、重みを配った分だけ
+    > ベクトル検索の順位が薄まって精度が落ちる。** ハイブリッド検索を on にしているのは
+    > リランカーを起動するためであって、語彙検索のためではない。
 
     **(b) ナレッジベースの作成と grant**
 
@@ -239,6 +283,20 @@ docker volume rm short-video-creation_open-terminal-data
     > ⚠️ **モデルにナレッジを紐づける場合、モデルの grant とは別にナレッジ自身の read grant が要る。** `retrieval/utils.py:1514-1521` の collection 分岐が `admin` / 所有者 / `AccessGrants.has_access(resource_type='knowledge')` / フォルダのいずれかを要求する。付け忘れると **モデルは選べるのに検索結果だけ 0 件**という、エラーの出ない壊れ方をする（ステップ 12 の「モデルピッカーには並ぶのに 400」と同じ形の食い違い）。
 
     > ⚠️ 一般ユーザの**利用**は塞がっていない。`GET /api/v1/knowledge/` は `get_verified_user` のみ（`routers/knowledge.py:130`）なので、read grant を貰ったナレッジベースはチャット入力欄の `#` から使える。チャットへの一回限りのファイル添付（`USER_PERMISSIONS_CHAT_FILE_UPLOAD`、既定 `true`）も全ユーザが使える。
+
+    **(c) 既存ナレッジベースの再インデックス（既存環境のみ）**
+
+    チャンク分割の設定を変えても、既存のベクトルは作り直されない。新旧のチャンクが同じ
+    コレクションに混在すると、**リランカーが 512 トークンで切り詰める長いチャンクと、
+    収まる短いチャンクが同じ土俵で比較される。** スコアが歪むが、エラーは出ない。
+
+    各ナレッジベースについて、既存ファイルを削除してから再アップロードする。
+
+    - 管理者がチームへ配った read grant は、ナレッジベース自体を消さない限り維持される
+    - `RAG_EMBEDDING_MODEL` は変更しないため、ベクトルの次元は変わらない。コレクションを
+      作り直す必要はない
+    - 目安として、チャンク数は 2〜3 倍に増える（tiktoken 2000 トークン ≒ 1,800 文字 に対し、
+      SentencePiece 440 トークン ≒ 650 文字）
 
 15. **ユーザを招待し、承認してグループへ追加する**
 

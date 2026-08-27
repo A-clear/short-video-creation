@@ -393,6 +393,60 @@ services:
     networks: [svc-docling-net]
 
   # ----------------------------------------------------------------------------
+  # リランクモデルの事前取得と検証（一回きり）
+  # ----------------------------------------------------------------------------
+  # リランカー本体はコンテナではありません。Open WebUI の Reranking Engine の
+  # 選択肢は「Default (SentenceTransformers)」と「External」の 2 つだけで
+  # （Documents.svelte:1214-1215）、前者を選ぶ以上モデルは Open WebUI の
+  # プロセス内で動きます。このサービスが担うのは次の 2 点です。
+  #
+  #   1. 事前取得 — open-webui-data ボリューム上の HuggingFace キャッシュへ
+  #      モデルを入れる。これが無いと 4 つの uvicorn ワーカーが起動時に
+  #      同時ダウンロードを始めます（main.py:624 の get_rf は lifespan の中で
+  #      走るため、遅延ロードではありません）。
+  #
+  #   2. ロード検証 — 実際に CrossEncoder を構築して predict まで通す。
+  #      ⚠️ Open WebUI はモデルのロードに失敗しても HTTP エラーを返さず、
+  #      ENABLE_RAG_HYBRID_SEARCH を黙って false へ戻すだけです
+  #      （routers/retrieval.py:1185-1187）。管理者から見えるのは
+  #      「保存したのにトグルが off に戻っている」という症状だけで、
+  #      原因は log.error の 1 行にしか出ません。ここで先に失敗させることで、
+  #      docker compose up 時点の明示的なエラーに変えています。
+  #
+  # ⚠️ image は open-webui 本体と同じものにしてください。huggingface_hub /
+  #    sentence-transformers / transformers のバージョンとキャッシュの
+  #    レイアウトが一致します。別イメージにすると「init は成功したのに
+  #    ワーカーがモデルを見つけられない」が起きます。同じイメージなので
+  #    追加の pull も発生しません。
+  #
+  # ⚠️ 公式イメージは ENTRYPOINT を持たず CMD [ "bash", "start.sh"] だけです
+  #    （Dockerfile:219）。したがって command の上書きで足ります。
+  reranker-model-init:
+    image: ghcr.io/open-webui/open-webui:main
+    container_name: svc-reranker-model-init
+    restart: "no"
+    environment:
+      # ⚠️ 公式イメージの Dockerfile:95 と同じ値。ここがずれるとワーカーが
+      #    キャッシュを見つけられません。
+      SENTENCE_TRANSFORMERS_HOME: /app/backend/data/cache/embedding/models
+      HF_HOME: /app/backend/data/cache/embedding/models
+      RERANKER_MODEL_ID: ${RERANKER_MODEL_ID:-hotchpotch/japanese-reranker-small-v2}
+      # 本体と同じ条件でロードを検証するため、同じ値を渡します。
+      SENTENCE_TRANSFORMERS_CROSS_ENCODER_BACKEND: ${SENTENCE_TRANSFORMERS_CROSS_ENCODER_BACKEND:-torch}
+      SENTENCE_TRANSFORMERS_CROSS_ENCODER_SIGMOID_ACTIVATION_FUNCTION: ${SENTENCE_TRANSFORMERS_CROSS_ENCODER_SIGMOID_ACTIVATION_FUNCTION:-true}
+      RAG_RERANKING_MODEL_TRUST_REMOTE_CODE: ${RAG_RERANKING_MODEL_TRUST_REMOTE_CODE:-false}
+      # モデルのダウンロードとロードは 1 コアで足ります。
+      OMP_NUM_THREADS: "1"
+    command: ["python", "/scripts/init_reranker_model.py"]
+    volumes:
+      - open-webui-data:/app/backend/data
+      - ./scripts/init_reranker_model.py:/scripts/init_reranker_model.py:ro
+    # ⚠️ 一回きりで終了するため専用ネットワークは切っていません。必要な通信は
+    #    HuggingFace への egress だけで、svc-net の他サービス（postgres /
+    #    redis / minio）は使いません。
+    networks: [svc-net]
+
+  # ----------------------------------------------------------------------------
   # Open Terminal（AI の実行環境）
   # ----------------------------------------------------------------------------
   # Open WebUI 本体に足りない「実際に手を動かす場所」を提供するコンポーネントです。
@@ -663,6 +717,15 @@ services:
       # （影響は「文書をアップロードすると変換に失敗する」だけ）。
       docling-serve:
         condition: service_started
+      # モデルの取得と検証が終わるまで起動しない。ここだけ service_started ではなく
+      # service_completed_successfully を使う（一回きりのジョブなので healthy にならない）。
+      #
+      # ⚠️ 初回だけ HuggingFace への到達性が必須になります。オフラインで
+      #    起動したい場合はこの 2 行を消し、.env の
+      #    RAG_RERANKING_MODEL_AUTO_UPDATE を true に戻してください
+      #    （各ワーカーが自分で取得するようになります）。
+      reranker-model-init:
+        condition: service_completed_successfully
       # ⚠️ service_healthy にしていません。
       #    open-terminal は約 4GB のイメージで初回 pull と起動に時間がかかります。
       #    ターミナルが落ちていてもチャット本体は使えるべきなので、
@@ -693,6 +756,25 @@ services:
       # ⚠️ ※PersistentConfig です。既に一度起動した環境ではここを変えても
       #    無視されるので、Admin Settings → Tools → Documents で直してください。
       DOCLING_SERVER_URL: http://docling-serve:5001
+      #
+      # リランクとトークナイザで同じモデルを使う。
+      # ⚠️ ここが食い違うと、チャンクがリランカーの 512 トークン窓に収まらなくなり、
+      #    リランカーは各チャンクの先頭しか読まなくなります。エラーは出ません。
+      #    1 つの変数から両方を導くことでその食い違いを構造的に防いでいます。
+      # ⚠️ ※PersistentConfig です。既に一度起動した環境ではここを変えても
+      #    無視されるので、Admin Settings → Documents で直してください。
+      RAG_RERANKING_MODEL: ${RERANKER_MODEL_ID:-hotchpotch/japanese-reranker-small-v2}
+      RAG_TOKENIZER_MODEL: ${RERANKER_MODEL_ID:-hotchpotch/japanese-reranker-small-v2}
+      #
+      # ⚠️ torch は既定でホストの全コアを使おうとします。Open WebUI 側に上限を
+      #    設ける仕組みはありません（イメージにも backend にも OMP_NUM_THREADS /
+      #    torch.set_num_threads の設定が存在しないことを確認済み）。
+      #    ホストは 4 コアなので、4 ワーカー × 1 スレッド = 4 に揃えます。
+      #    2 にすると 8 スレッドになり、Docling や Computer と取り合って
+      #    かえって遅くなります。
+      #    これは素の環境変数なので、起動済みの環境でも再起動で反映されます。
+      OMP_NUM_THREADS: ${OPEN_WEBUI_OMP_NUM_THREADS:-1}
+      MKL_NUM_THREADS: ${OPEN_WEBUI_OMP_NUM_THREADS:-1}
       #
       # ⚠️ --scale open-webui=N で水平スケールする場合:
       #    マイグレーションを 1 台だけに任せる必要があります。

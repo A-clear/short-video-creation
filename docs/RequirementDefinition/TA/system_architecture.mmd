@@ -34,6 +34,7 @@ flowchart LR
             open-terminal@{ img: "https://api.iconify.design/mdi:console.svg", label: "Open Terminal", w: 60, h: 60, constraint: "on" }
             open-webui-computer@{ img: "https://api.iconify.design/mdi:laptop.svg", label: "Open WebUI Computer", w: 60, h: 60, constraint: "on" }
             codex@{ img: "https://api.iconify.design/simple-icons:openai.svg", label: "Codex CLI", w: 60, h: 60, constraint: "on" }
+            reranker@{ img: "https://api.iconify.design/mdi:sort-variant.svg", label: "Reranker (in-process)", w: 60, h: 60, constraint: "on" }
         end
 
     end
@@ -44,6 +45,11 @@ flowchart LR
         pgvector@{ img: "https://api.iconify.design/logos:postgresql.svg", label: "PGVector", w: 60, h: 60, constraint: "on" }
         redis@{ img: "https://api.iconify.design/logos:redis.svg", label: "Redis", w: 60, h: 60, constraint: "on" }
         minio@{ img: "https://api.iconify.design/simple-icons:minio.svg", label: "MinIO", w: 60, h: 60, constraint: "on" }
+    end
+
+    subgraph ContentExtraction["Content Extraction（文書抽出）"]
+        direction LR
+        docling@{ img: "https://api.iconify.design/mdi:file-document-outline.svg", label: "Docling", w: 60, h: 60, constraint: "on" }
     end
 
     user <--> |アクセス| internet
@@ -59,6 +65,8 @@ flowchart LR
 
     open-webui <--> |チャット履歴 / 設定 / 編集ジョブの状態| postgres
     open-webui <--> |ベクトル検索| pgvector
+    open-webui <--> |文書のコンテンツ抽出（PDF / Office → Markdown）| docling
+    open-webui -.-> |検索結果の再スコア（日本語クロスエンコーダ。別コンテナではなく同一プロセス内）| reranker
     open-webui <--> |WebSocket セッション共有| redis
     open-webui <--> |アップロード動画の共有ストレージ| minio
     open-webui <--> |コマンド実行 / ファイル操作（バックエンドがプロキシ）| open-terminal

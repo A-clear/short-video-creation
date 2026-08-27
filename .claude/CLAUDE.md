@@ -21,6 +21,11 @@ functions/                  Open WebUI Functions のソース（ここで開発�
   descript_studio.py        Action（マルチ 4 サブ: upload / edit / export / probe）
   descript_pipe.py          Pipe（MCP オーケストレーション。単一モデル）
   descript_guard.py         Filter（RAG 迂回 / 署名 URL 恒久化 / 事前診断）
+scripts/                    運用スクリプト
+  check_functions.py        Functions の静的検証
+  init_reranker_model.py    リランクモデルの事前取得とロード検証
+                            （compose の reranker-model-init から実行）
+  computer-urls.sh          Computer 3 台のアクセス URL を出す
 full-stack/open-webui/      Open WebUI フォーク（submodule）
 .env.example                スケーリング構成の環境変数テンプレート
 docker/docling/             Docling の日本語 OCR イメージ
@@ -118,9 +123,9 @@ npm run cy:open               # Cypress（E2E、upstream 由来）
 - 文書 RAG: OpenAI Embedding / Docling / PGVector（下記）
 - ホスティング想定: Vercel（`docs/RequirementDefinition/TA/system_architecture.mmd`）
 
-### Basic RAG（Embedding = OpenAI / 抽出 = Docling / ベクトル DB = PGVector）
+### Basic RAG（Embedding = OpenAI / 抽出 = Docling / ベクトル DB = PGVector / リランク = SentenceTransformers）
 
-3 点とも**マルチユーザだから必要になる**選択で、独立した好みではない。既定の SentenceTransformers は**ワーカーあたり約 500MB**、既定の pypdf は継続的な取り込みでメモリリーク、既定の ChromaDB は SQLite ベースで fork-safe ではない。設定は `.env.example` §13 に集約し、判断の根拠は `docs/superpowers/specs/2026-08-27-multi-user-design.md` §4.7 が正本。
+抽出・埋め込み・ベクトル DB の 3 点は**マルチユーザだから必要になる**選択で、独立した好みではない。既定の SentenceTransformers（埋め込み）は**ワーカーあたり約 500MB**、既定の pypdf は継続的な取り込みでメモリリーク、既定の ChromaDB は SQLite ベースで fork-safe ではない。ここに日本語特化のリランクとトークナイザ（`hotchpotch/japanese-reranker-small-v2`）が加わる。設定は `.env.example` §13 に集約し、判断の根拠は `docs/superpowers/specs/2026-08-27-multi-user-design.md` §4.7 と `docs/superpowers/specs/2026-08-28-japanese-rag-reranker-design.md` が正本。
 
 - **ナレッジベースは管理者が作り、チームに read grant を配る。** `USER_PERMISSIONS_WORKSPACE_KNOWLEDGE_ACCESS` は upstream 既定の `false` のまま。一般ユーザの作成は 401 になる（`routers/knowledge.py:286-292`）が、**利用は塞がらない**（`GET /api/v1/knowledge/` は `get_verified_user` のみ。同 `:130`）。管理者は `filter_allowed_access_grants()` の対象外（`utils/access_control/__init__.py:249` で早期 return）なので、`..._ALLOW_SHARING=false` があっても管理者が付けたグループ grant は削られない
 - **モデルに紐付けたナレッジは、モデルの grant とは別にナレッジ自身の read grant が要る**（`retrieval/utils.py:1514-1521`）。付け忘れると「モデルは選べるのに検索結果だけ 0 件」になり、エラーが出ないので原因が分からない
@@ -130,6 +135,11 @@ npm run cy:open               # Cypress（E2E、upstream 由来）
 - **docling-serve の `/opt/app-root/src/.cache/docling/models` にボリュームを張ってはいけない。** 変換モデルはイメージに焼き込み済みで、空のボリュームで覆うと自動ダウンロードせず実行時エラーになる。同じ理由で `svc-docling-net` は `internal: true` にできている
 - **docling-serve 側の `UVICORN_WORKERS` は 1 固定**（既定の LocalOrchestrator がタスクをプロセス内メモリに持つため、2 以上だと Task Not Found (404)）。Open WebUI 側の `UVICORN_WORKERS`（`.env` §6、現在 4）とは名前が同じだけの別物
 - **`RAG_EMBEDDING_MODEL` を後から変えない。** 次元が変わると既存コレクションと合わず、再インデックスするまで検索が黙って空を返す
+- **リランカーはハイブリッド検索が有効なときしか呼ばれない。** `RerankCompressor` が現れるのは `query_doc_with_native_hybrid_search`（`retrieval/utils.py:434`）と `query_doc_with_hybrid_search` の 2 経路だけで、通常の `query_doc` には存在しない。そのうえで **`RAG_HYBRID_BM25_WEIGHT=0`** にしている — PGVector の native hybrid search は `to_tsvector('simple', ...)` を使い（`retrieval/vector/dbs/pgvector.py:566-578`）、`simple` は空白区切りなので**日本語の文は丸ごと 1 トークンになる**。フォールバックの `BM25Retriever` も `preprocess_func` 未指定で同じ。設定で差し替える口は無い。ハイブリッドは reranker を起動するためのスイッチとして使っている。0 なら `if bm25_weight > 0` のガード（`pgvector.py:562`）で FTS の SQL 自体が発行されない
+- **モデルのロード失敗は「Hybrid Search が勝手に off に戻る」として現れる。** `routers/retrieval.py:1185-1187` が例外を握って `ENABLE_RAG_HYBRID_SEARCH = False` にするだけで、HTTP エラーを返さない。原因は `log.error` の 1 行にしか出ない。compose の **`reranker-model-init`** サービスは、この失敗を `docker compose up` 時点の明示的なエラーへ前倒しするために存在する。**このサービスの image は `open-webui` 本体と同一でなければならない**（`huggingface_hub` のバージョンとキャッシュのレイアウトを一致させるため）
+- **`RAG_RERANKING_MODEL` を空にすると、エラーではなく「別のもの」が動く。** `get_rf` が `None` を返し（`routers/retrieval.py:173 / 176 / 240`）、`RerankCompressor` が**埋め込みベースの再スコアへ静かにフォールバックする**（`retrieval/utils.py:1743-1758`）。全候補に対して毎クエリ OpenAI の embeddings が追加で叩かれ、精度は上がらないのに課金だけ増える
+- **`RAG_RERANKING_MODEL` と `RAG_TOKENIZER_MODEL` は同じ値でなければならない。** 前者はチャンクを読む側、後者は `RAG_TEXT_SPLITTER=token_transformers` のときチャンクを切る側（`routers/retrieval.py:1608-1615`）。食い違うとチャンクがリランカーの 512 トークン窓に収まらず、先頭しか読まれない。エラーは出ない。`docker-compose.yml` では **`RERANKER_MODEL_ID` 1 つから両方を導いて**構造的に防いでいる
+- **モデルはワーカー起動時に、ワーカーごとに読まれる。** `main.py:624` の `get_rf` は lifespan の中で走るため遅延ロードではなく、`UVICORN_WORKERS=4` なら 4 プロセスが各自モデルを保持する（重みだけで 280.6MB × 4）。torch は既定でホストの全コアを使おうとし Open WebUI 側に上限は無いので、compose で **`OMP_NUM_THREADS=1`**（ホスト 4 コア ÷ ワーカー 4）を渡している。`onnx` バックエンドは `optimum` 未同梱のため選べない
 
 ### 実行環境の 3 コンポーネント（compose のみ。Functions とは別レイヤ）
 
@@ -291,5 +301,5 @@ Function の種別は定義したクラス名で決まる（`Pipe` / `Filter` / 
 - **`BYPASS_ADMIN_ACCESS_CONTROL=false` にしてはいけない**（upstream 既定は `true`。`config.py:2062`）。`false` にすると `main.py:1077` の条件が管理者でも真になり、管理者も `check_model_access` を通る。同関数は `model` テーブルに行が無いモデルを問答無用で拒否する（`utils/models.py:447`）ため、**Workspace → Models 未登録のモデルが全員にとって使用不能**になる。しかも `get_filtered_models` は未登録モデルを管理者には見せる（`utils/models.py:521-523`）ので、**モデルピッカーには並ぶのに選ぶと 400 `Model not found`** という食い違いになり原因が分かりにくい。なお Action → Pipe の RPC は `bypass_filter=True` で `chat.py:198` を飛ばすため影響を受けない
 - **権限はグループを OR 合成する**（`utils/access_control/__init__.py:54`）。グループは権限を足すことしかできず奪えないため、「既定を `false` に絞ってグループで `true` を足す」以外の順序は成立しない
 - **`chat_id` と `file_id` はクライアント制御である。** Functions で DB を引くときは必ずスコープ付き API（`Chats.get_chat_by_id_and_user_id` / `Files.get_file_by_id_and_user_id`）を使う。スコープ無し版を使うと他ユーザの状態とファイルに到達できる
-- **PersistentConfig は初回起動時にしか取り込まれない。** `Config.seed_defaults()` は「DB に無いキーだけ INSERT」する（`models/config.py:256`）。`TERMINAL_SERVER_CONNECTIONS` / `OPENAI_API_CONFIGS` / `DEFAULT_USER_ROLE` / `USER_PERMISSIONS_*` / Basic RAG の抽出・分割・検索設定（`CONTENT_EXTRACTION_ENGINE` / `DOCLING_*` / `RAG_TEXT_SPLITTER` / `CHUNK_*` / `RAG_TOP_K`。`config.py:2828-2894`）はすべてこれに該当する。起動済みの環境で `.env` を変えても効かないので、Admin Settings で直すこと
+- **PersistentConfig は初回起動時にしか取り込まれない。** `Config.seed_defaults()` は「DB に無いキーだけ INSERT」する（`models/config.py:256`）。`TERMINAL_SERVER_CONNECTIONS` / `OPENAI_API_CONFIGS` / `DEFAULT_USER_ROLE` / `USER_PERMISSIONS_*` / Basic RAG の抽出・分割・検索設定（`CONTENT_EXTRACTION_ENGINE` / `DOCLING_*` / `RAG_TEXT_SPLITTER` / `CHUNK_*` / `RAG_TOP_K`／リランク設定一式（`RAG_TOKENIZER_MODEL` / `ENABLE_RAG_HYBRID_SEARCH` / `RAG_HYBRID_BM25_WEIGHT` / `RAG_RERANKING_ENGINE` / `RAG_RERANKING_MODEL` / `RAG_RERANKING_BATCH_SIZE` / `RAG_TOP_K_RERANKER` / `RAG_RELEVANCE_THRESHOLD`）。`config.py:2828-2894`）はすべてこれに該当する。起動済みの環境で `.env` を変えても効かないので、Admin Settings で直すこと
 - **`UVICORN_WORKERS` は 4。ただし Open WebUI のバージョンを上げた直後の初回起動だけは 1 に戻すこと。** マイグレーションは `config.py:78` のモジュール読み込み時に走るため、`--workers 4` では 4 プロセスが同時に `alembic upgrade` を実行する。しかも `config.py:73-75` が例外を握り潰す（`log.exception` のみで再送出しない）ので、**スキーマが壊れても起動は成功してしまう**。DB 接続数も `(POOL_SIZE + MAX_OVERFLOW) × ワーカー数 × レプリカ数` で掛け算になる（既定で 140 / `max_connections=200`）
