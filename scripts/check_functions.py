@@ -60,6 +60,7 @@ SHARED = [
     "_esc",
     "_render",
     "_as_user_model",
+    "_user_id",
     "_load_state",
     "_save_state",
     "_append_history",

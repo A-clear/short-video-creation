@@ -195,11 +195,36 @@ def _as_user_model(user: Any) -> UserModel:
 # ===========================================================================
 
 
-async def _load_state(chat_id: Optional[str]) -> dict:
-    if not chat_id:
+def _user_id(user_raw: Any) -> Optional[str]:
+    """__user__ から user_id を取り出す。dict / UserModel のどちらでも動く。
+
+    マルチユーザ環境では chat state とファイルの所有者検証にこの値を使う。
+    取れなかった場合は None を返し、呼び出し側は fail-closed で扱う。
+    """
+    if user_raw is None:
+        return None
+    if isinstance(user_raw, dict):
+        value = user_raw.get("id")
+    else:
+        value = getattr(user_raw, "id", None)
+    return str(value) if value else None
+
+
+async def _load_state(chat_id: Optional[str], user_id: Optional[str]) -> dict:
+    """chat.chat['descript'] を読む。
+
+    ⚠️ 所有者検証つきの get_chat_by_id_and_user_id を使うこと
+    （backend/open_webui/models/chats.py:1540）。chat_id はクライアント制御
+    （utils/actions.py:66-68 が form_data をそのまま使う）なので、
+    スコープ無しの get_chat_by_id では他ユーザの state を読めてしまう。
+    読んだ state は _ok() の封筒に載って呼び出し元へ返るため実害がある。
+
+    user_id が取れない経路は fail-closed で {} を返す。
+    """
+    if not chat_id or not user_id:
         return {}
     try:
-        chat = await Chats.get_chat_by_id(chat_id)
+        chat = await Chats.get_chat_by_id_and_user_id(chat_id, user_id)
     except Exception:
         return {}
     if chat is None:
@@ -1758,7 +1783,7 @@ class Action:
 
         fmt = _export_format(chosen)
 
-        state = await _load_state(body.get("chat_id"))
+        state = await _load_state(body.get("chat_id"), _user_id(user))
         composition_id = state.get("composition_id") if state.get(
             "project_id") == project_id else None
 

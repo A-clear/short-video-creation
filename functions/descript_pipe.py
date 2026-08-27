@@ -202,11 +202,36 @@ def _as_user_model(user: Any) -> UserModel:
 # ===========================================================================
 
 
-async def _load_state(chat_id: Optional[str]) -> dict:
-    if not chat_id:
+def _user_id(user_raw: Any) -> Optional[str]:
+    """__user__ から user_id を取り出す。dict / UserModel のどちらでも動く。
+
+    マルチユーザ環境では chat state とファイルの所有者検証にこの値を使う。
+    取れなかった場合は None を返し、呼び出し側は fail-closed で扱う。
+    """
+    if user_raw is None:
+        return None
+    if isinstance(user_raw, dict):
+        value = user_raw.get("id")
+    else:
+        value = getattr(user_raw, "id", None)
+    return str(value) if value else None
+
+
+async def _load_state(chat_id: Optional[str], user_id: Optional[str]) -> dict:
+    """chat.chat['descript'] を読む。
+
+    ⚠️ 所有者検証つきの get_chat_by_id_and_user_id を使うこと
+    （backend/open_webui/models/chats.py:1540）。chat_id はクライアント制御
+    （utils/actions.py:66-68 が form_data をそのまま使う）なので、
+    スコープ無しの get_chat_by_id では他ユーザの state を読めてしまう。
+    読んだ state は _ok() の封筒に載って呼び出し元へ返るため実害がある。
+
+    user_id が取れない経路は fail-closed で {} を返す。
+    """
+    if not chat_id or not user_id:
         return {}
     try:
-        chat = await Chats.get_chat_by_id(chat_id)
+        chat = await Chats.get_chat_by_id_and_user_id(chat_id, user_id)
     except Exception:
         return {}
     if chat is None:
@@ -215,16 +240,26 @@ async def _load_state(chat_id: Optional[str]) -> dict:
     return dict(state) if isinstance(state, dict) else {}
 
 
-async def _save_state(chat_id: Optional[str], patch: dict) -> dict:
+async def _save_state(chat_id: Optional[str], patch: dict, user_id: Optional[str]) -> dict:
     """chat.chat['descript'] にパッチをマージして保存し、マージ後の state を返す。
 
     update_chat_by_id は blob に 'title' が無いとチャットタイトルを
     'New Chat' にリセットする（models/chats.py:608）ため、必ず補う。
+
+    ⚠️ 取得も所有者検証つきの get_chat_by_id_and_user_id を使うこと。
+    update_chat_by_id は chat.chat を丸ごと置換する（models/chats.py:606）ので、
+    スコープ無しで取得すると他ユーザのチャットを破壊できる。
+
+    書けなかった場合もマージ後の state を返す。封筒の state は
+    「このリクエストが認識している状態」であり、永続化の成否とは別だからである。
     """
-    if not chat_id:
+    if not chat_id or not user_id:
+        # ⚠️ 無言で捨てない。ここに入ると _ok() は成功の封筒に patch を載せて返すため、
+        #    UI 上は成功したのに永続化されていない状態が痕跡なく発生する。
+        _log_debug("state.save_skipped", chat_id=chat_id, has_user=bool(user_id))
         return dict(patch or {})
     try:
-        chat = await Chats.get_chat_by_id(chat_id)
+        chat = await Chats.get_chat_by_id_and_user_id(chat_id, user_id)
     except Exception:
         return dict(patch or {})
     if chat is None:
@@ -248,11 +283,11 @@ async def _save_state(chat_id: Optional[str], patch: dict) -> dict:
     return state
 
 
-async def _append_history(chat_id: Optional[str], entry: dict) -> None:
-    state = await _load_state(chat_id)
+async def _append_history(chat_id: Optional[str], entry: dict, user_id: Optional[str]) -> None:
+    state = await _load_state(chat_id, user_id)
     history = list(state.get("history") or [])
     history.append({"ts": int(time.time()), **entry})
-    await _save_state(chat_id, {"history": history})
+    await _save_state(chat_id, {"history": history}, user_id)
 
 
 # ===========================================================================
@@ -1868,6 +1903,9 @@ class Pipe:
                 "request": __request__,
                 "user_raw": __user__,
                 "user": _as_user_model(__user__),
+                # マルチユーザ環境での chat state / ファイルの所有者検証に使う。
+                # 取れない経路は fail-closed（state を読まない・書かない）。
+                "user_id": _user_id(__user__),
                 "user_valves": self._user_valves(__user__),
                 "chat_id": __chat_id__ or (__metadata__ or {}).get("chat_id"),
                 "message_id": __message_id__ or (__metadata__ or {}).get("message_id"),
@@ -1882,7 +1920,7 @@ class Pipe:
                 "emitter": __event_emitter__,
                 "emit_status": _make_emit_status(__event_emitter__),
             }
-            ctx["state"] = await _load_state(ctx["chat_id"])
+            ctx["state"] = await _load_state(ctx["chat_id"], ctx.get("user_id"))
             _log_info(
                 "pipe.start",
                 op=op,
@@ -2169,7 +2207,7 @@ class Pipe:
                     resolved[op] = name
 
         if resolved != (cached if isinstance(cached, dict) else None):
-            await _save_state(ctx.get("chat_id"), {"tool_map": resolved})
+            await _save_state(ctx.get("chat_id"), {"tool_map": resolved}, ctx.get("user_id"))
             ctx["state"] = {**(ctx.get("state") or {}), "tool_map": resolved}
 
         return resolved
@@ -2387,7 +2425,8 @@ class Pipe:
         project_id, created = await self._ensure_project(name, ctx, client, specs, tool_map, arg_maps)
         state = await _save_state(
             ctx.get("chat_id"), {
-                "project_id": project_id, "project_name": name}
+                "project_id": project_id, "project_name": name},
+            ctx.get("user_id"),
         )
         await ctx["emit_status"](f"プロジェクト『{name}』を確定しました", done=True)
         return _ok(
@@ -2461,7 +2500,7 @@ class Pipe:
             patch["project_name"] = project_name
         if project_url:
             patch["project_url"] = project_url
-        state = await _save_state(ctx.get("chat_id"), patch)
+        state = await _save_state(ctx.get("chat_id"), patch, ctx.get("user_id"))
         await _append_history(
             ctx.get("chat_id"),
             {
@@ -2470,6 +2509,7 @@ class Pipe:
                 "result": "partial" if outcome.get("partial") else "success",
                 "note": project_name or new_project_id,
             },
+            ctx.get("user_id"),
         )
         await ctx["emit_status"]("メディアの取り込みが完了しました", done=True)
 
@@ -2508,6 +2548,7 @@ class Pipe:
                 "last_job_id": edit.get("job_id"),
                 "edit_prompt": prompt,
             },
+            ctx.get("user_id"),
         )
         await ctx["emit_status"]("編集が完了しました", done=True)
         return _ok(
@@ -2618,6 +2659,7 @@ class Pipe:
         new_state = await _save_state(
             ctx.get("chat_id"),
             {"project_id": project_id, "last_job_id": outcome.get("job_id")},
+            ctx.get("user_id"),
         )
         await _append_history(
             ctx.get("chat_id"),
@@ -2627,6 +2669,7 @@ class Pipe:
                 "result": "partial" if outcome.get("partial") else "success",
                 "note": fmt,
             },
+            ctx.get("user_id"),
         )
         await ctx["emit_status"](f"タイムラインを書き出しました（{fmt}）。{note_ja}", done=True)
 
@@ -2804,7 +2847,7 @@ class Pipe:
         if published.get("project_url"):
             patch["project_url"] = published["project_url"]
         # download_url は署名付き・期限付きなので state には保存しない（契約書 §11）
-        state = await _save_state(ctx.get("chat_id"), patch)
+        state = await _save_state(ctx.get("chat_id"), patch, ctx.get("user_id"))
         await _append_history(
             ctx.get("chat_id"),
             {
@@ -2813,6 +2856,7 @@ class Pipe:
                 "result": "partial" if (edit.get("partial") or published.get("partial")) else "success",
                 "note": (instruction or "")[:120],
             },
+            ctx.get("user_id"),
         )
 
         # 6) プレビュー表示
@@ -2877,6 +2921,7 @@ class Pipe:
                 "result": "partial" if published.get("partial") else "success",
                 "note": "confirmed",
             },
+            ctx.get("user_id"),
         )
 
         if self.valves.embed_player:
@@ -3113,7 +3158,7 @@ class Pipe:
                 )
                 continue
             if entry.get("file_id"):
-                prepared.append(await self._resolve_stored_file(entry))
+                prepared.append(await self._resolve_stored_file(entry, ctx.get("user_id")))
         if not prepared:
             raise DescriptError(
                 "TOOL_ARGS_MISSING",
@@ -3152,22 +3197,33 @@ class Pipe:
         return await self._track_job(ctx, client, specs, tool_map, arg_maps, raw)
 
     @staticmethod
-    async def _resolve_stored_file(entry: dict) -> dict:
+    async def _resolve_stored_file(entry: dict, user_id: Optional[str]) -> dict:
         """Open WebUI に保存済みのファイル（file_id）の実体パス・サイズを解決する。
 
-        Files.get_file_by_id で DB レコードを引き（backend/open_webui/models/files.py:153）、
+        Files.get_file_by_id_and_user_id で DB レコードを引き
+        （backend/open_webui/models/files.py:168）、
         Storage.get_file で実体をローカルパスに解決する
         （backend/open_webui/storage/provider.py:70 / 162）。
         STORAGE_PROVIDER=s3（MinIO）でも S3StorageProvider.get_file が UPLOAD_DIR に
         ダウンロードしてそのパスを返すため同じ手順で読める（provider.py:162-170）。
         boto3 は同期なので upstream と同じく asyncio.to_thread に逃がす
         （backend/open_webui/routers/files.py:799）。
+
+        ⚠️ 所有者検証つきの get_file_by_id_and_user_id を使うこと。
+        file_id はクライアント制御である。metadata 以外の任意キーは Pipe の
+        body に素通しされる（routers/functions.py:206）ため、スコープ無しの
+        get_file_by_id（models/files.py:153）を使うと、他ユーザがアップロードした
+        動画を攻撃者自身の Descript プロジェクトへ持ち出せてしまう。
+
+        user_id が取れない経路は fail-closed とし、下の未検出エラーへ合流させる。
         """
         file_id = str(entry.get("file_id") or "")
-        try:
-            record = await Files.get_file_by_id(file_id)
-        except Exception:
-            record = None
+        record = None
+        if file_id and user_id:
+            try:
+                record = await Files.get_file_by_id_and_user_id(file_id, user_id)
+            except Exception:
+                record = None
         if record is None or not record.path:
             raise DescriptError(
                 "TOOL_ARGS_MISSING",
@@ -3429,7 +3485,7 @@ class Pipe:
                             "projectUrl", "app_url", "edit_url")
         if project_url:
             patch["project_url"] = project_url
-        ctx["state"] = await _save_state(ctx.get("chat_id"), patch)
+        ctx["state"] = await _save_state(ctx.get("chat_id"), patch, ctx.get("user_id"))
         await _append_history(
             ctx.get("chat_id"),
             {
@@ -3438,6 +3494,7 @@ class Pipe:
                 "result": "partial" if outcome.get("partial") else "success",
                 "note": name,
             },
+            ctx.get("user_id"),
         )
 
         if not project_id:
@@ -3520,7 +3577,7 @@ class Pipe:
         if awaiting is not None:
             patch["awaiting"] = awaiting
         # download_url は署名付き・期限付きなので state に残さない（契約書 §11）
-        return await _save_state(ctx.get("chat_id"), patch)
+        return await _save_state(ctx.get("chat_id"), patch, ctx.get("user_id"))
 
     def _publish_data(self, published: dict) -> dict:
         data = {

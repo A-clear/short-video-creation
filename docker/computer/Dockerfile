@@ -14,10 +14,12 @@
 #    無い）。だからこのイメージが必要になります。
 #
 # ビルド:
-#   docker compose build open-webui-computer
+#   docker compose build
+#   （サービス名は省略可。open-webui-computer-a / -b / -c の 3 台とも同じ
+#    image: svc/open-webui-computer:local タグを指すため、実質 1 回のビルドになる）
 #
 # 検証:
-#   docker compose run --rm --entrypoint sh open-webui-computer -c 'node -v; pnpm -v'
+#   docker compose run --rm --entrypoint sh open-webui-computer-a -c 'node -v; pnpm -v'
 # ==============================================================================
 
 ARG COMPUTER_IMAGE=ghcr.io/open-webui/computer:latest

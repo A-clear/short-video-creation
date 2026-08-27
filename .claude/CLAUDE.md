@@ -13,7 +13,9 @@ docs/                       設計ドキュメント（成果物の中心）
   RequirementDefinition/    要件定義: BA(業務) / AA(情報システムフロー) / TA(システム構成) / DA(ER + 外部API仕様)
   DetailedDesign/           詳細設計: authorization_flow.mmd / movie_flow.mmd
                             functions_contract.md ← 3 つの Functions が共有する契約の正本
-  Setup/                    セットアップ手順書: descript_functions_setup.md / codex_agent_setup.md
+  Setup/                    セットアップ手順書: descript_functions_setup.md / codex_agent_setup.md / multi_user_setup.md
+  superpowers/specs/        設計ドキュメント（マルチユーザ対応の設計と根拠）
+  superpowers/plans/        実装計画（タスク分割と検証手順）
 functions/                  Open WebUI Functions のソース（ここで開発し、GitHub URL 経由で Open WebUI に取り込む）
   descript_studio.py        Action（マルチ 4 サブ: upload / edit / export / probe）
   descript_pipe.py          Pipe（MCP オーケストレーション。単一モデル）
@@ -22,7 +24,8 @@ full-stack/open-webui/      Open WebUI フォーク（submodule）
 .env.example                スケーリング構成の環境変数テンプレート
 docker/computer/Dockerfile  Open WebUI Computer の開発イメージ（Node/pnpm/TS/codex を追加）
 docker-compose.yml          PostgreSQL(pgvector) / Redis / MinIO / Open WebUI
-                            + Open Terminal / Open WebUI Computer
+                            + Open Terminal（組み込みマルチユーザ）
+                            + Open WebUI Computer × 3（チーム別）
 ```
 
 **`docs/DetailedDesign/functions_contract.md` が Functions 実装の正本。** 1 Function = 自己完結 1 ファイルの制約上、共通ヘルパは 3 ファイルに重複展開されている。コピー元は常にこの契約書であり、ヘルパを直す場合は契約書を先に直してから 3 ファイルへ反映する。
@@ -59,7 +62,11 @@ cd full-stack/open-webui
 npm run dev                   # pyodide 取得 → vite dev --host（:5173）
 
 # Computer のイメージだけはビルドが要る（公式イメージに開発ツールが無いため）
-docker compose build open-webui-computer
+# 3 台とも同じ image: タグを指すため、これで足りる
+docker compose build
+
+# Computer 3 台のアクセス URL を出す（初回セットアップ URL / ログイン URL を出し分ける）
+./scripts/computer-urls.sh
 
 # Docker 一括起動
 make install                  # docker compose up -d
@@ -104,9 +111,38 @@ npm run cy:open               # Cypress（E2E、upstream 由来）
 
 動画編集そのものを Descript に委譲する方針は変わらない。ここは FCPXML の検査や ffprobe での確認など「手元でファイルを触る」ための面。
 
-- **Open Terminal** — Open WebUI の**部品**。バックエンドがプロキシし、チャットのサイドバーに出る使い捨ての実行環境。ホストにポートを公開していない（API キーをブラウザに渡さないため）
-- **Open WebUI Computer（cptr）** — **独立した 1 つのアプリ**。自前のログイン・PWA・エージェントランタイムを持ち、Open WebUI からは gateway 経由で `cptr/<workspace>` というモデルに見える。ポート公開が必須（ブラウザが直接 Socket.IO でつなぐ）。**compose 中で唯一ビルドするサービス**（`docker/computer/Dockerfile`）
+- **Open Terminal** — Open WebUI の**部品**。バックエンドがプロキシし、チャットのサイドバーに出る実行環境。ホストにポートを公開していない（API キーをブラウザに渡さないため）。`OPEN_TERMINAL_MULTI_USER=true` でユーザごとに Linux アカウントと home（`/home/<ユーザ ID の先頭 8 文字>`）が作られる。**分離されるのはファイルだけで、PTY セッション・プロセス出力・ポートは全ユーザ共有**（他人の稼働中シェルにアタッチできる）
+- **Open WebUI Computer（cptr）** — **独立した 1 つのアプリ**。自前のログイン・PWA・エージェントランタイムを持ち、Open WebUI からは gateway 経由で `cptr/<workspace>` というモデルに見える。ポート公開が必須（ブラウザが直接 Socket.IO でつなぐ）。**compose 中で唯一ビルドするサービス**（`docker/computer/Dockerfile`）。**チーム別に 3 台**（`open-webui-computer-a` / `-b` / `-c`、ホストポート 8001 / 8002 / 8003）。cptr の `routers/workspace.py` と `routers/terminal.py` に所有者検査が無いため、コンテナ境界が唯一の分離手段。
+
+  **初回セットアップ URL は `docker compose logs` から読んではいけない。`./scripts/computer-urls.sh` を使う。** 3 台とも `http://localhost:8000/?token=...` と出力され区別できないため（`cptr/cli.py` が `--host 0.0.0.0` を無条件に `localhost` へ潰し、ポートもコンテナ内部の 8000 のまま出す。差し替える環境変数は無い）。違うのはトークンだけ。取り違えても **GET は 200 でセットアップ画面が開いてしまい**、送信時に初めて `403 invalid startup token` になる（トークンは URL ではなく `POST /api/auth/setup` のボディで `compare_digest` 検証される）。**トークンは restart のたびに変わる**ので控えても無駄
+
 - **Codex（coding agent subscription）** — ChatGPT サブスクリプションを API キー無しで使う。**Open WebUI ではなく Computer 側の機能**で、設定は Computer の Settings → Admin → Agents。手順は `docs/Setup/codex_agent_setup.md`
+
+### Computer 内で立てた開発サーバをホストで見る
+
+**Computer の Browser タブ / Port Preview を使う。** HTTP プロキシ型で、`http://localhost:5173` をそのまま開ける。実装は `cptr/routers/browser.py` と `cptr/utils/browser/proxy.py`。ループバック宛てのときだけ ES module の root-relative import を書き換える分岐があり（`rewrite_javascript()`）、dev サーバを見るための機能として作られている。フロントの `browser-runtime.js` が `fetch` / `XMLHttpRequest` / `WebSocket` / `EventSource` / `pushState` を差し替え、WebSocket は `/api/browser/sessions/{id}/ws` でトンネルされるので **HMR も通る**。ホストからはチーム別ポート（`:8001` / `:8002` / `:8003`）経由で見えるため**ポート公開は不要**。
+
+**ポート公開は廃止した。** 固定ポートの公開は複数人と構造的に両立しない。Computer は 1 コンテナ = 1 つの Linux ユーザ空間で、2 人目の `vite` は 5173 を取れず（EADDRINUSE）既定の `strictPort: false` のまま 5174 へずれる。5174 は公開していないのでホストから見えない（`uvicorn` は自動でずれず起動失敗する）。Browser タブ / Port Preview は任意のポートで動きマッピングが要らないため、こちらに一本化した。
+
+**Browser タブ側の落とし穴:**
+
+- **モードは `proxy` のままにする。** Settings → Admin → **Browser** → **Browser tab default**。もう一方の `chrome` は CDP でスクリーンキャストする方式で、**このイメージに Chrome は入っていない**（実測: `command -v chromium google-chrome` → 127）。既定のまま選ぶと `409` で失敗する。同じ画面の **Agent browser tools**（`browser.enabled`）はエージェント用のブラウザ _ツール_（`browser_navigate` / `_snapshot` / `_click` / `_type` / `_screenshot` / `_evaluate` の 6 つ）を生やす別物。**どちらもリモート CDP を指せば Chrome 無しで動く** — 下の「ブラウザ操作をエージェントに持たせる」を参照
+- **Files パネルの Ports 一覧に出るのは、Computer の Terminal から起動したサーバだけ。** `routers/events.py` が 3 秒ごとに `/proc/net/tcp` を走査するが、`_find_session_for_pid()` が `cptr.utils.terminal` のセッションの子孫に絞る。**エージェントの `run_command` で起動したサーバは `command_sessions`（`utils/tools.py` の別レジストリ）配下なので一覧に出ない** — Browser タブに URL を直打ちすれば普通に開ける
+- 走査は `/proc/net/tcp` のみで **IPv6 専用の listen は検出されない**。ポート 22 / 53 / 80 / 443 / 631 / 5353 も除外される
+- Ports 一覧は `session_id` を付けるが**所有者でフィルタしていない**。ユーザ間分離が無い設計と整合しているだけで、他人のポートも見える
+
+### ブラウザ操作をエージェントに持たせる（Playwright MCP / リモート CDP）
+
+「エージェントに画面を触らせて dev サーバを検証させたい」場合の選択肢。**Chrome をイメージに入れる必要は無い。**
+実測: このイメージには Chromium が要求する共有ライブラリが 1 つも無い（`libnss3` / `libatk-1.0` / `libgbm` / `libxkbcommon` / `libasound` / `libcups` / `libpango` / `libdrm` / `libxcomposite` すべて `ldconfig -p` で 0 件）。`sudo` も apt も使えないので、**コンテナ内で `npx playwright install` しても起動時に落ちる**。ブラウザ本体は必ず外に置く。
+
+- **Playwright MCP（推奨）** — cptr 0.9.21 は本物の MCP クライアントを持つ（`cptr/utils/mcp/client.py`。`mcp` 1.29.0 同梱済みで `pip install 'cptr[mcp]'` は不要）。Settings → Admin → **Tools** の Tool Server として登録でき、`type` は `openapi` / **`mcp`（Streamable HTTP）** / **`mcp_stdio`（プロセス起動）** の 3 種（`routers/admin.py:585`）。`mcr.microsoft.com/playwright/mcp` を別サービスとして `--headless --browser chromium --no-sandbox --port 8931 --host 0.0.0.0` で起動して `type: mcp` / `url: http://playwright-mcp:8931/mcp` を登録する。**`svc-computer-net` は `-a` / `-b` / `-c` の 3 つに分割済みで単一の `svc-computer-net` は存在しない**（この記述のまま compose に書くと `docker compose config` が落ちる）。Playwright MCP はチームごとに 1 台ずつ置いて対応するチームのネットワーク（`svc-computer-net-a` 等）だけに参加させるか、3 チーム共通で使うなら 3 ネットワークすべてに参加させる。**`mcp_stdio` で `npx @playwright/mcp` をコンテナ内に生やす形は上記の理由で不可**
+- **リモート CDP** — cptr 内蔵の Agent browser tools と Browser タブの `chrome` モードは、どちらも `browser.cdp_url` を見る。**`browser.auto_launch` を off にすると `ensure_browser()`（localhost 決め打ちで Chrome を探す）を通らず、リモートの CDP に直接つなぐ**（`utils/tools.py:1822-1836`、`routers/browser.py:208`）。`browserless/chrome` などをサイドカーに置いて `http://chrome:9222` を指す
+- **クラウド API** — `browser.provider` は `local` / `firecrawl` / `browser_use` の 3 択（Admin → Browser の `<select>`）。ブラウザを自前で持たない代わりに API キーと課金が要る
+
+**Computer 側で「Computer use」モデル（gpt-5.4 以降）は使えない。** cptr のソース全体に `computer_use` / `computer-use` の文字列が 1 つも無く、アクションループが実装されていない。`browser_screenshot` は PNG を `<workspace>/.cptr/screenshots/` に保存して**ファイルパスの文字列を返すだけ**で、画像がモデルへ戻らない（`utils/tools.py:1901-1931`）。ブラウザ操作は Playwright MCP の既定の **Snapshot モード**（アクセシビリティツリー）で行う — ツール呼び出しができるモデルなら何でも動き、座標クリックより安定して安い。座標が要るときだけ `--caps=vision` を足す。
+
+**dev サーバの bind に注意。** ブラウザが別コンテナに居るので、`http://localhost:5173` では届かない。dev サーバを `--host 0.0.0.0` で立て、`http://open-webui-computer-a:5173` のようにチーム別サービス名で指す。
 
 ### Computer の開発イメージ（`docker/computer/Dockerfile`）
 
@@ -116,7 +152,7 @@ npm run cy:open               # Cypress（E2E、upstream 由来）
 
 **見落とすと沈黙して壊れる点**（すべて実イメージ・実バイナリで確認済み）:
 
-- **`docker compose up -d` だけでは反映されない。** `docker compose build open-webui-computer` を明示的に流す必要がある
+- **`docker compose up -d` だけでは反映されない。** `docker compose build` を明示的に流す必要がある（3 台とも同じ `image:` タグを指すため、これで足りる）
 - **Node は 22 で固定。** submodule の `engines` が `>=18.13.0 <=22.x.x` なので、24 に上げると submodule のフロントエンドがインストールできなくなる
 - Node は `node:22-bookworm-slim` からバイナリを `COPY` している。**両者のベースが同じ Debian 12 (bookworm) だから成立する**。upstream がベースを変えたらここが壊れる
 - pnpm は corepack ではなく `npm install -g` で入れる。corepack のシムは初回実行時にネットワークから pnpm を取りに行くため、「ビルドは通ったのに実行時に落ちる」が起きる
@@ -222,4 +258,9 @@ Function の種別は定義したクラス名で決まる（`Pipe` / `Filter` / 
 - `WEBUI_SECRET_KEY` は**全レプリカで同一の値**にすること。値が変わると OAuth 連携ツール（Descript MCP など）の保存済みトークンを復号できなくなり `Error decrypting tokens` になる
 - submodule 先 `A-clear/open-webui` は別リポジトリ（public）。読み取りは誰でもできるが `kamegin4-aws` に push 権限は無い。submodule にコミットを積むと親が push 不能になる点に注意
 - `full-stack/open-webui/backend/venv/` はコミット対象外のローカル環境。作り直す場合は `pip install -r backend/requirements.txt`
-- `codex-home` ボリュームには Codex のログイン情報（`auth.json`）が入る。**消すと再ログインが必要**になり、バックアップ対象としても機微。`open-webui-computer-cache` / `-local` はパッケージキャッシュなので消しても再取得されるだけ
+- `codex-home-a` / `-b` / `-c` ボリューム（チーム別）には Codex のログイン情報（`auth.json`）が入る。**消すと再ログインが必要**になり、バックアップ対象としても機微。`computer-{a,b,c}-cache` / `computer-{a,b,c}-local` はパッケージキャッシュなので消しても再取得されるだけ
+- **マルチユーザ前提で運用している。** 設計は `docs/superpowers/specs/2026-08-27-multi-user-design.md`、手順は `docs/Setup/multi_user_setup.md`。分離は「事故防止」レベルであって「悪意」には不十分。既知の限界は手順書の最終節を参照
+- **Functions にアクセス制御は存在しない。** `function` テーブルに `access_control` 列が無く、`access_grant` の `resource_type` 10 種にも `function` が無い。制御軸は `is_active` と `is_global` の 2 つだけ。特定グループに見せたい場合は **Workspace → Models に Model エントリを作り、そこに access_grants を付ける**。「Function の権限」ではなく「Model の権限」として設計すること
+- **権限はグループを OR 合成する**（`utils/access_control/__init__.py:54`）。グループは権限を足すことしかできず奪えないため、「既定を `false` に絞ってグループで `true` を足す」以外の順序は成立しない
+- **`chat_id` と `file_id` はクライアント制御である。** Functions で DB を引くときは必ずスコープ付き API（`Chats.get_chat_by_id_and_user_id` / `Files.get_file_by_id_and_user_id`）を使う。スコープ無し版を使うと他ユーザの状態とファイルに到達できる
+- **PersistentConfig は初回起動時にしか取り込まれない。** `Config.seed_defaults()` は「DB に無いキーだけ INSERT」する（`models/config.py:256`）。`TERMINAL_SERVER_CONNECTIONS` / `OPENAI_API_CONFIGS` / `DEFAULT_USER_ROLE` / `USER_PERMISSIONS_*` はすべてこれに該当する。起動済みの環境で `.env` を変えても効かないので、Admin Settings で直すこと
