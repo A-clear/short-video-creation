@@ -219,11 +219,36 @@ def _as_user_model(user: Any) -> UserModel:
 # ===========================================================================
 
 
-async def _load_state(chat_id: Optional[str]) -> dict:
-    if not chat_id:
+def _user_id(user_raw: Any) -> Optional[str]:
+    """__user__ から user_id を取り出す。dict / UserModel のどちらでも動く。
+
+    マルチユーザ環境では chat state とファイルの所有者検証にこの値を使う。
+    取れなかった場合は None を返し、呼び出し側は fail-closed で扱う。
+    """
+    if user_raw is None:
+        return None
+    if isinstance(user_raw, dict):
+        value = user_raw.get("id")
+    else:
+        value = getattr(user_raw, "id", None)
+    return str(value) if value else None
+
+
+async def _load_state(chat_id: Optional[str], user_id: Optional[str]) -> dict:
+    """chat.chat['descript'] を読む。
+
+    ⚠️ 所有者検証つきの get_chat_by_id_and_user_id を使うこと
+    （backend/open_webui/models/chats.py:1540）。chat_id はクライアント制御
+    （utils/actions.py:66-68 が form_data をそのまま使う）なので、
+    スコープ無しの get_chat_by_id では他ユーザの state を読めてしまう。
+    読んだ state は _ok() の封筒に載って呼び出し元へ返るため実害がある。
+
+    user_id が取れない経路は fail-closed で {} を返す。
+    """
+    if not chat_id or not user_id:
         return {}
     try:
-        chat = await Chats.get_chat_by_id(chat_id)
+        chat = await Chats.get_chat_by_id_and_user_id(chat_id, user_id)
     except Exception:
         return {}
     if chat is None:
@@ -232,16 +257,26 @@ async def _load_state(chat_id: Optional[str]) -> dict:
     return dict(state) if isinstance(state, dict) else {}
 
 
-async def _save_state(chat_id: Optional[str], patch: dict) -> dict:
+async def _save_state(chat_id: Optional[str], patch: dict, user_id: Optional[str]) -> dict:
     """chat.chat['descript'] にパッチをマージして保存し、マージ後の state を返す。
 
     update_chat_by_id は blob に 'title' が無いとチャットタイトルを
     'New Chat' にリセットする（models/chats.py:608）ため、必ず補う。
+
+    ⚠️ 取得も所有者検証つきの get_chat_by_id_and_user_id を使うこと。
+    update_chat_by_id は chat.chat を丸ごと置換する（models/chats.py:606）ので、
+    スコープ無しで取得すると他ユーザのチャットを破壊できる。
+
+    書けなかった場合もマージ後の state を返す。封筒の state は
+    「このリクエストが認識している状態」であり、永続化の成否とは別だからである。
     """
-    if not chat_id:
+    if not chat_id or not user_id:
+        # ⚠️ 無言で捨てない。ここに入ると _ok() は成功の封筒に patch を載せて返すため、
+        #    UI 上は成功したのに永続化されていない状態が痕跡なく発生する。
+        _log_debug("state.save_skipped", chat_id=chat_id, has_user=bool(user_id))
         return dict(patch or {})
     try:
-        chat = await Chats.get_chat_by_id(chat_id)
+        chat = await Chats.get_chat_by_id_and_user_id(chat_id, user_id)
     except Exception:
         return dict(patch or {})
     if chat is None:
@@ -265,11 +300,11 @@ async def _save_state(chat_id: Optional[str], patch: dict) -> dict:
     return state
 
 
-async def _append_history(chat_id: Optional[str], entry: dict) -> None:
-    state = await _load_state(chat_id)
+async def _append_history(chat_id: Optional[str], entry: dict, user_id: Optional[str]) -> None:
+    state = await _load_state(chat_id, user_id)
     history = list(state.get("history") or [])
     history.append({"ts": int(time.time()), **entry})
-    await _save_state(chat_id, {"history": history})
+    await _save_state(chat_id, {"history": history}, user_id)
 
 
 # ===========================================================================
@@ -624,7 +659,7 @@ class Filter:
 
         # ③ state のヒント注入
         if self.valves.inject_project_hint:
-            await self._inject_hint(body, metadata)
+            await self._inject_hint(body, metadata, user)
 
         _log_info(
             "filter.inlet",
@@ -729,11 +764,11 @@ class Filter:
                 append=True,
             )
 
-    async def _inject_hint(self, body: dict, metadata) -> None:
+    async def _inject_hint(self, body: dict, metadata, user) -> None:
         chat_id = body.get("chat_id")
         if not chat_id and isinstance(metadata, dict):
             chat_id = metadata.get("chat_id")
-        state = await _load_state(chat_id)
+        state = await _load_state(chat_id, _user_id(user))
         if not state:
             return
 
@@ -843,7 +878,7 @@ class Filter:
             return body
 
         chat_id = body.get("chat_id")
-        state = await _load_state(chat_id)
+        state = await _load_state(chat_id, _user_id(user))
 
         # ★ 本文の書き換えは Descript を使っているチャットに限定する（契約書 §5.9 追加の防御）。
         #    outlet はチャット履歴の保存内容を不可逆に書き換えるため、
@@ -895,6 +930,7 @@ class Filter:
                             f"rev={state.get('revision')}"
                         ),
                     },
+                    _user_id(user),
                 )
             except Exception:
                 pass

@@ -5,12 +5,23 @@
 #   PostgreSQL (+ pgvector)  … 本体 DB 兼ベクトル DB
 #   Redis                    … 共有状態ストア / WebSocket マネージャ
 #   MinIO                    … 共有ファイルストレージ（S3 互換）
+#   Docling                  … Basic RAG のコンテンツ抽出エンジン
+#                               （PDF / Office / HTML → Markdown）
 #   Open WebUI               … アプリ本体
 #   Open Terminal            … AI がコマンドを実行する作業環境（PWA 内のターミナル / ファイルブラウザ）
 #   Open WebUI Computer      … 実マシン相当のエージェントワークスペース（独立 PWA + gateway）
+#                               ＋ Python / TypeScript 開発ツールチェーンと codex CLI
+#                               （docker/computer/Dockerfile でビルド）。チーム別
+#                               （team-a / team-b / team-c）に 3 コンテナ用意する
+#   Playwright MCP           … Computer 内の dev サーバをエージェントが操作するための
+#                               ヘッドレスブラウザ。Computer のイメージには Chromium の
+#                               共有ライブラリが無いため別コンテナに置く。同じくチーム別に 3 台
 #
 # 起動:
 #   cp .env.example .env  で値を埋めてから
+#   docker compose build   ← 初回とツール更新時に必要。ビルドするのは
+#                             Computer（3 台とも同じ image: タグなので実質 1 回）
+#                             と Docling（日本語 OCR の言語パック追加）の 2 つ
 #   docker compose up -d
 #
 # 水平スケール:
@@ -20,6 +31,154 @@
 # ⚠️ 本ファイルは意図的に実行しません（リポジトリのルール）。
 #    起動はユーザが明示的に行ってください。
 # ==============================================================================
+
+# ==============================================================================
+# Open WebUI Computer の共通定義（チーム別 3 台で共有する）
+# ==============================================================================
+#
+# ⚠️ 3 台とも同じ image: タグを指すため、docker compose build は実質 1 回の
+#    ビルドになります（BuildKit のキャッシュが効く）。
+x-computer-env:
+  &computer-env # イメージ側で既に /data ですが、下の volume と対応させるため明示します。
+  CPTR_DATA_DIR: /data
+  CPTR_LOG_LEVEL: ${OPEN_WEBUI_COMPUTER_LOG_LEVEL:-INFO}
+  CPTR_LOG_FORMAT: json
+  # 既定は NONE（監査ログ無し）。SSH 相当の権限を持つ面なので METADATA 以上を推奨。
+  # ⚠️ API レベルの記録であり、端末操作の全トランスクリプトではありません。
+  CPTR_AUDIT_LOG_LEVEL: ${OPEN_WEBUI_COMPUTER_AUDIT_LOG_LEVEL:-METADATA}
+  CPTR_EXECUTE_TIMEOUT: ${OPEN_WEBUI_COMPUTER_EXECUTE_TIMEOUT:-600}
+  TAVILY_API_KEY: ${TAVILY_API_KEY:-}
+  #
+  # ⚠️ LLM プロバイダ（OpenAI / Anthropic）と認証モードは環境変数で
+  #    設定できません。前者は各 Computer の Settings → Admin → Connections、
+  #    後者は <data-dir>/config.toml の [auth] セクションです。
+  #
+  # ⚠️ 認証モードは password のままにしてください。trusted_header モードの
+  #    AuthResult は user_id が None になり（utils/config.py:387-397）、
+  #    gateway キー発行が 401 で弾かれます（gateway.py:780-781）。
+  #    本構成は gateway キーが必須です。
+
+# ⚠️ Computer イメージの `/workspace` と `/home/cptr/{.codex,.cache,.local}` は
+#    Dockerfile 側で cptr 所有として作ってあります（ベースイメージの VOLUME 宣言は
+#    /data だけで、/workspace すら存在しません）。イメージに無いパスへ名前付き
+#    ボリュームを張ると Docker が root 所有でディレクトリを作り、cptr が書き込めず
+#    静かに壊れます（`codex login` も `mkdir /workspace/<name>` も Permission
+#    denied）。以下 3 サービスの volumes: はこれを踏まえたマウント先になっています。
+#    崩れた場合は再ビルド + `up -d --force-recreate` で所有者が入り直ります。
+x-computer-base: &computer-base
+  build:
+    context: ./docker/computer
+    args:
+      COMPUTER_IMAGE: ${OPEN_WEBUI_COMPUTER_IMAGE:-ghcr.io/open-webui/computer:latest}
+      NODE_VERSION: ${NODE_VERSION:-22}
+      PNPM_VERSION: ${PNPM_VERSION:-11.24.0}
+      TYPESCRIPT_VERSION: ${TYPESCRIPT_VERSION:-7.0.2}
+      TSX_VERSION: ${TSX_VERSION:-4.23.12}
+      CODEX_CLI_VERSION: ${CODEX_CLI_VERSION:-rust-v0.149.1}
+      CODEX_CLI_TARGET: ${CODEX_CLI_TARGET:-x86_64-unknown-linux-musl}
+  image: svc/open-webui-computer:local
+  restart: unless-stopped
+  deploy:
+    resources:
+      limits:
+        # ⚠️ 3 台に増えたため 4G/4.0 から下げています。limits はピーク保護で
+        #    あって常時消費ではありませんが、3 台合計 9G / 6 CPU がホストに
+        #    要求されます。Playwright MCP を使う場合はさらに 3 台分
+        #    （既定 1G / 1.0 CPU ずつ）が乗り、合計 12G / 9 CPU になります。
+        memory: ${OPEN_WEBUI_COMPUTER_MEMORY_LIMIT:-3G}
+        cpus: "${OPEN_WEBUI_COMPUTER_CPU_LIMIT:-2.0}"
+      reservations:
+        memory: ${OPEN_WEBUI_COMPUTER_MEMORY_RESERVATION:-1G}
+  healthcheck:
+    # curl の同梱は保証されていないため、確実に存在する python で叩きます。
+    test:
+      - CMD
+      - python
+      - -c
+      - "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/api/health', timeout=5).status == 200 else 1)"
+    interval: 30s
+    timeout: 10s
+    retries: 5
+    start_period: 60s
+
+# ==============================================================================
+# Playwright MCP の共通定義（チーム別 3 台で共有する）
+# ==============================================================================
+#
+# Computer の中で立てた dev サーバを「エージェントに操作させる」ための
+# ヘッドレスブラウザです。人間が目で見るだけなら Computer の Browser タブ
+# （プロキシ）で足りるので、こちらは不要です。
+#
+# ⚠️ なぜ別コンテナなのか — Computer のイメージには Chromium が要求する
+#    共有ライブラリが 1 つも入っていません（libnss3 / libatk-1.0 / libgbm /
+#    libxkbcommon / libasound / libcups / libpango / libdrm / libxcomposite が
+#    すべて ldconfig -p で 0 件）。cptr は非 root で sudo も apt も使えないため、
+#    コンテナ内で `npx playwright install` してもブラウザ起動時に落ちます。
+#    ブラウザ本体は必ず外に置きます。
+#
+# ⚠️ なぜチームごとに 3 台なのか — 1 台を 3 つのネットワークに参加させると、
+#    そのブラウザが 3 チームすべての Computer と dev サーバに到達できます。
+#    チームを分けている理由（下の open-webui-computer-* のコメント参照）が
+#    その 1 コンテナで無効化されるため、ネットワークと同じ粒度で分けます。
+#
+# ⚠️ 載せるのは svc-computer-net-* ではなく専用の svc-playwright-net-* です。
+#    前者には open-webui 本体も参加しているため、相乗りさせると
+#    「エージェントが指示した URL を開くブラウザ」が Open WebUI 本体に
+#    到達できてしまいます。両者の間に必要な通信は 1 本もありません。
+#
+# ⚠️ ポートは公開しません。この API は「認証なしでブラウザを遠隔操作できる口」
+#    です。同じチームの Computer からサービス名で引ければ足ります。
+x-playwright-mcp: &playwright-mcp
+  # ⚠️ ENTRYPOINT に `node /app/cli.js --headless --browser chromium
+  #    --no-sandbox` が焼かれているイメージです。上書きせず、設定は下の
+  #    PLAYWRIGHT_MCP_* 環境変数で渡します（CLI フラグと 1:1 対応）。
+  image: mcr.microsoft.com/playwright/mcp:${PLAYWRIGHT_MCP_VERSION:-latest}
+  restart: unless-stopped
+  # Chromium は子プロセスを大量に作るため、PID 1 にゾンビを回収する役が要ります。
+  init: true
+  # ⚠️ Docker の既定 /dev/shm は 64MB で、Chromium がタブを開いた瞬間に
+  #    クラッシュすることが知られています。ここは節約しないでください。
+  shm_size: ${PLAYWRIGHT_MCP_SHM_SIZE:-1gb}
+  deploy:
+    resources:
+      limits:
+        memory: ${PLAYWRIGHT_MCP_MEMORY_LIMIT:-1G}
+        cpus: "${PLAYWRIGHT_MCP_CPU_LIMIT:-1.0}"
+  # ⚠️ このイメージに curl も wget もありません（実測）。node で叩きます。
+  #    Host: localhost:8931 が通るよう allowed-hosts に localhost:8931 を
+  #    含めてあります。正常時は 406（Accept ヘッダ不足）が返り、これは
+  #    「MCP ハンドラが生きている」ことの証明になります。
+  healthcheck:
+    test:
+      - CMD
+      - node
+      - -e
+      - "fetch('http://localhost:8931/mcp',{method:'POST'}).then(r=>process.exit(r.status<500?0:1)).catch(()=>process.exit(1))"
+    interval: 30s
+    timeout: 10s
+    retries: 3
+    start_period: 20s
+
+x-playwright-mcp-env: &playwright-mcp-env
+  PLAYWRIGHT_MCP_PORT: "8931"
+  # ⚠️ 既定は localhost bind で、別コンテナから一切繋がりません。
+  #    起動ログは 0.0.0.0 でも "Listening on http://localhost:8931" と出ます
+  #    （表示だけの問題で、実際の bind はこの変数に従います）。
+  PLAYWRIGHT_MCP_HOST: "0.0.0.0"
+  # プロファイルをディスクに残さない。複数クライアントが同時に繋いでも
+  # プロファイルロックで衝突しません。
+  PLAYWRIGHT_MCP_ISOLATED: "true"
+  # ⚠️ これを omit にしないと browser_take_screenshot が base64 の image ブロックを
+  #    返し、cptr の _extract_mcp_result が非 text ブロックを json.dumps して
+  #    テキストに混ぜます（utils/tools.py:2906-2915）。モデルには画像として
+  #    渡らないうえ、実測で小さなページでも 12KB のゴミが文脈に入りました。
+  #    スクリーンショットはファイルに保存され、パスだけが返ります。
+  PLAYWRIGHT_MCP_IMAGE_RESPONSES: omit
+  PLAYWRIGHT_MCP_VIEWPORT_SIZE: ${PLAYWRIGHT_MCP_VIEWPORT_SIZE:-1280x720}
+  # 返すコンソールログの下限。dev サーバの検証が目的なので既定は warning。
+  PLAYWRIGHT_MCP_CONSOLE_LEVEL: ${PLAYWRIGHT_MCP_CONSOLE_LEVEL:-warning}
+  # ⚠️ Service Worker はブロックしません。本プロジェクトの成果物は PWA で、
+  #    ブロックすると検証したい挙動そのものが消えます。
 
 services:
   # ----------------------------------------------------------------------------
@@ -36,8 +195,12 @@ services:
       POSTGRES_USER: ${POSTGRES_USER:-openwebui}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD を .env に設定してください}
       POSTGRES_DB: ${POSTGRES_DB:-openwebui}
-      # 総接続数 = (DATABASE_POOL_SIZE + DATABASE_POOL_MAX_OVERFLOW) × レプリカ数
-      # .env の既定値（15 + 20）でレプリカ 3 台なら 105。余裕を持たせています。
+      # 総接続数 = (DATABASE_POOL_SIZE + DATABASE_POOL_MAX_OVERFLOW)
+      #            × UVICORN_WORKERS × レプリカ数
+      # .env の既定値（15 + 20）× ワーカー 4 × レプリカ 1 で 140。
+      # ⚠️ ワーカーとレプリカは掛け算になります。この構成のまま
+      #    --scale open-webui=2 にすると 280 で max_connections を超えます。
+      #    先に下の max_connections を引き上げてください。
       POSTGRES_INITDB_ARGS: "--encoding=UTF8"
     command:
       - postgres
@@ -138,6 +301,152 @@ services:
     networks: [svc-net]
 
   # ----------------------------------------------------------------------------
+  # Docling（Basic RAG のコンテンツ抽出エンジン）
+  # ----------------------------------------------------------------------------
+  # PDF / Word / スプレッドシート / HTML / 画像を Markdown に変換して
+  # Open WebUI に返します。既定の pypdf は継続的な取り込みでメモリリークする
+  # ため、Basic RAG の抽出エンジンとしてこちらを使います。
+  #
+  # 呼び出しは Open WebUI → POST /v1/convert/file の 1 経路だけです
+  # （retrieval/loaders/main.py:197-216）。
+  #
+  # ⚠️ Open WebUI 側の requests.post にタイムアウト指定がありません。
+  #    ぶら下がりの上限は下の DOCLING_SERVE_MAX_SYNC_WAIT だけで決まります。
+  #    ここを無効に大きくすると、変換 1 件が Open WebUI のスレッドを
+  #    その秒数だけ占有します。
+  #
+  # ⚠️ ボリュームを付けていないのは意図的です。変換モデル（layout /
+  #    tableformer / picture_classifier / rapidocr / easyocr）はイメージの
+  #    /opt/app-root/src/.cache/docling/models に焼き込まれています。
+  #    空の名前付きボリュームで覆うと docling-serve はモデルを自動取得せず
+  #    実行時エラーにします。
+  #
+  # ⚠️ **ビルドが必要なサービスです**（Computer と合わせて 2 つ目）。
+  #    公式イメージの tesseract には英語の言語パックしか入っていないため、
+  #    docker/docling/Dockerfile で日本語（jpn / jpn_vert）を足しています。
+  #    docker compose up -d だけでは反映されません。
+  docling-serve:
+    build:
+      context: ./docker/docling
+      args:
+        DOCLING_SERVE_IMAGE: quay.io/docling-project/docling-serve:${DOCLING_SERVE_VERSION:-latest}
+    image: svc/docling-serve:local
+    container_name: svc-docling-serve
+    restart: unless-stopped
+    environment:
+      # 認証キー。Open WebUI は X-Api-Key ヘッダで送ります。
+      # ⚠️ .env の DOCLING_API_KEY と同じ値を参照しています。片方だけ
+      #    変えると変換が 401 になります。
+      DOCLING_SERVE_API_KEY: ${DOCLING_API_KEY:?DOCLING_API_KEY を .env に設定してください}
+
+      # デモ UI（/ui）。認証が掛からないため既定では出しません。
+      DOCLING_SERVE_ENABLE_UI: "false"
+
+      # 画像説明を外部 LLM に投げる機能。使わないので閉じたままにします。
+      # ⚠️ true にする場合は下の svc-docling-net の internal を外す必要があります。
+      DOCLING_SERVE_ENABLE_REMOTE_SERVICES: "false"
+
+      # 同期変換の待ち時間上限（秒）。既定 120 は大きな PDF に足りません。
+      DOCLING_SERVE_MAX_SYNC_WAIT: ${DOCLING_SERVE_MAX_SYNC_WAIT:-600}
+
+      # 変換ワーカー数。
+      DOCLING_SERVE_ENG_LOC_NUM_WORKERS: ${DOCLING_SERVE_ENG_LOC_NUM_WORKERS:-2}
+
+      DOCLING_SERVE_LOG_FORMAT: json
+
+      # ⚠️ **1 から動かさないでください。** 既定の LocalOrchestrator は
+      #    タスクをプロセス内のメモリに持つため、2 以上にすると
+      #    「あるワーカーが作ったタスクを別のワーカーが知らない」状態になり
+      #    Task Not Found (404) が出ます。
+      # ⚠️ Open WebUI 側の UVICORN_WORKERS（.env 6 節）とは名前が同じだけの
+      #    別物です。このサービスは env_file を読み込まないため混ざりません。
+      UVICORN_WORKERS: "1"
+
+      OMP_NUM_THREADS: ${DOCLING_OMP_NUM_THREADS:-4}
+      MKL_NUM_THREADS: ${DOCLING_OMP_NUM_THREADS:-4}
+    deploy:
+      resources:
+        limits:
+          memory: ${DOCLING_SERVE_MEMORY_LIMIT:-4G}
+          cpus: "${DOCLING_SERVE_CPU_LIMIT:-4.0}"
+    # /health は認証不要（app.py の health ルートに require_auth が無い。
+    # 変換系の 5 ルートだけが Depends(require_auth) を持ちます）。
+    #
+    # curl の同梱が保証されないため python で叩きます。パスはイメージの
+    # ENV UV_PROJECT_ENVIRONMENT=/opt/app-root（registry の config blob で確認）
+    # から導いた venv の bin です。
+    # ⚠️ ここだけは実イメージを pull して確認していません。unhealthy のまま
+    #    直らない場合は `docker compose exec docling-serve sh -c 'command -v python python3 curl'`
+    #    で実在するものに差し替えてください（depends_on は service_started
+    #    なので、unhealthy でも Open WebUI の起動は止まりません）。
+    healthcheck:
+      test:
+        - CMD
+        - /opt/app-root/bin/python
+        - -c
+        - "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:5001/health', timeout=5).status == 200 else 1)"
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    # ⚠️ ポートは公開しません。Open WebUI からサービス名で引ければ足ります。
+    networks: [svc-docling-net]
+
+  # ----------------------------------------------------------------------------
+  # リランクモデルの事前取得と検証（一回きり）
+  # ----------------------------------------------------------------------------
+  # リランカー本体はコンテナではありません。Open WebUI の Reranking Engine の
+  # 選択肢は「Default (SentenceTransformers)」と「External」の 2 つだけで
+  # （Documents.svelte:1214-1215）、前者を選ぶ以上モデルは Open WebUI の
+  # プロセス内で動きます。このサービスが担うのは次の 2 点です。
+  #
+  #   1. 事前取得 — open-webui-data ボリューム上の HuggingFace キャッシュへ
+  #      モデルを入れる。これが無いと 4 つの uvicorn ワーカーが起動時に
+  #      同時ダウンロードを始めます（main.py:624 の get_rf は lifespan の中で
+  #      走るため、遅延ロードではありません）。
+  #
+  #   2. ロード検証 — 実際に CrossEncoder を構築して predict まで通す。
+  #      ⚠️ Open WebUI はモデルのロードに失敗しても HTTP エラーを返さず、
+  #      ENABLE_RAG_HYBRID_SEARCH を黙って false へ戻すだけです
+  #      （routers/retrieval.py:1185-1187）。管理者から見えるのは
+  #      「保存したのにトグルが off に戻っている」という症状だけで、
+  #      原因は log.error の 1 行にしか出ません。ここで先に失敗させることで、
+  #      docker compose up 時点の明示的なエラーに変えています。
+  #
+  # ⚠️ image は open-webui 本体と同じものにしてください。huggingface_hub /
+  #    sentence-transformers / transformers のバージョンとキャッシュの
+  #    レイアウトが一致します。別イメージにすると「init は成功したのに
+  #    ワーカーがモデルを見つけられない」が起きます。同じイメージなので
+  #    追加の pull も発生しません。
+  #
+  # ⚠️ 公式イメージは ENTRYPOINT を持たず CMD [ "bash", "start.sh"] だけです
+  #    （Dockerfile:219）。したがって command の上書きで足ります。
+  reranker-model-init:
+    image: ghcr.io/open-webui/open-webui:main
+    container_name: svc-reranker-model-init
+    restart: "no"
+    environment:
+      # ⚠️ 公式イメージの Dockerfile:95 と同じ値。ここがずれるとワーカーが
+      #    キャッシュを見つけられません。
+      SENTENCE_TRANSFORMERS_HOME: /app/backend/data/cache/embedding/models
+      HF_HOME: /app/backend/data/cache/embedding/models
+      RERANKER_MODEL_ID: ${RERANKER_MODEL_ID:-hotchpotch/japanese-reranker-small-v2}
+      # 本体と同じ条件でロードを検証するため、同じ値を渡します。
+      SENTENCE_TRANSFORMERS_CROSS_ENCODER_BACKEND: ${SENTENCE_TRANSFORMERS_CROSS_ENCODER_BACKEND:-torch}
+      SENTENCE_TRANSFORMERS_CROSS_ENCODER_SIGMOID_ACTIVATION_FUNCTION: ${SENTENCE_TRANSFORMERS_CROSS_ENCODER_SIGMOID_ACTIVATION_FUNCTION:-true}
+      RAG_RERANKING_MODEL_TRUST_REMOTE_CODE: ${RAG_RERANKING_MODEL_TRUST_REMOTE_CODE:-false}
+      # モデルのダウンロードとロードは 1 コアで足ります。
+      OMP_NUM_THREADS: "1"
+    command: ["python", "/scripts/init_reranker_model.py"]
+    volumes:
+      - open-webui-data:/app/backend/data
+      - ./scripts/init_reranker_model.py:/scripts/init_reranker_model.py:ro
+    # ⚠️ 一回きりで終了するため専用ネットワークは切っていません。必要な通信は
+    #    HuggingFace への egress だけで、svc-net の他サービス（postgres /
+    #    redis / minio）は使いません。
+    networks: [svc-net]
+
+  # ----------------------------------------------------------------------------
   # Open Terminal（AI の実行環境）
   # ----------------------------------------------------------------------------
   # Open WebUI 本体に足りない「実際に手を動かす場所」を提供するコンポーネントです。
@@ -171,8 +480,23 @@ services:
       # 実際の通信は Open WebUI のバックエンド経由なので、公開 URL だけで足ります。
       OPEN_TERMINAL_CORS_ALLOWED_ORIGINS: ${WEBUI_URL:-http://localhost:8080}
 
-      # 同時ターミナルセッション数の上限（既定 16）。
-      OPEN_TERMINAL_MAX_SESSIONS: ${OPEN_TERMINAL_MAX_SESSIONS:-16}
+      # 各ユーザに専用の Linux アカウントと home（/home/<先頭8文字>）を作る。
+      # Open WebUI は X-User-Id を無条件に送るため（routers/terminals.py:123）、
+      # 追加の連携設定は要らない。
+      #
+      # ⚠️ 分離されるのはファイルだけです。PTY セッション一覧・接続・削除、
+      #    プロセス一覧・コマンド文字列・出力、ポート、CPU/メモリは全ユーザ共有。
+      #    他人の稼働中シェルに WebSocket でアタッチできます。
+      #    小規模で信頼できるチーム向けの設定です。
+      #
+      # ⚠️ home 名は Open WebUI のユーザ ID を英数小文字の先頭 8 文字に
+      #    切り詰めたものです（公式ドキュメントの /home/{user-id} は不正確）。
+      #    先頭 8 文字が一致する 2 人は同じ OS アカウントに合流します。
+      OPEN_TERMINAL_MULTI_USER: "true"
+
+      # ⚠️ コンテナ全体の合計上限であり、ユーザ単位ではありません。
+      #    既定 16 を人数で分け合う形になるため引き上げます。
+      OPEN_TERMINAL_MAX_SESSIONS: ${OPEN_TERMINAL_MAX_SESSIONS:-32}
 
       # コマンド出力を待つ秒数。既定は「未設定 = 無期限に待つ」なので必ず入れます。
       # ffmpeg のエンコードが走る想定で長めにしています。
@@ -186,9 +510,10 @@ services:
         中間ファイルの加工に使ってください。実際の動画編集は Descript 側が
         担当するため、ここで編集そのものを行わないでください。
 
-      # ファイルブラウザのルート。home = /home/user（既定）。
-      # 明示パス（/workspace 等）や filesystem（ルート全体）も指定できますが、
-      # filesystem はコンテナ全体が見えるようになるため使いません。
+      # ファイルブラウザのルート。home を指定すると、マルチユーザ時は
+      # 各ユーザ自身の home に解決される（main.py:153 の get_file_browser_root
+      # が fs.home を返す）。明示パス（/workspace 等）や filesystem も
+      # 指定できるが、filesystem にすると分離の意味が消えるため使わない。
       OPEN_TERMINAL_FILE_BROWSER_ROOT: home
 
       # 起動のたびに再インストールされる追加パッケージ（Docker イメージ限定）。
@@ -201,8 +526,17 @@ services:
       # パッケージ導入だけ許して情報の持ち出しを塞ぎたい場合に有効です。
       # OPEN_TERMINAL_ALLOWED_DOMAINS: "pypi.org,files.pythonhosted.org,github.com,*.npmjs.org"
     volumes:
-      # 作業ファイルの永続化。このボリュームを消すと AI の作業結果も消えます。
-      - open-terminal-data:/home/user
+      # ⚠️ マルチユーザ時は各ユーザの home が /home/<name> に作られるため、
+      #    /home ごと載せる必要があります。/home/user だけをマウントしても
+      #    新しい home はコンテナのレイヤ上に置かれ、作り直すと消えます。
+      #
+      # ⚠️ 既存の open-terminal-data を「マウント先だけ /home に変える」のは
+      #    壊れます。既存ボリュームは空ではない（/etc/skel 由来の dotfile が
+      #    24KB）ため、Docker がイメージの /home で seed せずボリュームの中身で
+      #    上書きし、/home/user が root 所有の空ディレクトリになります。
+      #    uid 1000 の user は自分の HOME に書けずログ出力が失敗します。
+      #    そのためボリューム名ごと変えています（移行価値のあるデータは無し）。
+      - open-terminal-home:/home
     # 暴走したスクリプトがホストを食い潰さないための上限。
     # 超過すると CPU はスロットル、メモリは OOM kill されます。
     deploy:
@@ -228,101 +562,133 @@ services:
     networks: [svc-terminal-net]
 
   # ----------------------------------------------------------------------------
-  # Open WebUI Computer（cptr）
+  # Open WebUI Computer（cptr）— チーム別 3 コンテナ
   # ----------------------------------------------------------------------------
   # 「実マシンをブラウザに出す」コンポーネントです。ファイル・エディタ・ターミナル・
-  # git に加えて、独自のエージェントランタイム（承認モード / サブエージェント /
-  # スキル / スケジュール実行）を持ちます。
+  # git に加えて、独自のエージェントランタイムを持ちます。
   #
-  # ⚠️ Open Terminal とは別物です。役割の線引き:
-  #    - Open Terminal … Open WebUI の中の「手」。バックエンドがプロキシする部品で、
-  #                      チャットのサイドバーに出る。使い捨ての作業環境。
-  #    - Computer      … 独立した 1 つのアプリ。自前のログイン・自前の PWA を持ち、
-  #                      作業が継続する常設ワークスペース。Open WebUI からは
-  #                      gateway 経由で `cptr/<workspace>` というモデルとして見える。
+  # ⚠️ Open Terminal とは別物です:
+  #    - Open Terminal … Open WebUI の中の「手」。バックエンドがプロキシする部品。
+  #    - Computer      … 独立した 1 つのアプリ。自前のログインと PWA を持つ。
+  #                      Open WebUI からは gateway 経由で cptr/<workspace> という
+  #                      モデルとして見える。
   #
-  # ⚠️ Open Terminal と違い、ホストへのポート公開が必須です。
-  #    Computer は Open WebUI のバックエンドを経由せず、ブラウザが直接 Socket.IO で
-  #    つなぎに行くためです。「隠す」ことはできないので、代わりに
-  #    ①ネットワークをデータ層から切り離す ②公開先を絞る、で守ります。
+  # ⚠️ なぜチームごとにコンテナを分けるのか:
+  #    cptr の routers/workspace.py と routers/terminal.py は絶対パスや
+  #    セッション ID を受け取るだけで所有者検査がありません。サインインさえ
+  #    していれば任意のユーザが他人のファイルを読み書きでき、他人の稼働中
+  #    シェルにアタッチできます（GET /api/workspace/read?path=... が通る）。
+  #    これは設定でも config.toml でも緩和できないため、コンテナ境界が
+  #    唯一の分離手段です。公式の表現は "Accounts are not isolation."
   #
-  # ⚠️ セキュリティモデルは「サインインしたユーザ = SSH 相当の全権」。
-  #    ユーザ間の分離はありません。境界はマウントしたディレクトリだけです。
-  #    生の公開インターネットには出さないでください（Tailscale / 認証付き
-  #    リバースプロキシの内側に置く）。
-  open-webui-computer:
-    # :latest が安定版、:dev が main 追従。ここは :latest を選びます。
-    # イメージは全オプション機能群を同梱しているため extras の指定は不要です。
-    image: ghcr.io/open-webui/computer:latest
-    container_name: svc-open-webui-computer
-    restart: unless-stopped
+  # ⚠️ 同一チーム内には分離がありません。境界はチームのコンテナだけです。
+  #
+  # ⚠️ ポート公開は必須です。ブラウザが Open WebUI のバックエンドを経由せず
+  #    直接 Socket.IO でつなぎに行くためです。生の公開インターネットには
+  #    出さないでください。
+  open-webui-computer-a:
+    <<: *computer-base
+    container_name: svc-open-webui-computer-a
     environment:
-      # イメージ側で既に /data に設定済みですが、下の volume と対応させるため明示します。
-      # DB（SQLite）・config.toml・アップロード・ログが全部ここに入ります。
-      CPTR_DATA_DIR: /data
-
-      CPTR_LOG_LEVEL: ${OPEN_WEBUI_COMPUTER_LOG_LEVEL:-INFO}
-      # 収集基盤に流す前提で JSON にしておきます（text も可）。
-      CPTR_LOG_FORMAT: json
-
-      # 既定は NONE（監査ログ無し）。SSH 相当の権限を持つ面なので METADATA 以上を推奨。
-      # METADATA = 変更系リクエストの記録 / REQUEST = リクエストボディ（マスク済み）も記録。
-      # ⚠️ 端末の全操作ログではありません。あくまで API レベルの記録です。
-      CPTR_AUDIT_LOG_LEVEL: ${OPEN_WEBUI_COMPUTER_AUDIT_LOG_LEVEL:-METADATA}
-
-      # 既定の * は全オリジン許可。Computer 自身の公開 URL と Open WebUI の URL に絞ります。
-      # ⚠️ カンマ区切りです（Open Terminal はセミコロン区切りではない点も含めて別仕様）。
-      CPTR_CORS_ALLOWED_ORIGINS: ${OPEN_WEBUI_COMPUTER_URL:-http://localhost:8001},${WEBUI_URL:-http://localhost:8080}
-
-      # run_command が「返る」までの秒数。既定は未設定 = コマンドは走り続けたまま即返る。
-      # ffmpeg のエンコードを待たせたいので明示します。
-      CPTR_EXECUTE_TIMEOUT: ${OPEN_WEBUI_COMPUTER_EXECUTE_TIMEOUT:-600}
-
-      # Web 検索。キー未設定だと DuckDuckGo にフォールバックします。
-      # 優先順は Exa → Perplexity → Tavily → Brave → Firecrawl → SearXNG → DuckDuckGo。
-      # EXA_API_KEY / PERPLEXITY_API_KEY を入れると Tavily より先に使われるので入れないこと。
-      TAVILY_API_KEY: ${TAVILY_API_KEY:-}
-
-      # ⚠️ LLM プロバイダ（OpenAI / Anthropic）は環境変数で設定できません。
-      #    Computer 側の Settings → Admin → Connections で登録します。
-      #    本プロジェクトの選定モデルは .env.example の「Open WebUI Computer」節を参照。
+      <<: *computer-env
+      CPTR_CORS_ALLOWED_ORIGINS: ${OPEN_WEBUI_COMPUTER_URL_A:-http://localhost:8001},${WEBUI_URL:-http://localhost:8080}
     volumes:
-      # アプリ状態。named volume にしています。
-      # ⚠️ ホストディレクトリを /data に bind mount すると、SQLite が app.db を
-      #    作れずに起動失敗します（ホスト側の所有者がイメージの設定を上書きするため）。
-      - open-webui-computer-data:/data
-      # 作業領域。UI から「ワークスペース」として追加するのはこのパスです。
-      - open-webui-computer-workspace:/workspace
-      #
-      # ホストの実プロジェクトを触らせたい場合はここに足します（マウントした分だけが境界）。
-      # ⚠️ gateway 経由の実行は全ツール自動承認なので、書き込み可でマウントする範囲は
-      #    「エージェントに勝手に触られてよい」ものだけにしてください。
-      # - ./docs:/workspace/docs
-      # - ./functions:/workspace/functions
+      # ⚠️ ホストディレクトリを /data に bind mount すると SQLite が app.db を
+      #    作れずに起動失敗します。名前付きボリュームのままにしてください。
+      - computer-a-data:/data
+      - computer-a-workspace:/workspace
+      # ⚠️ Codex のログイン情報。チームごとに分けているため、同じ ChatGPT
+      #    アカウントで 3 回 codex login --device-auth する運用になります
+      #    （レート制限は 1 アカウントで共有）。消すと再ログインが必要です。
+      - codex-home-a:/home/cptr/.codex
+      - computer-a-cache:/home/cptr/.cache
+      - computer-a-local:/home/cptr/.local
     ports:
-      # ⚠️ Open Terminal と違い、これはコメントアウトできません。
-      #    ブラウザが直接この口に来ます。ホスト側の既定は 8001（8080=Open WebUI、
-      #    8000=Open Terminal の検証用ポートと衝突させないため）。
-      - "${OPEN_WEBUI_COMPUTER_PORT:-8001}:8000"
-    deploy:
-      resources:
-        limits:
-          memory: ${OPEN_WEBUI_COMPUTER_MEMORY_LIMIT:-4G}
-          cpus: "${OPEN_WEBUI_COMPUTER_CPU_LIMIT:-4.0}"
-    healthcheck:
-      # curl の同梱は保証されていないため、確実に存在する python で叩きます。
-      test:
-        - CMD
-        - python
-        - -c
-        - "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/api/health', timeout=5).status == 200 else 1)"
-      interval: 30s
-      timeout: 10s
-      retries: 5
-      start_period: 60s
-    # ⚠️ svc-net には載せません（postgres / redis / minio に到達させないため）。
-    #    open-terminal とも別ネットワークにして、両者を相互に見えなくしています。
-    networks: [svc-computer-net]
+      - "${OPEN_WEBUI_COMPUTER_PORT_A:-8001}:8000"
+    networks: [svc-computer-net-a, svc-playwright-net-a]
+
+  open-webui-computer-b:
+    <<: *computer-base
+    container_name: svc-open-webui-computer-b
+    environment:
+      <<: *computer-env
+      CPTR_CORS_ALLOWED_ORIGINS: ${OPEN_WEBUI_COMPUTER_URL_B:-http://localhost:8002},${WEBUI_URL:-http://localhost:8080}
+    volumes:
+      - computer-b-data:/data
+      - computer-b-workspace:/workspace
+      - codex-home-b:/home/cptr/.codex
+      - computer-b-cache:/home/cptr/.cache
+      - computer-b-local:/home/cptr/.local
+    ports:
+      - "${OPEN_WEBUI_COMPUTER_PORT_B:-8002}:8000"
+    networks: [svc-computer-net-b, svc-playwright-net-b]
+
+  open-webui-computer-c:
+    <<: *computer-base
+    container_name: svc-open-webui-computer-c
+    environment:
+      <<: *computer-env
+      CPTR_CORS_ALLOWED_ORIGINS: ${OPEN_WEBUI_COMPUTER_URL_C:-http://localhost:8003},${WEBUI_URL:-http://localhost:8080}
+    volumes:
+      - computer-c-data:/data
+      - computer-c-workspace:/workspace
+      - codex-home-c:/home/cptr/.codex
+      - computer-c-cache:/home/cptr/.cache
+      - computer-c-local:/home/cptr/.local
+    ports:
+      - "${OPEN_WEBUI_COMPUTER_PORT_C:-8003}:8000"
+    networks: [svc-computer-net-c, svc-playwright-net-c]
+
+  # ----------------------------------------------------------------------------
+  # Playwright MCP（チーム別 3 コンテナ）
+  # ----------------------------------------------------------------------------
+  # Computer のエージェントに「ブラウザで dev サーバを触らせる」ための面です。
+  # 共通の注意は上の x-playwright-mcp を参照。
+  #
+  # ⚠️ Computer 側の登録は `type: mcp`（Streamable HTTP を直接指す）では
+  #    動きません。cptr は type: mcp のときツール呼び出しのたびに接続し直して
+  #    切断するため（utils/tools.py:2931-2940）、MCP セッションが毎回作り直され、
+  #    browser_navigate の次に browser_snapshot を呼ぶと about:blank が返ります
+  #    （--shared-browser-context でも解決しないことを実測済み）。
+  #    長寿命プロセスを保つ `mcp_stdio` 経路に、stdio ↔ HTTP を変換する
+  #    mcp-remote を挟んで登録してください。手順は
+  #    docs/Setup/playwright_mcp_setup.md。
+  #
+  # ⚠️ 到達先の指定に localhost は使えません。ブラウザは別コンテナに居ます。
+  #    dev サーバを --host 0.0.0.0 で立て、http://open-webui-computer-a:5173 の
+  #    ようにチーム別のサービス名で指してください。
+  playwright-mcp-a:
+    <<: *playwright-mcp
+    container_name: svc-playwright-mcp-a
+    environment:
+      <<: *playwright-mcp-env
+      # ⚠️ これが無いと DNS リバインディング対策に弾かれ、接続が 403 になります
+      #    （実測。ログには何も出ないので原因が分かりません）。
+      #    localhost:8931 は上の healthcheck 用です。
+      PLAYWRIGHT_MCP_ALLOWED_HOSTS: playwright-mcp-a:8931,localhost:8931
+      # ブラウザが「出て行ける先」の制限。空 = 制限なし。
+      # ⚠️ 絞ると CDN や Google Fonts も落ちるため、実ページの描画が崩れます。
+      #    既定では設定せず、境界はネットワーク分離に任せています。
+      PLAYWRIGHT_MCP_ALLOWED_ORIGINS: ${PLAYWRIGHT_MCP_ALLOWED_ORIGINS_A:-}
+    networks: [svc-playwright-net-a]
+
+  playwright-mcp-b:
+    <<: *playwright-mcp
+    container_name: svc-playwright-mcp-b
+    environment:
+      <<: *playwright-mcp-env
+      PLAYWRIGHT_MCP_ALLOWED_HOSTS: playwright-mcp-b:8931,localhost:8931
+      PLAYWRIGHT_MCP_ALLOWED_ORIGINS: ${PLAYWRIGHT_MCP_ALLOWED_ORIGINS_B:-}
+    networks: [svc-playwright-net-b]
+
+  playwright-mcp-c:
+    <<: *playwright-mcp
+    container_name: svc-playwright-mcp-c
+    environment:
+      <<: *playwright-mcp-env
+      PLAYWRIGHT_MCP_ALLOWED_HOSTS: playwright-mcp-c:8931,localhost:8931
+      PLAYWRIGHT_MCP_ALLOWED_ORIGINS: ${PLAYWRIGHT_MCP_ALLOWED_ORIGINS_C:-}
+    networks: [svc-playwright-net-c]
 
   # ----------------------------------------------------------------------------
   # Open WebUI
@@ -347,6 +713,19 @@ services:
         condition: service_healthy
       minio:
         condition: service_healthy
+      # 抽出エンジン。落ちていてもチャット本体は使えるべきなので待ちません
+      # （影響は「文書をアップロードすると変換に失敗する」だけ）。
+      docling-serve:
+        condition: service_started
+      # モデルの取得と検証が終わるまで起動しない。ここだけ service_started ではなく
+      # service_completed_successfully を使う（一回きりのジョブなので healthy にならない）。
+      #
+      # ⚠️ 初回だけ HuggingFace への到達性が必須になります。オフラインで
+      #    起動したい場合はこの 2 行を消し、.env の
+      #    RAG_RERANKING_MODEL_AUTO_UPDATE を true に戻してください
+      #    （各ワーカーが自分で取得するようになります）。
+      reranker-model-init:
+        condition: service_completed_successfully
       # ⚠️ service_healthy にしていません。
       #    open-terminal は約 4GB のイメージで初回 pull と起動に時間がかかります。
       #    ターミナルが落ちていてもチャット本体は使えるべきなので、
@@ -355,7 +734,11 @@ services:
         condition: service_started
       # 同じく service_started。起動時に Open WebUI は有効な OpenAI 互換接続の
       # /v1/models を引きに行くため、先に上がっていた方がログが汚れません。
-      open-webui-computer:
+      open-webui-computer-a:
+        condition: service_started
+      open-webui-computer-b:
+        condition: service_started
+      open-webui-computer-c:
         condition: service_started
     env_file:
       - .env
@@ -368,6 +751,30 @@ services:
       S3_ENDPOINT_URL: http://minio:9000
       S3_ACCESS_KEY_ID: ${MINIO_ROOT_USER}
       S3_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD}
+      # Basic RAG の抽出エンジン。.env の 13 節と同じ値ですが、コンテナ名で
+      # 解決させるためここでも明示します（上流の既定は http://docling:5001）。
+      # ⚠️ ※PersistentConfig です。既に一度起動した環境ではここを変えても
+      #    無視されるので、Admin Settings → Tools → Documents で直してください。
+      DOCLING_SERVER_URL: http://docling-serve:5001
+      #
+      # リランクとトークナイザで同じモデルを使う。
+      # ⚠️ ここが食い違うと、チャンクがリランカーの 512 トークン窓に収まらなくなり、
+      #    リランカーは各チャンクの先頭しか読まなくなります。エラーは出ません。
+      #    1 つの変数から両方を導くことでその食い違いを構造的に防いでいます。
+      # ⚠️ ※PersistentConfig です。既に一度起動した環境ではここを変えても
+      #    無視されるので、Admin Settings → Documents で直してください。
+      RAG_RERANKING_MODEL: ${RERANKER_MODEL_ID:-hotchpotch/japanese-reranker-small-v2}
+      RAG_TOKENIZER_MODEL: ${RERANKER_MODEL_ID:-hotchpotch/japanese-reranker-small-v2}
+      #
+      # ⚠️ torch は既定でホストの全コアを使おうとします。Open WebUI 側に上限を
+      #    設ける仕組みはありません（イメージにも backend にも OMP_NUM_THREADS /
+      #    torch.set_num_threads の設定が存在しないことを確認済み）。
+      #    ホストは 4 コアなので、4 ワーカー × 1 スレッド = 4 に揃えます。
+      #    2 にすると 8 スレッドになり、Docling や Computer と取り合って
+      #    かえって遅くなります。
+      #    これは素の環境変数なので、起動済みの環境でも再起動で反映されます。
+      OMP_NUM_THREADS: ${OPEN_WEBUI_OMP_NUM_THREADS:-1}
+      MKL_NUM_THREADS: ${OPEN_WEBUI_OMP_NUM_THREADS:-1}
       #
       # ⚠️ --scale open-webui=N で水平スケールする場合:
       #    マイグレーションを 1 台だけに任せる必要があります。
@@ -382,23 +789,17 @@ services:
       # Open Terminal の接続定義。管理画面（Admin Settings → Integrations →
       # Open Terminal）で手作業登録する代わりに、起動時に流し込みます。
       #
-      # ⚠️ 見落とすと沈黙して壊れる 3 点（v0.11.0 の実ソースで確認）:
-      #   ① config.py:386 の json.loads には try/except がありません。
-      #      TOOL_SERVER_CONNECTIONS（config.py:372）は例外を握り潰しますが、
-      #      こちらは JSON が壊れていると import 時に落ちて起動できません。
-      #   ② PersistentConfig 相当です。DEFAULT_CONFIG（config.py:2800）経由で
-      #      Config.seed_defaults() に渡されますが、この関数は
-      #      「DB に無いキーだけ INSERT」します（models/config.py:256）。
-      #      つまり取り込まれるのは初回起動時だけで、2 回目以降は
-      #      Admin Settings の値が正になります。ここを変えて反映したい場合は
-      #      管理画面で操作するか、DB の terminal_server.connections を消して再起動。
-      #   ③ access_grants が空 / 未指定だと「管理者のみ」になります
-      #      （utils/access_control/__init__.py:167）。公式ドキュメントの
-      #      direct connection の例は [] なので、そのまま写すと一般ユーザに
-      #      ターミナルが見えません。全員に開くには principal_id "*" の
-      #      read grant が要ります（utils/access_control/__init__.py:140）。
-      #      特定グループに絞る場合は
-      #        {"principal_type": "group", "principal_id": "<group_id>", "permission": "read"}
+      # ⚠️ access_grants を空にしています。空 / 未指定は「管理者のみ」に倒れます
+      #    （utils/access_control/__init__.py:171）。これは意図的な初期値です。
+      #
+      #    グループ ID はグループを作るまで存在せず、この変数は初回起動時にしか
+      #    取り込まれない（Config.seed_defaults() は DB に無いキーだけ INSERT。
+      #    models/config.py:256）ため、ここにグループ grant を書けません。
+      #    起動後に Admin Settings → Integrations で 3 チームの read grant を
+      #    付けてください。手順は docs/Setup/multi_user_setup.md。
+      #
+      # ⚠️ config.py:386 の json.loads には try/except がありません。
+      #    JSON を壊すと Open WebUI が起動しません。
       #
       # ⚠️ 折り畳みブロック（>-）の中は必ず同じインデントに揃えてください。
       #    深いインデントの行があると YAML が改行を保持してしまいます。
@@ -406,49 +807,78 @@ services:
         [{"id": "open-terminal", "name": "作業用ターミナル",
         "url": "http://open-terminal:8000", "key": "${OPEN_TERMINAL_API_KEY}",
         "auth_type": "bearer", "enabled": true,
-        "config": {"access_grants":
-        [{"principal_type": "user", "principal_id": "*", "permission": "read"}]}}]
+        "config": {"access_grants": []}}]
+      #
+      # ターミナルのプロキシ応答に sandbox CSP を被せる。
+      # プロキシは上流応答からセキュリティ関連ヘッダを剥がすが、ここで指定した
+      # ものは剥がした後にマージされ、衝突時はこちらが勝つ
+      # （routers/terminals.py:178-179）。
+      #
+      # ⚠️ セッション横取りには効きません。あれは WebSocket であって
+      #    プロキシ応答ではないためです。効くのは「プロキシ経由で返る
+      #    コンテンツがブラウザで何をできるか」の制限だけです。
+      #
+      # TERMINAL_SERVER_CONNECTIONS と違い config.py:391-393 に try/except が
+      # あるため、JSON が壊れていても {} にフォールバックして起動します。
+      TERMINAL_PROXY_HEADERS: >-
+        {"Content-Security-Policy": "sandbox allow-scripts; default-src 'none'; img-src 'self' data:; style-src 'unsafe-inline'",
+        "X-Content-Type-Options": "nosniff",
+        "Referrer-Policy": "no-referrer",
+        "X-Frame-Options": "DENY"}
       #
       # Open WebUI → Open WebUI Computer の接続（OpenAI 互換 gateway）。
       # Computer の各ワークスペースが `cptr/<workspace>` としてモデルピッカーに出ます。
       #
-      # 添字 0 = 本物の OpenAI（.env の OPENAI_API_BASE_URL / OPENAI_API_KEY をそのまま使用）
-      # 添字 1 = Computer の gateway
+      # 添字 0 = 本物の OpenAI、1〜3 = 各チームの Computer gateway。
       # OPENAI_API_CONFIGS のキーは「この配列の添字を文字列にしたもの」です
       #（routers/openai.py:544 の api_configs.get(str(idx), ...)）。
       #
-      # ⚠️ 手順が前後すると反映されません。以下の順でしか初期投入できません:
-      #   ① docker compose up -d open-webui-computer
-      #   ② docker compose logs open-webui-computer で初回セットアップ URL
-      #      （/?token=...）を拾い、admin アカウントを作る
-      #   ③ Computer の Settings → Admin → Gateway で API キーを発行
-      #      （sk-cptr-... は 1 回しか表示されず、以降はハッシュ保存）
-      #   ④ .env の OPEN_WEBUI_COMPUTER_GATEWAY_KEY に貼り、
-      #      OPEN_WEBUI_COMPUTER_ENABLED=true にする
-      #   ⑤ そのうえで Open WebUI を初回起動する
+      # ⚠️ 接続そのものは管理者グローバルで、ユーザ別に出し分ける口はありません。
+      #    出し分けは Workspace → Models 側のグループ ACL で行います。
+      #    未登録のモデルは管理者にしか見えない（utils/models.py:517-523）ため、
+      #    Model エントリを作るまで一般ユーザからは不可視です。
       #
-      # ⚠️ ※PersistentConfig です。TERMINAL_SERVER_CONNECTIONS と同じで
-      #    seed_defaults() は「DB に無いキーだけ INSERT」します
-      #    （models/config.py:256）。既に一度起動した環境ではここを変えても
+      # ⚠️ ※PersistentConfig です。既に一度起動した環境ではここを変えても
       #    無視されるので、Admin Settings → Connections で直してください。
-      OPENAI_API_BASE_URLS: ${OPENAI_API_BASE_URL:-https://api.openai.com/v1};http://open-webui-computer:8000/v1
-      OPENAI_API_KEYS: ${OPENAI_API_KEY};${OPEN_WEBUI_COMPUTER_GATEWAY_KEY:-}
+      OPENAI_API_BASE_URLS: ${OPENAI_API_BASE_URL:-https://api.openai.com/v1};http://open-webui-computer-a:8000/v1;http://open-webui-computer-b:8000/v1;http://open-webui-computer-c:8000/v1
+      OPENAI_API_KEYS: ${OPENAI_API_KEY};${OPEN_WEBUI_COMPUTER_GATEWAY_KEY_A:-};${OPEN_WEBUI_COMPUTER_GATEWAY_KEY_B:-};${OPEN_WEBUI_COMPUTER_GATEWAY_KEY_C:-}
       #
       # headers は接続ごとのカスタムヘッダで、値は utils/headers.py:114-131 の
       # プレースホルダに置換されます。この 5 つを渡すことで
-      #   - 会話の継続（follow-up が Computer 側の同じチャットに入る）
-      #   - 分岐の同期（Open WebUI での編集 / 再生成が Computer 側でも枝になる）
-      #   - 裏方タスクの除外（タイトル / タグ / 追従候補の生成でエージェントを起動しない）
+      #   - 会話の継続 / 分岐の同期 / 裏方タスクの除外
       # が効きます。1 つでも欠けると素のチャットしか成立しません。
       #
-      # ⚠️ enable は true / false のみ（JSON の真偽値）。壊れた JSON は
-      #    config.py:349 で警告のうえ握り潰され、接続が「無かったこと」になります。
-      # ⚠️ gateway 経由の実行に個別承認はありません。Computer 側のエージェントが
-      #    ファイル編集・コマンド実行・ツール呼び出しを全自動で行います。
+      # ⚠️ api_type は Chat Completions（= "responses" 以外）にすること。
+      #    gateway が実装しているのは GET /v1/models と
+      #    POST /v1/chat/completions の 2 つだけです。
+      #
+      # ⚠️ gateway 経由の実行に個別承認はありません。gateway キーは SSH 認証情報
+      #    として扱ってください。
+      #
+      # ⚠️ TERMINAL_SERVER_CONNECTIONS と違い、ここは壊れても起動が止まりません。
+      #    config.py:339-349 に try/except があり、JSON が壊れていると warning ログ
+      #    だけ出して丸ごと無視されます（ヘッダ 5 種と api_type が全部消えたまま
+      #    起動してしまう）。よくある壊し方は「.env に大文字の True/False を書く」
+      #    こと（例: OPEN_WEBUI_COMPUTER_ENABLED_A=True）。JSON のブール値では
+      #    ないため小文字の true / false を書くこと。
       OPENAI_API_CONFIGS: >-
         {"0": {"enable": true},
-        "1": {"enable": ${OPEN_WEBUI_COMPUTER_ENABLED:-false},
-        "connection_type": "external",
+        "1": {"enable": ${OPEN_WEBUI_COMPUTER_ENABLED_A:-false},
+        "connection_type": "external", "api_type": "",
+        "headers": {"X-OpenWebUI-Chat-Id": "{{CHAT_ID}}",
+        "X-OpenWebUI-Message-Id": "{{MESSAGE_ID}}",
+        "X-OpenWebUI-User-Message-Id": "{{USER_MESSAGE_ID}}",
+        "X-OpenWebUI-User-Message-Parent-Id": "{{USER_MESSAGE_PARENT_ID}}",
+        "X-OpenWebUI-Task": "{{TASK}}"}},
+        "2": {"enable": ${OPEN_WEBUI_COMPUTER_ENABLED_B:-false},
+        "connection_type": "external", "api_type": "",
+        "headers": {"X-OpenWebUI-Chat-Id": "{{CHAT_ID}}",
+        "X-OpenWebUI-Message-Id": "{{MESSAGE_ID}}",
+        "X-OpenWebUI-User-Message-Id": "{{USER_MESSAGE_ID}}",
+        "X-OpenWebUI-User-Message-Parent-Id": "{{USER_MESSAGE_PARENT_ID}}",
+        "X-OpenWebUI-Task": "{{TASK}}"}},
+        "3": {"enable": ${OPEN_WEBUI_COMPUTER_ENABLED_C:-false},
+        "connection_type": "external", "api_type": "",
         "headers": {"X-OpenWebUI-Chat-Id": "{{CHAT_ID}}",
         "X-OpenWebUI-Message-Id": "{{MESSAGE_ID}}",
         "X-OpenWebUI-User-Message-Id": "{{USER_MESSAGE_ID}}",
@@ -465,19 +895,45 @@ services:
       timeout: 10s
       retries: 5
       start_period: 60s
-    # svc-terminal-net / svc-computer-net にも参加します。open-terminal と
-    # open-webui-computer へ到達できるのはこのサービスだけで、両者は
-    # svc-net に載っていないためデータ層にも互いにも到達できません。
-    networks: [svc-net, svc-terminal-net, svc-computer-net]
+    # svc-terminal-net と 3 つの svc-computer-net-* にも参加します。
+    # 各 Computer へ到達できるのはこのサービスだけで、Computer 同士は
+    # ネットワークが分かれているため相互に到達できません。
+    networks:
+      [
+        svc-net,
+        svc-terminal-net,
+        svc-docling-net,
+        svc-computer-net-a,
+        svc-computer-net-b,
+        svc-computer-net-c,
+      ]
 
 volumes:
   postgres-data:
   redis-data:
   minio-data:
   open-webui-data:
-  open-terminal-data:
-  open-webui-computer-data:
-  open-webui-computer-workspace:
+  open-terminal-home:
+  # Computer のチーム別ボリューム。
+  # ⚠️ codex-home-* には Codex のログイン情報（auth.json）が入ります。
+  #    消すと再ログインが必要になり、バックアップ対象としても機微です。
+  # ⚠️ *-cache / *-local はパッケージキャッシュなので消しても再取得されるだけ。
+  #    ただしチームごとに独立するため、合計サイズは 3 倍に膨らみます。
+  computer-a-data:
+  computer-a-workspace:
+  computer-a-cache:
+  computer-a-local:
+  codex-home-a:
+  computer-b-data:
+  computer-b-workspace:
+  computer-b-cache:
+  computer-b-local:
+  codex-home-b:
+  computer-c-data:
+  computer-c-workspace:
+  computer-c-cache:
+  computer-c-local:
+  codex-home-c:
 
 networks:
   svc-net:
@@ -493,12 +949,48 @@ networks:
     #    OPEN_TERMINAL_ALLOWED_DOMAINS でドメインを絞ってください。
     # internal: true
 
-  # Open WebUI ↔ Open WebUI Computer 専用。
-  # svc-terminal-net と分けているのは、open-terminal と open-webui-computer を
-  # 相互に到達不能にするためです（どちらもコマンド実行ができる面なので、
-  # 片方が落ちたときの横移動を塞ぎます）。
+  # Open WebUI ↔ docling-serve 専用。
+  #
+  # ⚠️ internal: true にしています。変換モデルはイメージに焼き込み済みで、
+  #    DOCLING_SERVE_ENABLE_REMOTE_SERVICES=false のため、このコンテナが
+  #    外部へ出る必要は 1 つもありません。
+  #    外す必要があるのは次の 2 ケースだけです。
+  #      ・画像説明（picture description）を外部 LLM API で行う
+  #      ・easyocr の日本語モデルを実行時に取得させる（.env 13 節の (b)）
+  svc-docling-net:
+    driver: bridge
+    internal: true
+
+  # Open WebUI ↔ 各チームの Computer 専用。チームごとに分けることで
+  # Computer コンテナ同士を相互に到達不能にしています。
   #
   # ⚠️ internal: true にはできません。Computer は OpenAI / Anthropic API と
   #    Tavily に出る必要があり、また ports 公開でホストからも入ってきます。
-  svc-computer-net:
+  svc-computer-net-a:
+    driver: bridge
+  svc-computer-net-b:
+    driver: bridge
+  svc-computer-net-c:
+    driver: bridge
+
+  # Computer ↔ Playwright MCP 専用。svc-computer-net-* と分けているのは、
+  # そちらには open-webui 本体も参加しているためです。相乗りさせると
+  # 「エージェントが指示した URL を開くブラウザ」が Open WebUI 本体に
+  # 到達できてしまいます。両者の間に必要な通信は 1 本もありません。
+  #
+  # 参加するのは open-webui-computer-<team> と playwright-mcp-<team> の 2 つだけ。
+  # 通信は双方向に使われます:
+  #   Computer   → Playwright : mcp-remote が :8931/mcp を叩く
+  #   Playwright → Computer   : ブラウザが dev サーバ（:5173 等）を開く
+  #
+  # ⚠️ internal: true にするとブラウザが外部へ一切出られなくなります。
+  #    エージェントが開く先をチームの dev サーバだけに閉じ込められる反面、
+  #    CDN / Google Fonts / 外部 API を読むページは描画が崩れます。
+  #    本プロジェクトの成果物は PWA なので既定では有効にしていません。
+  # internal: true
+  svc-playwright-net-a:
+    driver: bridge
+  svc-playwright-net-b:
+    driver: bridge
+  svc-playwright-net-c:
     driver: bridge

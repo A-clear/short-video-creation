@@ -550,11 +550,36 @@ def _as_user_model(user: Any) -> UserModel:
 ### 5.3 状態の読み書き
 
 ```python
-async def _load_state(chat_id: Optional[str]) -> dict:
-    if not chat_id:
+def _user_id(user_raw: Any) -> Optional[str]:
+    """__user__ から user_id を取り出す。dict / UserModel のどちらでも動く。
+
+    マルチユーザ環境では chat state とファイルの所有者検証にこの値を使う。
+    取れなかった場合は None を返し、呼び出し側は fail-closed で扱う。
+    """
+    if user_raw is None:
+        return None
+    if isinstance(user_raw, dict):
+        value = user_raw.get("id")
+    else:
+        value = getattr(user_raw, "id", None)
+    return str(value) if value else None
+
+
+async def _load_state(chat_id: Optional[str], user_id: Optional[str]) -> dict:
+    """chat.chat['descript'] を読む。
+
+    ⚠️ 所有者検証つきの get_chat_by_id_and_user_id を使うこと
+    （backend/open_webui/models/chats.py:1540）。chat_id はクライアント制御
+    （utils/actions.py:66-68 が form_data をそのまま使う）なので、
+    スコープ無しの get_chat_by_id では他ユーザの state を読めてしまう。
+    読んだ state は _ok() の封筒に載って呼び出し元へ返るため実害がある。
+
+    user_id が取れない経路は fail-closed で {} を返す。
+    """
+    if not chat_id or not user_id:
         return {}
     try:
-        chat = await Chats.get_chat_by_id(chat_id)
+        chat = await Chats.get_chat_by_id_and_user_id(chat_id, user_id)
     except Exception:
         return {}
     if chat is None:
@@ -563,16 +588,26 @@ async def _load_state(chat_id: Optional[str]) -> dict:
     return dict(state) if isinstance(state, dict) else {}
 
 
-async def _save_state(chat_id: Optional[str], patch: dict) -> dict:
+async def _save_state(chat_id: Optional[str], patch: dict, user_id: Optional[str]) -> dict:
     """chat.chat['descript'] にパッチをマージして保存し、マージ後の state を返す。
 
     update_chat_by_id は blob に 'title' が無いとチャットタイトルを
     'New Chat' にリセットする（models/chats.py:608）ため、必ず補う。
+
+    ⚠️ 取得も所有者検証つきの get_chat_by_id_and_user_id を使うこと。
+    update_chat_by_id は chat.chat を丸ごと置換する（models/chats.py:606）ので、
+    スコープ無しで取得すると他ユーザのチャットを破壊できる。
+
+    書けなかった場合もマージ後の state を返す。封筒の state は
+    「このリクエストが認識している状態」であり、永続化の成否とは別だからである。
     """
-    if not chat_id:
+    if not chat_id or not user_id:
+        # ⚠️ 無言で捨てない。ここに入ると _ok() は成功の封筒に patch を載せて返すため、
+        #    UI 上は成功したのに永続化されていない状態が痕跡なく発生する。
+        _log_debug("state.save_skipped", chat_id=chat_id, has_user=bool(user_id))
         return dict(patch or {})
     try:
-        chat = await Chats.get_chat_by_id(chat_id)
+        chat = await Chats.get_chat_by_id_and_user_id(chat_id, user_id)
     except Exception:
         return dict(patch or {})
     if chat is None:
@@ -596,12 +631,35 @@ async def _save_state(chat_id: Optional[str], patch: dict) -> dict:
     return state
 
 
-async def _append_history(chat_id: Optional[str], entry: dict) -> None:
-    state = await _load_state(chat_id)
+async def _append_history(chat_id: Optional[str], entry: dict, user_id: Optional[str]) -> None:
+    state = await _load_state(chat_id, user_id)
     history = list(state.get("history") or [])
     history.append({"ts": int(time.time()), **entry})
-    await _save_state(chat_id, {"history": history})
+    await _save_state(chat_id, {"history": history}, user_id)
 ```
+
+> ⚠️ **`chat_id` はクライアント制御である。** Action の `body['chat_id']` は
+> POST された `form_data` そのもの（`utils/actions.py:66-68`）、Pipe の
+> `__chat_id__` と Filter の `body['chat_id']` も同様に検証されていない。
+> `user_id` を伴わない読み書きは、他ユーザのチャット状態への読み出しと
+> 全置換書き込みになる。**スコープ無しの `Chats.get_chat_by_id` を
+> ここで使ってはならない。**
+
+> ⚠️ **既知の制約（未修正）**: `_save_state` は read-modify-write であり、
+> 排他制御を持たない。同一チャットを 2 タブで同時操作すると後勝ちで
+> `descript` state が失われる。より深刻な場合、Open WebUI 自身のメッセージ
+> 保存経路と競合すると、古い `blob` の書き戻しでメッセージがロールバック
+> されうる（`models/chats.py:606` が `chat_item.chat` を丸ごと差し替えるため）。
+> §3.3 の「書き手は Pipe のみ」という規律が守るのは単一リクエスト内の順序
+> だけである。
+
+> ⚠️ **`file_id` もクライアント制御である。** `_resolve_stored_file()`
+> （`descript_pipe.py` のみ）は `Files.get_file_by_id_and_user_id`
+> （`models/files.py:168`）を使うこと。スコープ無しの `Files.get_file_by_id`
+> （`:153`）では、他ユーザがアップロードした動画を攻撃者自身の Descript
+> プロジェクトへ持ち出せる。入口は `descript_args.file_id` と
+> `body['descript_media']` の 2 つあるが、どちらも `_resolve_stored_file` を
+> 通るためここ 1 箇所で塞げる。
 
 ### 5.4 引数整形
 
