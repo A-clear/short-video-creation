@@ -165,9 +165,21 @@ x-playwright-mcp-env: &playwright-mcp-env
   #    起動ログは 0.0.0.0 でも "Listening on http://localhost:8931" と出ます
   #    （表示だけの問題で、実際の bind はこの変数に従います）。
   PLAYWRIGHT_MCP_HOST: "0.0.0.0"
-  # プロファイルをディスクに残さない。複数クライアントが同時に繋いでも
-  # プロファイルロックで衝突しません。
-  PLAYWRIGHT_MCP_ISOLATED: "true"
+  # ⚠️ **false から変えないでください。** CDP 接続（下の
+  #    PLAYWRIGHT_MCP_CDP_ENDPOINT）と組み合わせると、true では
+  #    **操作が noVNC の画面に映らなくなります**。
+  #    実測（同一手順で --isolated の有無だけを変えた対照実験）:
+  #      --isolated あり: 画面の圧縮サイズ 26,808 → 26,808 bytes（変化なし）
+  #      --isolated なし: 26,808 → 176,931 bytes（ページが描画された）
+  #    true だと Playwright が新しい BrowserContext を作り、それが
+  #    X ディスプレイ上の可視ウィンドウにならないためです。
+  #    **ツール呼び出しは成功し、snapshot も正しく返る**ので、
+  #    「画面だけ更新されない」という気づきにくい壊れ方をします。
+  #    プロファイルは chrome-* コンテナ側（chrome-*-profile ボリューム）が持ちます。
+  #
+  # 既定は true（= 従来どおり内部ブラウザ、プロファイルをディスクに残さない）。
+  # noVNC を使うときだけ .env で false にしてください。
+  PLAYWRIGHT_MCP_ISOLATED: ${PLAYWRIGHT_MCP_ISOLATED:-true}
   # ⚠️ これを omit にしないと browser_take_screenshot が base64 の image ブロックを
   #    返し、cptr の _extract_mcp_result が非 text ブロックを json.dumps して
   #    テキストに混ぜます（utils/tools.py:2906-2915）。モデルには画像として
@@ -179,6 +191,95 @@ x-playwright-mcp-env: &playwright-mcp-env
   PLAYWRIGHT_MCP_CONSOLE_LEVEL: ${PLAYWRIGHT_MCP_CONSOLE_LEVEL:-warning}
   # ⚠️ Service Worker はブロックしません。本プロジェクトの成果物は PWA で、
   #    ブロックすると検証したい挙動そのものが消えます。
+
+# ==============================================================================
+# Chrome + noVNC の共通定義（チーム別 3 台で共有する）
+# ==============================================================================
+#
+# Playwright MCP が操作する画面を、人間がブラウザで見るための面です。
+# エージェント実装そのものには不要で、**デバッグのための可視化**です。
+#
+#   Computer ──MCP──▶ playwright-mcp-* ──CDP:9222──▶ chrome-* ──:608x──▶ 人間
+#
+# ⚠️ なぜ Playwright MCP の中で完結しないのか — 既定の Playwright MCP は
+#    Chromium を自分の内側で起動し、CDP を内部パイプで握るため外から覗けません。
+#    PLAYWRIGHT_MCP_CDP_ENDPOINT で「既にあるブラウザに接続する側」に変え、
+#    ブラウザをこのサービスへ外出しします。
+#
+# ⚠️ ビルドが必要なサービスです（Computer / Docling と合わせて 3 つ目）。
+#    docker compose up -d だけでは反映されません。3 台とも同じ image: タグを
+#    指すため、ビルドは実質 1 回です。
+#
+# ⚠️ CDP ポート（9222）はホストに公開していません。CDP に認証は無く、
+#    到達できれば任意のページを開かせ Cookie も読めます。公開するのは
+#    パスワード付きの noVNC だけです。
+x-chrome-novnc: &chrome-novnc
+  # ⚠️ profiles によりこの 3 台は **既定では起動しません**。
+  #    `docker compose up -d` が Chrome を 3 台巻き込むと +3G / +3 CPU になり、
+  #    ホスト 4 コアの構成では他のサービスごと道連れに遅くなるためです。
+  #    使うとき: docker compose --profile novnc up -d
+  #              docker compose up -d chrome-a   ← 名前指定なら profile 不要
+  profiles: [novnc]
+  build:
+    context: ./docker/chrome-novnc
+    args:
+      PLAYWRIGHT_MCP_IMAGE: mcr.microsoft.com/playwright/mcp:${PLAYWRIGHT_MCP_VERSION:-latest}
+  image: svc/chrome-novnc:local
+  restart: unless-stopped
+  # Chrome は子プロセスを大量に作るため、ゾンビ回収役が要ります。
+  init: true
+  # ⚠️ 既定の /dev/shm は 64MB で、Chrome がタブを開いた瞬間に落ちます。
+  #    entrypoint 側で --disable-dev-shm-usage を付けていないのは、
+  #    ここで十分な共有メモリを与えているためです。
+  shm_size: ${CHROME_NOVNC_SHM_SIZE:-1gb}
+  # ⚠️ **メモリ 1G では足りません**（実測）。実サイト 1 タブだけで 930〜978MiB /
+  #    1GiB（93〜96%）に達します。GPU が無くソフトウェア描画になるため、
+  #    ブラウザは見た目よりメモリと CPU を使います。
+  #
+  # ⚠️ CPU 上限はページ読み込み時の余裕として 2.0 にしています。**定常状態は軽い**
+  #    ことが実測で分かっています（実サイト 1 タブで 17〜20%）。1.0 に張り付いて
+  #    docker exec すら詰まった事例は、Chrome の What's New 宣伝タブが 3 枚
+  #    たまっていたのが原因で、entrypoint の --disable-features=ChromeWhatsNewUI で
+  #    塞いであります。
+  #
+  # ⚠️ ホスト 4 コアで**同時に動かせるのは実質 1 チーム分**です。
+  deploy:
+    resources:
+      limits:
+        memory: ${CHROME_NOVNC_MEMORY_LIMIT:-2G}
+        cpus: "${CHROME_NOVNC_CPU_LIMIT:-2.0}"
+  healthcheck:
+    # noVNC と CDP の両方が生きていることを確認します。
+    # 片方だけ生きている状態（例: 画面は出るが操作できない）を healthy に
+    # しないためです。curl はこのイメージに無いので node で叩きます。
+    test:
+      - CMD
+      - node
+      - -e
+      - "Promise.all([fetch('http://127.0.0.1:6080/vnc.html'),fetch('http://127.0.0.1:9222/json/version')]).then(r=>process.exit(r.every(x=>x.ok)?0:1)).catch(()=>process.exit(1))"
+    interval: 30s
+    timeout: 10s
+    retries: 3
+    start_period: 30s
+
+# ⚠️ VNC_PASSWORD はここに置きません。**チームごとに違う値でなければ
+#    チーム分離が成立しない**ためです。3 台は同じホストの別ポート
+#    （6080 / 6081 / 6082）に出るので、パスワードを共有すると
+#    A のパスワードで B と C の画面が見られます。コンテナを 3 つに
+#    分けている理由（他チームの Computer と dev サーバに到達させない）が
+#    そのまま無効になります。各サービスの environment: を参照してください。
+x-chrome-novnc-env: &chrome-novnc-env
+  # 既定は「見るだけ」。false にすると noVNC 側から操作できますが、
+  # エージェントの操作と人間の操作が同じウィンドウで衝突します。
+  VNC_VIEW_ONLY: ${CHROME_NOVNC_VIEW_ONLY:-true}
+  # ⚠️ PLAYWRIGHT_MCP_VIEWPORT_SIZE と揃えてください。食い違うと
+  #    エージェントが見ている領域と画面に映る領域がずれます。
+  SCREEN_WIDTH: ${CHROME_NOVNC_SCREEN_WIDTH:-1280}
+  SCREEN_HEIGHT: ${CHROME_NOVNC_SCREEN_HEIGHT:-720}
+  # 画面更新の応答性。実測で 20ms → 5ms にすると 36.4 → 52.6 件/秒（+44%）、
+  # x11vnc の CPU は 0.1% のまま。帯域は 15.6 → 21.6 MB/s に増えます。
+  VNC_DEFER_MS: ${CHROME_NOVNC_VNC_DEFER_MS:-5}
+  VNC_WAIT_MS: ${CHROME_NOVNC_VNC_WAIT_MS:-5}
 
 services:
   # ----------------------------------------------------------------------------
@@ -665,6 +766,19 @@ services:
       # ⚠️ これが無いと DNS リバインディング対策に弾かれ、接続が 403 になります
       #    （実測。ログには何も出ないので原因が分かりません）。
       #    localhost:8931 は上の healthcheck 用です。
+      # noVNC で画面を見るときだけ設定します。値が入ると Playwright は
+      # Chromium を自前起動せず chrome-a に CDP で接続します。
+      #
+      # ⚠️ **既定は空です。** 空 = 未設定 扱いで内部ブラウザが起動します（実測）。
+      #    無条件に設定してしまうと、chrome-a を起動していないときに
+      #    ブラウザツールがまるごと壊れます（chrome-* は profiles: [novnc] の
+      #    ため既定では起動しない）。
+      #
+      # ⚠️ 有効にするときは PLAYWRIGHT_MCP_ISOLATED=false も**必ず同時に**。
+      #    片方だけだと「操作は成功するのに画面が更新されない」になります。
+      #      .env:  PLAYWRIGHT_MCP_CDP_ENDPOINT_A=http://chrome-a:9222
+      #             PLAYWRIGHT_MCP_ISOLATED=false
+      PLAYWRIGHT_MCP_CDP_ENDPOINT: ${PLAYWRIGHT_MCP_CDP_ENDPOINT_A:-}
       PLAYWRIGHT_MCP_ALLOWED_HOSTS: playwright-mcp-a:8931,localhost:8931
       # ブラウザが「出て行ける先」の制限。空 = 制限なし。
       # ⚠️ 絞ると CDN や Google Fonts も落ちるため、実ページの描画が崩れます。
@@ -677,6 +791,19 @@ services:
     container_name: svc-playwright-mcp-b
     environment:
       <<: *playwright-mcp-env
+      # noVNC で画面を見るときだけ設定します。値が入ると Playwright は
+      # Chromium を自前起動せず chrome-b に CDP で接続します。
+      #
+      # ⚠️ **既定は空です。** 空 = 未設定 扱いで内部ブラウザが起動します（実測）。
+      #    無条件に設定してしまうと、chrome-b を起動していないときに
+      #    ブラウザツールがまるごと壊れます（chrome-* は profiles: [novnc] の
+      #    ため既定では起動しない）。
+      #
+      # ⚠️ 有効にするときは PLAYWRIGHT_MCP_ISOLATED=false も**必ず同時に**。
+      #    片方だけだと「操作は成功するのに画面が更新されない」になります。
+      #      .env:  PLAYWRIGHT_MCP_CDP_ENDPOINT_B=http://chrome-b:9222
+      #             PLAYWRIGHT_MCP_ISOLATED=false
+      PLAYWRIGHT_MCP_CDP_ENDPOINT: ${PLAYWRIGHT_MCP_CDP_ENDPOINT_B:-}
       PLAYWRIGHT_MCP_ALLOWED_HOSTS: playwright-mcp-b:8931,localhost:8931
       PLAYWRIGHT_MCP_ALLOWED_ORIGINS: ${PLAYWRIGHT_MCP_ALLOWED_ORIGINS_B:-}
     networks: [svc-playwright-net-b]
@@ -686,8 +813,91 @@ services:
     container_name: svc-playwright-mcp-c
     environment:
       <<: *playwright-mcp-env
+      # noVNC で画面を見るときだけ設定します。値が入ると Playwright は
+      # Chromium を自前起動せず chrome-c に CDP で接続します。
+      #
+      # ⚠️ **既定は空です。** 空 = 未設定 扱いで内部ブラウザが起動します（実測）。
+      #    無条件に設定してしまうと、chrome-c を起動していないときに
+      #    ブラウザツールがまるごと壊れます（chrome-* は profiles: [novnc] の
+      #    ため既定では起動しない）。
+      #
+      # ⚠️ 有効にするときは PLAYWRIGHT_MCP_ISOLATED=false も**必ず同時に**。
+      #    片方だけだと「操作は成功するのに画面が更新されない」になります。
+      #      .env:  PLAYWRIGHT_MCP_CDP_ENDPOINT_C=http://chrome-c:9222
+      #             PLAYWRIGHT_MCP_ISOLATED=false
+      PLAYWRIGHT_MCP_CDP_ENDPOINT: ${PLAYWRIGHT_MCP_CDP_ENDPOINT_C:-}
       PLAYWRIGHT_MCP_ALLOWED_HOSTS: playwright-mcp-c:8931,localhost:8931
       PLAYWRIGHT_MCP_ALLOWED_ORIGINS: ${PLAYWRIGHT_MCP_ALLOWED_ORIGINS_C:-}
+    networks: [svc-playwright-net-c]
+
+  # ----------------------------------------------------------------------------
+  # Chrome + noVNC（チーム別 3 コンテナ）
+  # ----------------------------------------------------------------------------
+  # エージェントが操作している画面を、人間がブラウザで見るための面です。
+  # 共通の注意は上の x-chrome-novnc を参照。
+  #
+  # 見るときは http://localhost:6080/vnc.html （b は 6081 / c は 6082）に接続し、
+  # CHROME_NOVNC_VNC_PASSWORD_<チーム> を入力します。
+  #
+  # ⚠️ svc-playwright-net-* に載せます。理由は 2 つ:
+  #    1. playwright-mcp-* が CDP で繋ぎに来る
+  #    2. **このブラウザが dev サーバを開く実体になった**ため、
+  #       open-webui-computer-* に到達できる必要がある
+  #    （従来 playwright-mcp-* が担っていた役割がこちらへ移りました）
+  #
+  # ⚠️ このネットワークに居る Computer からも CDP に直接到達できます。
+  #    エージェントと同じ信頼境界なので許容していますが、
+  #    「MCP を経由しないブラウザ操作が可能」である点は認識してください。
+  chrome-a:
+    <<: *chrome-novnc
+    container_name: svc-chrome-a
+    environment:
+      <<: *chrome-novnc-env
+      # ⚠️ チームごとに**必ず違う値**にしてください。
+      #    未設定ならコンテナの entrypoint が起動を拒否します。
+      #    ここで compose の :? を使わないのは、**未設定だと exec / ps / config を
+      #    含む全 compose コマンドが失敗する**ためです（このサービスは任意なのに、
+      #    使わない人の操作まで巻き添えにしてしまう）。強制は起動時に行います。
+      VNC_PASSWORD: ${CHROME_NOVNC_VNC_PASSWORD_A:-}
+    volumes:
+      # Cookie / ログイン状態が残ります。同一チーム内では共有されます。
+      - chrome-a-profile:/data/profile
+    ports:
+      - "${CHROME_NOVNC_PORT_A:-6080}:6080"
+    networks: [svc-playwright-net-a]
+
+  chrome-b:
+    <<: *chrome-novnc
+    container_name: svc-chrome-b
+    environment:
+      <<: *chrome-novnc-env
+      # ⚠️ チームごとに**必ず違う値**にしてください。
+      #    未設定ならコンテナの entrypoint が起動を拒否します。
+      #    ここで compose の :? を使わないのは、**未設定だと exec / ps / config を
+      #    含む全 compose コマンドが失敗する**ためです（このサービスは任意なのに、
+      #    使わない人の操作まで巻き添えにしてしまう）。強制は起動時に行います。
+      VNC_PASSWORD: ${CHROME_NOVNC_VNC_PASSWORD_B:-}
+    volumes:
+      - chrome-b-profile:/data/profile
+    ports:
+      - "${CHROME_NOVNC_PORT_B:-6081}:6080"
+    networks: [svc-playwright-net-b]
+
+  chrome-c:
+    <<: *chrome-novnc
+    container_name: svc-chrome-c
+    environment:
+      <<: *chrome-novnc-env
+      # ⚠️ チームごとに**必ず違う値**にしてください。
+      #    未設定ならコンテナの entrypoint が起動を拒否します。
+      #    ここで compose の :? を使わないのは、**未設定だと exec / ps / config を
+      #    含む全 compose コマンドが失敗する**ためです（このサービスは任意なのに、
+      #    使わない人の操作まで巻き添えにしてしまう）。強制は起動時に行います。
+      VNC_PASSWORD: ${CHROME_NOVNC_VNC_PASSWORD_C:-}
+    volumes:
+      - chrome-c-profile:/data/profile
+    ports:
+      - "${CHROME_NOVNC_PORT_C:-6082}:6080"
     networks: [svc-playwright-net-c]
 
   # ----------------------------------------------------------------------------
@@ -934,6 +1144,11 @@ volumes:
   computer-c-cache:
   computer-c-local:
   codex-home-c:
+  # Chrome のプロファイル（Cookie / ログイン状態）。消しても再取得はされず、
+  # 再ログインが必要になるだけです。チームごとに独立します。
+  chrome-a-profile:
+  chrome-b-profile:
+  chrome-c-profile:
 
 networks:
   svc-net:
